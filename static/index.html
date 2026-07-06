@@ -1,0 +1,1094 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PLACHEM AI Server Monitor</title>
+  <style>
+    :root {
+      --bg: #030914;
+      --panel: rgba(9, 23, 42, 0.82);
+      --panel-strong: rgba(10, 30, 55, 0.92);
+      --line: rgba(75, 148, 210, 0.32);
+      --text: #f7fbff;
+      --muted: #9fb0cf;
+      --blue: #3488ff;
+      --cyan: #20d9f6;
+      --green: #63ef66;
+      --amber: #ffb21c;
+      --red: #ff5c71;
+      --shadow: 0 6px 18px rgba(0, 0, 0, 0.42);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background:
+        radial-gradient(circle at 20% 20%, rgba(38, 137, 255, 0.14), transparent 28%),
+        radial-gradient(circle at 75% 45%, rgba(24, 220, 210, 0.10), transparent 30%),
+        linear-gradient(145deg, #020611 0%, #061426 56%, #020710 100%);
+      overflow-x: hidden;
+    }
+
+    .shell {
+      width: min(760px, calc(100vw - 14px));
+      margin: 0 auto;
+      padding: 10px 0 8px;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      min-width: 0;
+    }
+
+    .logo {
+      width: 24px;
+      height: 24px;
+      border: 1px solid var(--cyan);
+      border-radius: 7px;
+      display: grid;
+      place-items: center;
+      color: var(--cyan);
+      box-shadow: 0 0 12px rgba(32, 217, 246, 0.34);
+      font-size: 13px;
+      font-weight: 800;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(18px, 2vw, 25px);
+      font-weight: 800;
+      letter-spacing: 0;
+      line-height: 1;
+    }
+
+    h1 span {
+      color: #b7c3dd;
+      font-weight: 500;
+    }
+
+    .live {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      color: #b5c2dc;
+      font-size: 9px;
+      white-space: nowrap;
+    }
+
+    .dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--green);
+      box-shadow: 0 0 10px rgba(99, 239, 102, 0.75);
+    }
+
+    .live .state { color: var(--green); }
+    .live.warning .state { color: var(--amber); }
+    .live.warning .dot { background: var(--amber); box-shadow: 0 0 18px rgba(255, 178, 28, 0.75); }
+    .live.error .state { color: var(--red); }
+    .live.error .dot { background: var(--red); box-shadow: 0 0 18px rgba(255, 92, 113, 0.75); }
+
+    .kpis {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(64px, 1fr));
+      gap: 6px;
+      padding: 6px;
+      border: 1px solid rgba(56, 164, 218, 0.25);
+      border-radius: 7px;
+      background: rgba(5, 19, 35, 0.76);
+      box-shadow: var(--shadow);
+      margin-bottom: 7px;
+    }
+
+    .kpi {
+      min-height: 34px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      border-radius: 7px;
+      border: 1px solid rgba(43, 140, 255, 0.45);
+      background: linear-gradient(135deg, rgba(19, 55, 114, 0.56), rgba(7, 18, 38, 0.82));
+      color: var(--text);
+      box-shadow: inset 0 0 28px rgba(55, 131, 255, 0.12);
+    }
+
+    .kpi.green { border-color: rgba(46, 224, 116, 0.45); box-shadow: inset 0 0 28px rgba(46, 224, 116, 0.12); }
+    .kpi.cyan { border-color: rgba(32, 217, 246, 0.45); box-shadow: inset 0 0 28px rgba(32, 217, 246, 0.12); }
+    .kpi.amber { border-color: rgba(255, 178, 28, 0.48); box-shadow: inset 0 0 28px rgba(255, 178, 28, 0.12); }
+
+    .icon {
+      font-size: 13px;
+      color: var(--cyan);
+      filter: drop-shadow(0 0 12px rgba(32, 217, 246, 0.46));
+    }
+
+    .kpi .label {
+      font-size: 9px;
+      font-weight: 600;
+    }
+
+    .kpi .value {
+      font-size: 12px;
+      color: var(--blue);
+      font-weight: 800;
+    }
+
+    .kpi.green .value { color: var(--green); }
+    .kpi.cyan .value { color: var(--cyan); }
+    .kpi.amber .value { color: var(--amber); }
+
+    .main-grid {
+      display: grid;
+      grid-template-columns: 1.02fr 1fr;
+      gap: 7px;
+      margin-bottom: 22px;
+    }
+
+    .right-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 7px;
+    }
+
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: linear-gradient(145deg, rgba(10, 26, 48, 0.88), rgba(4, 12, 24, 0.88));
+      box-shadow: var(--shadow), inset 0 0 32px rgba(38, 139, 255, 0.06);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .card::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: radial-gradient(circle at 85% 95%, rgba(23, 205, 234, 0.18), transparent 42%);
+      pointer-events: none;
+    }
+
+    .gpu-card {
+      min-height: 255px;
+      padding: 14px 16px;
+      border-color: rgba(32, 217, 246, 0.74);
+      box-shadow: 0 0 0 1px rgba(37, 140, 255, 0.55), 0 0 36px rgba(32, 217, 246, 0.35), var(--shadow);
+    }
+
+    .card-title {
+      position: relative;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 6px;
+      font-size: 13px;
+      font-weight: 750;
+    }
+
+    .subtle {
+      color: var(--muted);
+      font-size: 10px;
+      margin-left: 34px;
+    }
+
+    .gpu-body {
+      position: relative;
+      display: grid;
+      grid-template-columns: 1.05fr 0.95fr;
+      align-items: center;
+      gap: 18px;
+      min-height: 185px;
+    }
+
+    .gauge {
+      width: min(150px, 100%);
+      aspect-ratio: 1;
+      border-radius: 50%;
+      margin: 2px auto 0;
+      display: grid;
+      place-items: center;
+      background: conic-gradient(var(--cyan) calc(var(--p, 0) * 1%), #20304f 0);
+      box-shadow: 0 0 42px rgba(32, 217, 246, 0.16);
+      position: relative;
+    }
+
+    .gauge::before {
+      content: "";
+      position: absolute;
+      inset: 10px;
+      border-radius: 50%;
+      background: #061121;
+      box-shadow: inset 0 0 60px rgba(0, 0, 0, 0.45);
+    }
+
+    .gauge-content {
+      position: relative;
+      text-align: center;
+    }
+
+    .gauge-label {
+      color: var(--muted);
+      font-size: 9px;
+      margin-bottom: 10px;
+    }
+
+    .gauge-value {
+      font-size: 32px;
+      font-weight: 780;
+      line-height: 1;
+    }
+
+    .gpu-side {
+      display: grid;
+      gap: 9px;
+    }
+
+    .metric-row {
+      display: grid;
+      grid-template-columns: 64px 1fr;
+      gap: 7px;
+      align-items: start;
+      padding-bottom: 36px;
+      border-bottom: 1px solid rgba(151, 177, 216, 0.22);
+    }
+
+    .metric-row:last-child {
+      border-bottom: 0;
+      padding-bottom: 0;
+    }
+
+    .metric-label {
+      color: var(--muted);
+      font-size: 10px;
+      margin-bottom: 3px;
+    }
+
+    .metric-value {
+      font-size: 9px;
+      font-weight: 760;
+    }
+
+    .metric-value small {
+      color: #b8c6df;
+      font-size: 14px;
+      font-weight: 500;
+    }
+
+    .metric-value.hot { color: var(--amber); }
+
+    .bar {
+      width: 100%;
+      height: 6px;
+      border-radius: 999px;
+      background: rgba(86, 121, 164, 0.26);
+      overflow: hidden;
+      margin-top: 7px;
+    }
+
+    .bar-fill {
+      height: 100%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, #3d61ff, var(--cyan));
+      width: var(--w, 0%);
+      transition: width 240ms ease;
+    }
+
+    .small-card {
+      min-height: 132px;
+      padding: 14px 16px;
+    }
+
+    .small-card .card-title {
+      font-size: 15px;
+      margin-bottom: 10px;
+    }
+
+    .reading-label {
+      color: #c4d0e6;
+      font-size: 14px;
+      margin-bottom: 6px;
+    }
+
+    .big-number {
+      font-size: 31px;
+      line-height: 1;
+      font-weight: 780;
+    }
+
+    .big-number small {
+      color: #b8c6df;
+      font-size: 12px;
+      font-weight: 500;
+    }
+
+    canvas.spark {
+      width: 100%;
+      height: 44px;
+      margin-top: 7px;
+      display: block;
+    }
+
+    .network {
+      grid-column: 1 / -1;
+      min-height: 118px;
+      padding: 13px 16px 10px;
+    }
+
+    .network-body {
+      display: grid;
+      grid-template-columns: 1fr 1px 1fr;
+      gap: 9px;
+      align-items: center;
+      margin-top: 10px;
+    }
+
+    .divider {
+      width: 1px;
+      height: 60px;
+      background: rgba(154, 179, 214, 0.22);
+    }
+
+    .net-label {
+      color: #c9d3e7;
+      font-size: 9px;
+      margin-bottom: 3px;
+    }
+
+    .net-value {
+      display: flex;
+      align-items: baseline;
+      gap: 6px;
+      font-size: 20px;
+      font-weight: 750;
+    }
+
+    .net-arrow {
+      color: var(--cyan);
+      font-size: 16px;
+      line-height: 1;
+    }
+
+    .net-arrow.up { color: var(--green); }
+
+    .services {
+      min-height: 58px;
+      padding: 12px 14px;
+      display: grid;
+      grid-template-columns: 92px repeat(3, 1fr);
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 8px;
+    }
+
+    .service-title {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      font-size: 30px;
+      font-weight: 750;
+    }
+
+    .service {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 7px;
+      min-width: 0;
+      border-left: 1px solid rgba(154, 179, 214, 0.26);
+      font-size: 9px;
+    }
+
+    .pill {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--green);
+      box-shadow: 0 0 20px rgba(99, 239, 102, 0.64);
+      flex: 0 0 auto;
+    }
+
+    .service-state {
+      color: var(--green);
+      margin-left: 2px;
+    }
+
+    .service.stopped .pill, .service.error .pill {
+      background: var(--red);
+      box-shadow: 0 0 20px rgba(255, 92, 113, 0.64);
+    }
+
+    .service.unknown .pill {
+      background: var(--amber);
+      box-shadow: 0 0 20px rgba(255, 178, 28, 0.64);
+    }
+
+    .service.stopped .service-state, .service.error .service-state { color: var(--red); }
+    .service.unknown .service-state { color: var(--amber); }
+
+    footer {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      min-height: 26px;
+      color: #9fb0cf;
+      font-size: 9px;
+      border-top: 1px solid rgba(104, 140, 188, 0.20);
+      padding: 6px 2px 0;
+    }
+
+    footer .ok { color: var(--green); }
+
+
+    /* Compact monitor proportion tuning */
+    .service-title { font-size: 24px; }
+    .service-title .icon { font-size: 14px; }
+    .service { font-size: 10px; }
+    .service-state { margin-left: 3px; }
+    .gpu-card .icon, .small-card .icon, .network .icon { font-size: 15px; }
+    .kpi .icon { font-size: 13px; }
+    .kpi .label { font-size: 10px; }
+    .kpi .value { font-size: 12px; }
+    .reading-label { font-size: 13px; }
+    .big-number small, .metric-value small { font-size: 12px; }
+    .net-value { font-size: 22px; }
+    .net-arrow { font-size: 22px; }
+    footer .icon { font-size: 15px !important; }
+
+    @media (max-width: 1350px) {
+      .kpis { grid-template-columns: repeat(3, 1fr); }
+      .main-grid { grid-template-columns: 1fr; }
+      .services { grid-template-columns: 1fr; }
+      .service { border-left: 0; justify-content: flex-start; }
+    }
+
+    @media (max-width: 760px) {
+      .shell { width: min(100vw - 10px, 760px); padding-top: 7px; }
+      header { align-items: flex-start; flex-direction: column; }
+      .logo { width: 22px; height: 22px; font-size: 12px; }
+      .brand { gap: 8px; }
+      .kpis, .right-grid, .gpu-body, .network-body { grid-template-columns: 1fr; }
+      .divider { display: none; }
+      .gpu-card { min-height: auto; padding: 10px; }
+      .small-card, .network { padding: 10px; }
+      .gauge-value, .big-number { font-size: 22px; }
+      footer { flex-wrap: wrap; gap: 8px; }
+    }
+
+    /* Final compact dashboard balance */
+    .shell { width: min(820px, calc(100vw - 14px)); padding: 9px 0 8px; }
+    header { margin-bottom: 9px; }
+    h1 { font-size: clamp(20px, 2.2vw, 28px); }
+    .live { font-size: 11px; }
+
+    .kpis { grid-template-columns: repeat(6, minmax(76px, 1fr)); gap: 7px; padding: 6px; margin-bottom: 8px; }
+    .kpi { min-height: 38px; gap: 7px; }
+    .kpi .icon { font-size: 15px; }
+    .kpi .label { font-size: 12px; }
+    .kpi .value { font-size: 15px; }
+
+    .main-grid { grid-template-columns: 0.94fr 1.06fr; gap: 9px; margin-bottom: 10px; }
+    .right-grid { gap: 9px; }
+    .card { border-radius: 8px; }
+
+    .gpu-card { min-height: 218px; padding: 13px 15px; }
+    .card-title { gap: 8px; margin-bottom: 5px; font-size: 16px; }
+    .subtle { font-size: 11px; margin-left: 30px; }
+    .gpu-body { grid-template-columns: 0.95fr 1.05fr; gap: 14px; min-height: 158px; align-items: center; }
+    .gauge { width: min(128px, 100%); margin-top: 0; }
+    .gauge::before { inset: 9px; }
+    .gauge-label { font-size: 11px; margin-bottom: 6px; }
+    .gauge-value { font-size: 34px; }
+    .gpu-side { gap: 10px; align-self: center; }
+    .metric-row { grid-template-columns: 24px 1fr; gap: 9px; padding-bottom: 13px; align-items: center; }
+    .metric-row:last-child { padding-bottom: 0; }
+    .metric-label { font-size: 12px; margin-bottom: 3px; }
+    .metric-value { font-size: 18px; }
+    .metric-value small { font-size: 13px; }
+    .bar { height: 6px; margin-top: 7px; }
+
+    .small-card { min-height: 128px; padding: 13px 15px; }
+    .small-card .card-title { font-size: 17px; margin-bottom: 9px; }
+    .reading-label { font-size: 13px; margin-bottom: 5px; }
+    .big-number { font-size: 35px; }
+    .big-number small { font-size: 14px; }
+    canvas.spark { height: 36px; margin-top: 8px; }
+
+    .network { min-height: 112px; padding: 12px 15px 9px; }
+    .network-body { gap: 12px; margin-top: 7px; }
+    .divider { height: 56px; }
+    .net-label { font-size: 10px; margin-bottom: 3px; }
+    .net-value { font-size: 22px; gap: 6px; }
+    .net-arrow { font-size: 22px; }
+    .network canvas.spark { height: 34px; margin-top: 6px; }
+
+    .services { grid-template-columns: 105px repeat(3, 1fr); min-height: 52px; padding: 10px 14px; gap: 10px; margin-bottom: 8px; }
+    .service-title { font-size: 18px; gap: 7px; }
+    .service-title .icon { font-size: 14px; }
+    .service { font-size: 12px; gap: 6px; }
+    .pill { width: 10px; height: 10px; }
+    .service-state { margin-left: 3px; }
+
+    footer { font-size: 10px; min-height: 26px; gap: 10px; }
+    footer .icon { font-size: 14px !important; }
+
+    @media (max-width: 1350px) {
+      .kpis { grid-template-columns: repeat(6, minmax(76px, 1fr)); }
+      .main-grid { grid-template-columns: 0.94fr 1.06fr; }
+      .services { grid-template-columns: 105px repeat(3, 1fr); }
+      .service { border-left: 1px solid rgba(154, 179, 214, 0.26); justify-content: center; }
+    }
+
+    @media (max-width: 720px) {
+      .shell { width: min(100vw - 10px, 640px); }
+      header { align-items: flex-start; flex-direction: column; }
+      .kpis { grid-template-columns: repeat(3, 1fr); }
+      .main-grid, .right-grid, .gpu-body, .network-body, .services { grid-template-columns: 1fr; }
+      .divider { display: none; }
+      .service { border-left: 0; justify-content: flex-start; }
+    }
+
+
+    /* Mobile phone layout */
+    @media (max-width: 520px) {
+      body { overflow-x: hidden; }
+      .shell { width: min(100vw - 12px, 520px); padding: 8px 0 10px; }
+
+      header {
+        flex-direction: row;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 8px;
+      }
+      .brand { gap: 7px; min-width: 0; }
+      .logo { width: 24px; height: 24px; font-size: 13px; flex: 0 0 auto; }
+      h1 {
+        font-size: 19px;
+        line-height: 1.05;
+        white-space: normal;
+      }
+      h1 span { display: block; font-size: 14px; margin-top: 2px; }
+      .live { font-size: 10px; gap: 5px; flex: 0 0 auto; }
+      .live span:nth-child(3), .live span:nth-child(4) { display: none; }
+
+      .kpis {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 6px;
+        padding: 6px;
+        margin-bottom: 8px;
+      }
+      .kpi { min-height: 40px; justify-content: flex-start; padding: 0 10px; }
+      .kpi .icon { font-size: 15px; width: 18px; text-align: center; }
+      .kpi .label { font-size: 12px; min-width: 38px; }
+      .kpi .value { font-size: 16px; margin-left: auto; }
+
+      .main-grid, .right-grid, .gpu-body, .network-body, .services {
+        grid-template-columns: 1fr;
+      }
+      .main-grid, .right-grid { gap: 8px; margin-bottom: 8px; }
+
+      .gpu-card { min-height: auto; padding: 12px; }
+      .card-title { font-size: 16px; margin-bottom: 4px; }
+      .subtle { font-size: 11px; margin-left: 28px; }
+      .gpu-body { gap: 10px; min-height: auto; }
+      .gauge { width: min(150px, 58vw); }
+      .gauge-label { font-size: 11px; }
+      .gauge-value { font-size: 34px; }
+      .gpu-side {
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+      }
+      .metric-row {
+        grid-template-columns: 20px 1fr;
+        gap: 7px;
+        padding: 9px;
+        border: 1px solid rgba(151, 177, 216, 0.16);
+        border-radius: 8px;
+        align-items: center;
+      }
+      .metric-label { font-size: 11px; }
+      .metric-value { font-size: 18px; }
+      .metric-value small { font-size: 12px; }
+
+      .small-card { min-height: auto; padding: 12px; }
+      .small-card .card-title { font-size: 16px; margin-bottom: 8px; }
+      .reading-label { font-size: 13px; }
+      .big-number { font-size: 34px; }
+      .big-number small { font-size: 13px; }
+      canvas.spark { height: 38px; }
+
+      .network { min-height: auto; padding: 12px; }
+      .network-body { gap: 8px; }
+      .divider { display: none; }
+      .network-body > div:not(.divider) {
+        padding: 8px;
+        border: 1px solid rgba(151, 177, 216, 0.14);
+        border-radius: 8px;
+      }
+      .net-label { font-size: 11px; }
+      .net-value { font-size: 22px; }
+      .network canvas.spark { height: 34px; }
+
+      .services {
+        min-height: auto;
+        gap: 7px;
+        padding: 12px;
+      }
+      .service-title { font-size: 17px; margin-bottom: 2px; }
+      .service {
+        justify-content: flex-start;
+        border-left: 0;
+        border-top: 1px solid rgba(154, 179, 214, 0.18);
+        padding-top: 7px;
+        font-size: 13px;
+      }
+      .service-state { margin-left: auto; }
+
+      footer {
+        display: grid;
+        grid-template-columns: auto 1fr;
+        gap: 6px 8px;
+        font-size: 10px;
+        line-height: 1.25;
+      }
+      footer span:nth-child(3), footer span:nth-child(5), footer span:nth-child(7) { display: none; }
+    }
+
+
+    /* Detail diagnostics */
+    .clickable { cursor: pointer; transition: border-color 160ms ease, transform 160ms ease, box-shadow 160ms ease; }
+    .clickable:hover { border-color: rgba(32, 217, 246, 0.78); transform: translateY(-1px); box-shadow: 0 0 0 1px rgba(32, 217, 246, 0.18), var(--shadow); }
+    .hidden { display: none !important; }
+    .detail-view { margin-top: 8px; }
+    .detail-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+    .back-button { border: 1px solid rgba(32, 217, 246, 0.45); border-radius: 8px; background: rgba(8, 25, 44, 0.9); color: var(--text); padding: 7px 10px; font-size: 12px; cursor: pointer; }
+    .back-button:hover { border-color: var(--cyan); }
+    .detail-title { font-size: 20px; font-weight: 780; }
+    .detail-meta { color: var(--muted); font-size: 11px; }
+    .detail-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
+    .detail-card { padding: 12px; min-height: 80px; }
+    .detail-card h3 { margin: 0 0 8px; font-size: 14px; }
+    .detail-kv { display: grid; grid-template-columns: minmax(86px, 0.9fr) 1.1fr; gap: 5px 10px; font-size: 12px; }
+    .detail-kv .key { color: var(--muted); }
+    .detail-kv .value { color: var(--text); font-weight: 650; word-break: break-word; }
+    .detail-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+    .detail-table th, .detail-table td { padding: 5px 4px; border-bottom: 1px solid rgba(154, 179, 214, 0.14); text-align: left; }
+    .detail-table th { color: var(--muted); font-weight: 650; }
+    .detail-table td { color: var(--text); }
+    .wide { grid-column: 1 / -1; }
+    .status-normal, .status-running, .status-ok { color: var(--green); }
+    .status-warning, .status-unknown, .status-stopped { color: var(--amber); }
+    .status-error { color: var(--red); }
+    .core-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(84px, 1fr)); gap: 6px; }
+    .core-tile { border: 1px solid rgba(154, 179, 214, 0.16); border-radius: 7px; padding: 6px; font-size: 11px; }
+    .mini-bar { height: 5px; background: rgba(86, 121, 164, 0.26); border-radius: 99px; overflow: hidden; margin-top: 5px; }
+    .mini-bar span { display: block; height: 100%; background: linear-gradient(90deg, var(--blue), var(--cyan)); }
+
+    @media (max-width: 720px) {
+      .detail-grid { grid-template-columns: 1fr; }
+      .detail-header { align-items: flex-start; flex-direction: column; }
+      .detail-kv { grid-template-columns: 1fr; }
+      .detail-table { font-size: 10px; }
+    }
+
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <div class="brand">
+        <div class="logo">⌬</div>
+        <h1>PLACHEM <span>AI Server Monitor</span></h1>
+      </div>
+      <div id="overall" class="live">
+        <span class="dot"></span>
+        <span class="state">System Normal</span>
+        <span>·</span>
+        <span>Live</span>
+      </div>
+    </header>
+
+    <section id="main-view">
+    <section class="kpis">
+      <div class="kpi clickable" data-detail="cpu"><span class="icon">▣</span><span class="label">CPU</span><span id="kpi-cpu" class="value">--</span></div>
+      <div class="kpi green clickable" data-detail="memory"><span class="icon">▤</span><span class="label">RAM</span><span id="kpi-ram" class="value">--</span></div>
+      <div class="kpi clickable" data-detail="gpu"><span class="icon">▧</span><span class="label">GPU</span><span id="kpi-gpu" class="value">--</span></div>
+      <div class="kpi green clickable" data-detail="gpu"><span class="icon">▩</span><span class="label">VRAM</span><span id="kpi-vram" class="value">--</span></div>
+      <div class="kpi amber clickable" data-detail="gpu"><span class="icon">♨</span><span class="label">TEMP</span><span id="kpi-temp" class="value">--</span></div>
+      <div class="kpi cyan clickable" data-detail="disk"><span class="icon">▭</span><span class="label">DISK</span><span id="kpi-disk" class="value">--</span></div>
+    </section>
+
+    <section class="main-grid">
+      <article class="card gpu-card clickable" data-detail="gpu">
+        <div class="card-title"><span class="icon">▧</span><span>GPU Status</span></div>
+        <div id="gpu-name" class="subtle">Unknown</div>
+        <div class="gpu-body">
+          <div class="gauge" id="gpu-gauge" style="--p: 0">
+            <div class="gauge-content">
+              <div class="gauge-label">GPU Load</div>
+              <div id="gpu-load" class="gauge-value">--</div>
+            </div>
+          </div>
+          <div class="gpu-side">
+            <div class="metric-row">
+              <span class="icon">◴</span>
+              <div>
+                <div class="metric-label">VRAM</div>
+                <div id="vram-text" class="metric-value">-- <small>/ -- GB</small></div>
+                <div class="bar"><div id="vram-bar" class="bar-fill"></div></div>
+              </div>
+            </div>
+            <div class="metric-row">
+              <span class="icon">♨</span>
+              <div>
+                <div class="metric-label">Temperature</div>
+                <div id="gpu-temp" class="metric-value hot">--</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </article>
+
+      <section class="right-grid">
+        <article class="card small-card clickable" data-detail="cpu">
+          <div class="card-title"><span class="icon">▣</span><span>CPU</span></div>
+          <div class="reading-label">CPU Usage</div>
+          <div id="cpu-main" class="big-number">--</div>
+          <canvas id="cpu-chart" class="spark" width="520" height="110"></canvas>
+        </article>
+
+        <article class="card small-card clickable" data-detail="memory">
+          <div class="card-title"><span class="icon" style="color:#be7cff">▤</span><span>Memory</span></div>
+          <div id="mem-main" class="big-number">-- <small>/ -- GB</small></div>
+          <div class="reading-label">Usage <span id="mem-percent" style="color:var(--blue)">--</span></div>
+          <div class="bar"><div id="mem-bar" class="bar-fill"></div></div>
+        </article>
+
+        <article class="card network clickable" data-detail="network">
+          <div class="card-title"><span class="icon">⌘</span><span>Network</span></div>
+          <div class="network-body">
+            <div>
+              <div class="net-label">Download</div>
+              <div class="net-value"><span class="net-arrow">↓</span><span id="download">--</span></div>
+              <canvas id="download-chart" class="spark" width="520" height="80"></canvas>
+            </div>
+            <div class="divider"></div>
+            <div>
+              <div class="net-label">Upload</div>
+              <div class="net-value"><span class="net-arrow up">↑</span><span id="upload">--</span></div>
+              <canvas id="upload-chart" class="spark" width="520" height="80"></canvas>
+            </div>
+          </div>
+        </article>
+      </section>
+    </section>
+
+    <section class="card services clickable" data-detail="services">
+      <div class="service-title"><span class="icon">▦</span><span>Services</span></div>
+      <div id="svc-openclaw" class="service unknown"><span class="pill"></span><span>OpenClaw</span><span class="service-state">Unknown</span></div>
+      <div id="svc-ollama" class="service unknown"><span class="pill"></span><span>Ollama</span><span class="service-state">Unknown</span></div>
+      <div id="svc-tailscale" class="service unknown"><span class="pill"></span><span>Tailscale</span><span class="service-state">Unknown</span></div>
+    </section>
+
+    </section>
+
+    <section id="detail-view" class="detail-view hidden">
+      <div class="detail-header">
+        <button id="back-button" class="back-button" type="button">Back</button>
+        <div>
+          <div id="detail-title" class="detail-title">Diagnostics</div>
+          <div id="detail-meta" class="detail-meta">Loading</div>
+        </div>
+      </div>
+      <div id="detail-content" class="detail-grid"></div>
+    </section>
+
+    <footer>
+      <span class="icon" style="font-size:26px">▭</span>
+      <span id="server-name">PLACHEM-AI-01</span>
+      <span>|</span>
+      <span id="server-os">Unknown OS</span>
+      <span>|</span>
+      <span class="ok">Uptime <span id="uptime">Unknown</span></span>
+      <span>|</span>
+      <span>Last updated&nbsp; <span id="updated">--:--:--</span></span>
+    </footer>
+  </main>
+
+  <script>
+    const history = {
+      cpu: [],
+      download: [],
+      upload: []
+    };
+
+    const maxPoints = 42;
+
+    function pushHistory(key, value) {
+      const next = Number.isFinite(value) ? value : 0;
+      history[key].push(next);
+      if (history[key].length > maxPoints) history[key].shift();
+    }
+
+    function valueOrUnknown(value, suffix = "") {
+      return value === null || value === undefined || Number.isNaN(value) ? "Unknown" : `${value}${suffix}`;
+    }
+
+    function percent(value) {
+      return value === null || value === undefined || Number.isNaN(value) ? "--" : `${Math.round(value)}%`;
+    }
+
+    function clampPercent(value) {
+      if (!Number.isFinite(value)) return 0;
+      return Math.max(0, Math.min(100, value));
+    }
+
+    function formatBps(bytes) {
+      if (!Number.isFinite(bytes)) return "Unknown";
+      if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB/s`;
+      if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB/s`;
+      return `${Math.round(bytes)} B/s`;
+    }
+
+    function drawSparkline(id, values, color) {
+      const canvas = document.getElementById(id);
+      const ctx = canvas.getContext("2d");
+      const w = canvas.width;
+      const h = canvas.height;
+      ctx.clearRect(0, 0, w, h);
+      ctx.strokeStyle = "rgba(160, 183, 220, 0.16)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(0, h - 12);
+      ctx.lineTo(w, h - 12);
+      ctx.stroke();
+      if (values.length < 2) return;
+      const max = Math.max(...values, 1);
+      const step = w / (maxPoints - 1);
+      ctx.beginPath();
+      values.forEach((value, index) => {
+        const x = index * step;
+        const y = h - 14 - (value / max) * (h - 28);
+        if (index === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 3;
+      ctx.shadowColor = color;
+      ctx.shadowBlur = 12;
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+      const gradient = ctx.createLinearGradient(0, 0, 0, h);
+      gradient.addColorStop(0, color.replace("1)", "0.28)"));
+      gradient.addColorStop(1, color.replace("1)", "0)"));
+      ctx.lineTo((values.length - 1) * step, h - 12);
+      ctx.lineTo(0, h - 12);
+      ctx.closePath();
+      ctx.fillStyle = gradient;
+      ctx.fill();
+    }
+
+    function setService(id, service) {
+      const node = document.getElementById(id);
+      const state = service?.state || "unknown";
+      node.className = `service ${state}`;
+      node.querySelector(".service-state").textContent = service?.label || "Unknown";
+    }
+
+    function setOverall(state) {
+      const node = document.getElementById("overall");
+      node.className = `live ${state === "normal" ? "" : state}`;
+      node.querySelector(".state").textContent =
+        state === "normal" ? "System Normal" : state === "warning" ? "System Warning" : "System Error";
+    }
+
+    async function refresh() {
+      try {
+        const response = await fetch("/api/status", { cache: "no-store" });
+        const data = await response.json();
+
+        setOverall(data.overall);
+
+        const cpu = data.cpu || {};
+        const mem = data.memory || {};
+        const disk = data.disk || {};
+        const gpu = data.gpu || {};
+        const net = data.network || {};
+
+        document.getElementById("kpi-cpu").textContent = percent(cpu.usage_percent);
+        document.getElementById("kpi-ram").textContent = percent(mem.usage_percent);
+        document.getElementById("kpi-gpu").textContent = percent(gpu.usage_percent);
+        document.getElementById("kpi-vram").textContent = percent(gpu.vram_usage_percent);
+        document.getElementById("kpi-temp").textContent = valueOrUnknown(gpu.temperature_c, "°C");
+        document.getElementById("kpi-disk").textContent = percent(disk.usage_percent);
+
+        document.getElementById("gpu-name").textContent = gpu.name || "Unknown";
+        document.getElementById("gpu-load").textContent = percent(gpu.usage_percent);
+        document.getElementById("gpu-gauge").style.setProperty("--p", clampPercent(gpu.usage_percent));
+        document.getElementById("vram-text").innerHTML =
+          `${valueOrUnknown(gpu.vram_used_gb)} <small>/ ${valueOrUnknown(gpu.vram_total_gb)} GB</small>`;
+        document.getElementById("vram-bar").style.width = `${clampPercent(gpu.vram_usage_percent)}%`;
+        document.getElementById("gpu-temp").textContent = valueOrUnknown(gpu.temperature_c, "°C");
+
+        document.getElementById("cpu-main").textContent = percent(cpu.usage_percent);
+        document.getElementById("mem-main").innerHTML =
+          `${valueOrUnknown(mem.used_gb)} <small>/ ${valueOrUnknown(mem.total_gb)} GB</small>`;
+        document.getElementById("mem-percent").textContent = percent(mem.usage_percent);
+        document.getElementById("mem-bar").style.width = `${clampPercent(mem.usage_percent)}%`;
+
+        document.getElementById("download").textContent = formatBps(net.download_bps);
+        document.getElementById("upload").textContent = formatBps(net.upload_bps);
+
+        pushHistory("cpu", cpu.usage_percent);
+        pushHistory("download", net.download_bps);
+        pushHistory("upload", net.upload_bps);
+        drawSparkline("cpu-chart", history.cpu, "rgba(32, 217, 246, 1)");
+        drawSparkline("download-chart", history.download, "rgba(32, 217, 246, 1)");
+        drawSparkline("upload-chart", history.upload, "rgba(99, 239, 102, 1)");
+
+        setService("svc-openclaw", data.services?.openclaw);
+        setService("svc-ollama", data.services?.ollama);
+        setService("svc-tailscale", data.services?.tailscale);
+
+        document.getElementById("server-name").textContent = data.server?.name || "PLACHEM-AI-01";
+        document.getElementById("server-os").textContent = data.server?.os || "Unknown OS";
+        document.getElementById("uptime").textContent = data.server?.uptime?.label || "Unknown";
+        document.getElementById("updated").textContent = data.last_updated || "--:--:--";
+      } catch (error) {
+        setOverall("error");
+      }
+    }
+
+
+    const detailNames = {
+      cpu: "CPU Diagnostics",
+      memory: "Memory Diagnostics",
+      gpu: "GPU Diagnostics",
+      disk: "Disk Diagnostics",
+      network: "Network Diagnostics",
+      services: "Services Diagnostics"
+    };
+    let currentDetail = null;
+
+    function escapeHtml(value) {
+      return String(value ?? "Unknown").replace(/[&<>'"]/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;","\"":"&quot;"}[char]));
+    }
+
+    function fmt(value, suffix = "") {
+      return value === null || value === undefined || Number.isNaN(value) ? "Unknown" : `${value}${suffix}`;
+    }
+
+    function kv(rows) {
+      return `<div class="detail-kv">${rows.map(([k, v, cls = ""]) => `<div class="key">${escapeHtml(k)}</div><div class="value ${cls}">${escapeHtml(v)}</div>`).join("")}</div>`;
+    }
+
+    function table(headers, rows) {
+      return `<table class="detail-table"><thead><tr>${headers.map(h => `<th>${escapeHtml(h)}</th>`).join("")}</tr></thead><tbody>${rows.map(row => `<tr>${row.map(cell => `<td>${escapeHtml(cell)}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+    }
+
+    function card(title, body, wide = false) {
+      return `<article class="card detail-card ${wide ? "wide" : ""}"><h3>${escapeHtml(title)}</h3>${body}</article>`;
+    }
+
+    function renderCoreTiles(values) {
+      return `<div class="core-grid">${(values || []).map((value, i) => `<div class="core-tile">Core ${i}<strong style="float:right">${percent(value)}</strong><div class="mini-bar"><span style="width:${clampPercent(value)}%"></span></div></div>`).join("")}</div>`;
+    }
+
+    function renderDetail(type, data) {
+      if (data.status === "error") return card("Error", kv([["Message", data.error || "Unknown"]]), true);
+      if (type === "cpu") {
+        return [
+          card("Summary", kv([["Usage", percent(data.summary?.usage_percent)], ["Logical cores", data.logical_cores], ["Physical cores", data.physical_cores], ["Load average", (data.load_average || []).map(v => Number(v).toFixed(2)).join(" / ") || "Unknown"]])),
+          card("Core Usage", renderCoreTiles(data.core_percent), true),
+          card("CPU Top Processes", table(["PID", "Name", "CPU %", "RAM %"], (data.top_processes || []).map(p => [p.pid, p.name, p.cpu_percent, p.memory_percent])), true),
+        ].join("");
+      }
+      if (type === "memory") {
+        const m = data.memory || {}; const s = data.swap || {};
+        return [
+          card("Memory", kv([["Total", fmt(m.total_gb, " GB")], ["Used", fmt(m.used_gb, " GB")], ["Free", fmt(m.free_gb, " GB")], ["Available", fmt(m.available_gb, " GB")], ["Cache", fmt(m.cached_gb, " GB")], ["Usage", percent(m.usage_percent)]])),
+          card("Swap", kv([["Total", fmt(s.total_gb, " GB")], ["Used", fmt(s.used_gb, " GB")], ["Free", fmt(s.free_gb, " GB")], ["Usage", percent(s.usage_percent)]])),
+          card("Memory Top Processes", table(["PID", "Name", "RSS MB", "RAM %"], (data.top_processes || []).map(p => [p.pid, p.name, p.rss_mb, p.memory_percent])), true),
+        ].join("");
+      }
+      if (type === "gpu") {
+        const g = data.summary || {};
+        return [
+          card("GPU", kv([["Name", g.name], ["Usage", percent(g.usage_percent)], ["VRAM", `${fmt(g.vram_used_gb)} / ${fmt(g.vram_total_gb)} GB`], ["VRAM usage", percent(g.vram_usage_percent)], ["Temperature", fmt(g.temperature_c, "°C")], ["Source", g.source || "Unknown"]])),
+          card("GPU Processes", table(["PID", "Name", "VRAM MB"], (data.processes || []).map(p => [p.pid, p.name, p.vram_mb])), true),
+        ].join("");
+      }
+      if (type === "disk") {
+        return [
+          card("Root Disk", kv([["Used", fmt(data.summary?.used_gb, " GB")], ["Total", fmt(data.summary?.total_gb, " GB")], ["Usage", percent(data.summary?.usage_percent)]])),
+          card("Major Folders", table(["Path", "GB", "Status"], (data.major_folders || []).map(f => [f.path, f.size_gb, f.status])), true),
+          card("Partitions", table(["Device", "Mount", "Type", "Used", "Total", "%"], (data.partitions || []).map(d => [d.device, d.mountpoint, d.fstype, d.used_gb, d.total_gb, d.usage_percent])), true),
+        ].join("");
+      }
+      if (type === "network") {
+        return [
+          card("Current Speed", kv([["Download", formatBps(data.summary?.download_bps)], ["Upload", formatBps(data.summary?.upload_bps)], ["Tailscale", data.tailscale?.label || "Unknown", `status-${data.tailscale?.state || "unknown"}`]])),
+          card("Interfaces", table(["Name", "Up", "Speed", "RX MB", "TX MB", "Drop In/Out"], (data.interfaces || []).map(i => [i.name, i.is_up, i.speed_mbps, i.recv_mb, i.sent_mb, `${i.dropin}/${i.dropout}`])), true),
+          card("Listening Ports", table(["IP", "Port", "PID", "Process"], (data.listening_ports || []).map(p => [p.ip, p.port, p.pid, p.process])), true),
+        ].join("");
+      }
+      if (type === "services") {
+        const rows = Object.entries(data.services || {}).map(([name, svc]) => [name.replace(/_/g, " "), svc.label, svc.state]);
+        return card("Service States", table(["Service", "Label", "State"], rows), true);
+      }
+      return card("Unknown", kv([["Type", type]]), true);
+    }
+
+    async function refreshDetail() {
+      if (!currentDetail) return;
+      const title = document.getElementById("detail-title");
+      const meta = document.getElementById("detail-meta");
+      const content = document.getElementById("detail-content");
+      title.textContent = detailNames[currentDetail] || "Diagnostics";
+      try {
+        const response = await fetch(`/api/detail/${currentDetail}`, { cache: "no-store" });
+        const data = await response.json();
+        meta.textContent = `Last updated ${data.last_updated || "Unknown"}`;
+        content.innerHTML = renderDetail(currentDetail, data);
+      } catch (error) {
+        meta.textContent = "Error";
+        content.innerHTML = card("Error", kv([["Message", "Failed to load detail"]]), true);
+      }
+    }
+
+    function routeDetail() {
+      const hash = window.location.hash.replace("#", "").replace("/", "");
+      currentDetail = ["cpu", "memory", "gpu", "disk", "network", "services"].includes(hash) ? hash : null;
+      document.getElementById("main-view").classList.toggle("hidden", Boolean(currentDetail));
+      document.getElementById("detail-view").classList.toggle("hidden", !currentDetail);
+      if (currentDetail) refreshDetail();
+    }
+
+    document.querySelectorAll("[data-detail]").forEach(node => {
+      node.addEventListener("click", () => { window.location.hash = `/${node.dataset.detail}`; });
+    });
+    document.getElementById("back-button").addEventListener("click", () => { window.location.hash = ""; });
+    window.addEventListener("hashchange", routeDetail);
+
+
+    routeDetail();
+    refresh();
+    setInterval(() => { refresh(); refreshDetail(); }, 2000);
+  </script>
+</body>
+</html>
