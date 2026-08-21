@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
   <title>PLACHEM AI Server Monitor</title>
   <style>
     :root {
@@ -499,6 +500,25 @@
       box-shadow: 0 0 0 1px rgba(120, 140, 170, 0.25), var(--shadow);
     }
 
+    .gpu-grid, .agent-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+    .gpu-unit-card { padding: 18px; }
+    .gpu-unit-name { color: var(--muted); font-size: 12px; margin: -4px 0 14px; }
+    .gpu-unit-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 18px; }
+    .gpu-unit-metric { min-width: 0; }
+    .gpu-unit-metric span { display: block; color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .08em; }
+    .gpu-unit-metric strong { display: block; margin-top: 3px; font-size: 18px; color: var(--text); }
+    .gpu-unit-pcie { grid-column: 1 / -1; padding-top: 10px; border-top: 1px solid rgba(148,163,184,.14); color: var(--muted); font-size: 12px; }
+    .agent-grid .erpmanager-card { margin-top: 0; }
+    .secretary-card { padding: 14px 16px; border-color: rgba(167,139,250,.42); box-shadow: 0 0 0 1px rgba(167,139,250,.20), 0 0 28px rgba(167,139,250,.10), var(--shadow); }
+    .secretary-body { display: grid; gap: 9px; margin-top: 12px; }
+    .secretary-row { display: flex; justify-content: space-between; gap: 16px; color: var(--muted); font-size: 12px; }
+    .secretary-row strong { color: var(--text); text-align: right; overflow-wrap: anywhere; }
+
     .services {
       min-height: 58px;
       padding: 12px 14px;
@@ -586,7 +606,7 @@
     @media (max-width: 1350px) {
       .kpis { grid-template-columns: repeat(3, 1fr); }
       .main-grid { grid-template-columns: 1fr; }
-      .codex-grid { grid-template-columns: 1fr; }
+      .gpu-grid, .agent-grid { grid-template-columns: 1fr; }
       .services { grid-template-columns: 1fr; }
       .service { border-left: 0; justify-content: flex-start; }
     }
@@ -651,7 +671,7 @@
     .net-arrow { font-size: 22px; }
     .network canvas.spark { height: 34px; margin-top: 6px; }
 
-    .codex-grid { grid-template-columns: 1fr; gap: 8px; margin-bottom: 8px; }
+    .gpu-grid, .agent-grid { grid-template-columns: 1fr; gap: 8px; }
     .codex-card { padding: 10px 12px; }
     .codex-percent { font-size: 28px; }
     .services { grid-template-columns: 105px repeat(3, 1fr); min-height: 52px; padding: 10px 14px; gap: 10px; margin-bottom: 8px; }
@@ -1026,6 +1046,9 @@
     .service-state { font-size: 8px; }
     footer { font-size: 8px; min-height: 30px; }
 
+    @media (min-width: 900px) {
+      .gpu-grid, .agent-grid, .codex-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
   </style>
 </head>
 <body>
@@ -1050,94 +1073,15 @@
     <section class="kpis">
       <div class="kpi clickable" data-detail="cpu"><span class="icon">▣</span><span class="label">CPU</span><span id="kpi-cpu" class="value">--</span></div>
       <div class="kpi green clickable" data-detail="memory"><span class="icon">▤</span><span class="label">RAM</span><span id="kpi-ram" class="value">--</span></div>
-      <div class="kpi clickable" data-detail="gpu"><span class="icon">▧</span><span class="label">GPU</span><span id="kpi-gpu" class="value">--</span></div>
-      <div class="kpi green clickable" data-detail="gpu"><span class="icon">▩</span><span class="label">VRAM</span><span id="kpi-vram" class="value">--</span></div>
-      <div class="kpi amber clickable" data-detail="gpu"><span class="icon">♨</span><span class="label">TEMP</span><span id="kpi-temp" class="value">--</span></div>
+      <div class="kpi cyan clickable" data-detail="network"><span class="icon">↓</span><span class="label">Network ↓</span><span id="kpi-download" class="value">--</span></div>
+      <div class="kpi green clickable" data-detail="network"><span class="icon">↑</span><span class="label">Network ↑</span><span id="kpi-upload" class="value">--</span></div>
       <div class="kpi cyan clickable" data-detail="disk"><span class="icon">▭</span><span class="label">DISK</span><span id="kpi-disk" class="value">--</span></div>
+      <div class="kpi amber"><span class="icon">◷</span><span class="label">Uptime</span><span id="kpi-uptime" class="value">--</span></div>
     </section>
 
-    <section class="main-grid">
-      <article class="card gpu-card clickable" data-detail="gpu">
-        <div class="card-title"><span class="icon">▧</span><span>GPU Status</span></div>
-        <div id="gpu-name" class="subtle">Unknown</div>
-        <div class="gpu-body">
-          <div class="gauge" id="gpu-gauge" style="--p: 0">
-            <div class="gauge-content">
-              <div class="gauge-label">GPU Load</div>
-              <div id="gpu-load" class="gauge-value">--</div>
-            </div>
-          </div>
-          <div class="gpu-side">
-            <div class="metric-row">
-              <span class="icon">◴</span>
-              <div>
-                <div class="metric-label">VRAM</div>
-                <div id="vram-text" class="metric-value">-- <small>/ -- GB</small></div>
-                <div class="bar"><div id="vram-bar" class="bar-fill"></div></div>
-              </div>
-            </div>
-            <div class="metric-row">
-              <span class="icon">♨</span>
-              <div>
-                <div class="metric-label">Temperature</div>
-                <div id="gpu-temp" class="metric-value hot">--</div>
-              </div>
-            </div>
-          </div>
-        </div>
-      </article>
-
-      <section class="right-grid">
-        <article class="card small-card clickable" data-detail="cpu">
-          <div class="card-title"><span class="icon">▣</span><span>CPU</span></div>
-          <div class="reading-label">CPU Usage</div>
-          <div id="cpu-main" class="big-number">--</div>
-          <canvas id="cpu-chart" class="spark" width="520" height="110"></canvas>
-        </article>
-
-        <article class="card small-card clickable" data-detail="memory">
-          <div class="card-title"><span class="icon" style="color:#be7cff">▤</span><span>Memory</span></div>
-          <div id="mem-main" class="big-number">-- <small>/ -- GB</small></div>
-          <div class="reading-label">Usage <span id="mem-percent" style="color:var(--blue)">--</span></div>
-          <div class="bar"><div id="mem-bar" class="bar-fill"></div></div>
-        </article>
-
-        <article class="card network clickable" data-detail="network">
-          <div class="card-title"><span class="icon">⌘</span><span>Network</span></div>
-          <div class="network-body">
-            <div>
-              <div class="net-label">Download</div>
-              <div class="net-value"><span class="net-arrow">↓</span><span id="download">--</span></div>
-              <canvas id="download-chart" class="spark" width="520" height="80"></canvas>
-            </div>
-            <div class="divider"></div>
-            <div>
-              <div class="net-label">Upload</div>
-              <div class="net-value"><span class="net-arrow up">↑</span><span id="upload">--</span></div>
-              <canvas id="upload-chart" class="spark" width="520" height="80"></canvas>
-            </div>
-          </div>
-        </article>
-      </section>
-    </section>
-
-    <section class="card openclaw-main-summary">
-      <div class="openclaw-summary-head"><span class="icon">▧</span><span>OpenClaw Summary</span></div>
-      <div class="openclaw-main-metrics">
-        <div class="oc-segment"><span>Status</span><strong id="oc-status" class="status-running">Unknown</strong></div>
-        <div class="oc-segment"><span>Agents</span><strong id="oc-agents">--</strong></div>
-        <div class="oc-segment"><span>Active</span><strong id="oc-active">--</strong></div>
-        <div class="oc-segment"><span>Models</span><strong id="oc-models">--</strong></div>
-        <div class="oc-segment"><span>Gateway</span><strong id="oc-gateway" class="status-unknown">Unknown</strong></div>
-      </div>
-      <button id="openclaw-control-main" class="openclaw-control-button" type="button">OpenClaw Control →</button>
-    </section>
-
-    <section class="card services clickable" data-detail="services">
-      <div class="service-title"><span class="icon">▦</span><span>Services</span></div>
-      <div id="svc-openclaw" class="service unknown"><span class="pill"></span><span>OpenClaw</span><span class="service-state">Unknown</span></div>
-      <div id="svc-ollama" class="service unknown"><span class="pill"></span><span>Ollama</span><span class="service-state">Unknown</span></div>
-      <div id="svc-tailscale" class="service unknown"><span class="pill"></span><span>Tailscale</span><span class="service-state">Unknown</span></div>
+    <section class="gpu-grid">
+      <article class="card gpu-unit-card clickable" data-detail="gpu" id="gpu-card-0"></article>
+      <article class="card gpu-unit-card clickable" data-detail="gpu" id="gpu-card-1"></article>
     </section>
 
     <section class="codex-grid">
@@ -1158,12 +1102,44 @@
       </article>
     </section>
 
-    <section class="card erpmanager-card" id="erpmanager-card">
-      <div class="card-title"><span class="icon" style="color:#63c5ff">⛁</span><span>ERPmanager</span><span id="erpmanager-status-pill" class="erpmanager-status">--</span></div>
-      <div class="erpmanager-percent"><span id="erpmanager-percent">--</span><span class="bar-label">Context</span></div>
-      <div class="erpmanager-bar"><div id="erpmanager-bar-fill" class="erpmanager-bar-fill"></div></div>
-      <div id="erpmanager-tokens" class="reading-label">-- / --</div>
-      <div id="erpmanager-meta" class="erpmanager-meta">--</div>
+    <section class="agent-grid">
+      <article class="card erpmanager-card" id="erpmanager-card">
+        <div class="card-title"><span class="icon" style="color:#63c5ff">⛁</span><span>ERPmanager</span><span id="erpmanager-status-pill" class="erpmanager-status">--</span></div>
+        <div class="erpmanager-percent"><span id="erpmanager-percent">--</span><span class="bar-label">Context</span></div>
+        <div class="erpmanager-bar"><div id="erpmanager-bar-fill" class="erpmanager-bar-fill"></div></div>
+        <div id="erpmanager-tokens" class="reading-label">-- / --</div>
+        <div id="erpmanager-meta" class="erpmanager-meta">--</div>
+      </article>
+      <article class="card secretary-card" id="secretary-card">
+        <div class="card-title"><span class="icon" style="color:#a78bfa">◆</span><span>Secretary</span><span id="secretary-status-pill" class="erpmanager-status">--</span></div>
+        <div class="secretary-body">
+          <div class="secretary-row"><span>Agent</span><strong id="secretary-name">Secretary</strong></div>
+          <div class="secretary-row"><span>Model</span><strong id="secretary-model">--</strong></div>
+          <div class="secretary-row"><span>Session state</span><strong id="secretary-state">--</strong></div>
+          <div class="secretary-row"><span>Sessions</span><strong id="secretary-sessions">--</strong></div>
+          <div class="secretary-row"><span>Total tokens</span><strong id="secretary-tokens">--</strong></div>
+        </div>
+      </article>
+    </section>
+
+    <section class="card openclaw-main-summary">
+      <div class="openclaw-summary-head"><span class="icon">▧</span><span>OpenClaw Summary</span></div>
+      <div class="openclaw-main-metrics">
+        <div class="oc-segment"><span>Status</span><strong id="oc-status" class="status-running">Unknown</strong></div>
+        <div class="oc-segment"><span>Agents</span><strong id="oc-agents">--</strong></div>
+        <div class="oc-segment"><span>Active</span><strong id="oc-active">--</strong></div>
+        <div class="oc-segment"><span>Models</span><strong id="oc-models">--</strong></div>
+        <div class="oc-segment"><span>Gateway</span><strong id="oc-gateway" class="status-unknown">Unknown</strong></div>
+      </div>
+      <button id="openclaw-control-main" class="openclaw-control-button" type="button">OpenClaw Control →</button>
+    </section>
+
+    <section class="card services clickable" data-detail="services">
+      <div class="service-title"><span class="icon">▦</span><span>Services</span></div>
+      <div id="svc-openclaw" class="service unknown"><span class="pill"></span><span>OpenClaw</span><span class="service-state">Unknown</span></div>
+      <div id="svc-ollama" class="service unknown"><span class="pill"></span><span>Ollama</span><span class="service-state">Unknown</span></div>
+      <div id="svc-tailscale" class="service unknown"><span class="pill"></span><span>Tailscale</span><span class="service-state">Unknown</span></div>
+    </section>
     </section>
 
     <section id="detail-view" class="detail-view hidden">
@@ -1202,14 +1178,8 @@
   </main>
 
   <script>
-    const history = {
-      cpu: [],
-      download: [],
-      upload: []
-    };
-
     const maxPoints = 42;
-    const kpiHistory = { cpu: [], ram: [], gpu: [], vram: [], temp: [], disk: [] };
+    const kpiHistory = { cpu: [], ram: [], download: [], upload: [], disk: [], uptime: [] };
 
     function ensureKpiSparks() {
       document.querySelectorAll(".kpi").forEach((node, index) => {
@@ -1218,7 +1188,7 @@
           canvas.className = "kpi-spark";
           canvas.width = 260;
           canvas.height = 54;
-          canvas.id = ["kpi-spark-cpu", "kpi-spark-ram", "kpi-spark-gpu", "kpi-spark-vram", "kpi-spark-temp", "kpi-spark-disk"][index];
+          canvas.id = ["kpi-spark-cpu", "kpi-spark-ram", "kpi-spark-download", "kpi-spark-upload", "kpi-spark-disk", "kpi-spark-uptime"][index];
           node.appendChild(canvas);
         }
       });
@@ -1228,13 +1198,6 @@
       const next = Number.isFinite(value) ? value : 0;
       kpiHistory[key].push(next);
       if (kpiHistory[key].length > maxPoints) kpiHistory[key].shift();
-    }
-
-
-    function pushHistory(key, value) {
-      const next = Number.isFinite(value) ? value : 0;
-      history[key].push(next);
-      if (history[key].length > maxPoints) history[key].shift();
     }
 
     function valueOrUnknown(value, suffix = "") {
@@ -1255,6 +1218,34 @@
       if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB/s`;
       if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB/s`;
       return `${Math.round(bytes)} B/s`;
+    }
+
+    function formatGpuValue(value, suffix = "") {
+      return Number.isFinite(value) ? `${value}${suffix}` : "--";
+    }
+
+    function renderGpuCard(index, gpu) {
+      const card = document.getElementById(`gpu-card-${index}`);
+      if (!card) return;
+      if (!gpu) {
+        card.innerHTML = `<div class="card-title"><span class="icon">▧</span><span>GPU ${index}</span></div><div class="gpu-unit-name">Unavailable</div>`;
+        return;
+      }
+      const gen = Number.isFinite(gpu.pcie_gen_max) ? `PCIe ${gpu.pcie_gen_max}.0` : "PCIe --";
+      const width = Number.isFinite(gpu.pcie_width_current) ? `x${gpu.pcie_width_current}` : "x--";
+      const maxWidth = Number.isFinite(gpu.pcie_width_max) ? `x${gpu.pcie_width_max}` : "x--";
+      card.innerHTML = `
+        <div class="card-title"><span class="icon">▧</span><span>GPU ${index}</span></div>
+        <div class="gpu-unit-name">${escapeHtml(gpu.name || "Unknown")}</div>
+        <div class="gpu-unit-metrics">
+          <div class="gpu-unit-metric"><span>Load</span><strong>${percent(gpu.usage_percent)}</strong></div>
+          <div class="gpu-unit-metric"><span>VRAM</span><strong>${formatGpuValue(gpu.vram_used_gb)} / ${formatGpuValue(gpu.vram_total_gb)} GB</strong></div>
+          <div class="gpu-unit-metric"><span>VRAM usage</span><strong>${percent(gpu.vram_usage_percent)}</strong></div>
+          <div class="gpu-unit-metric"><span>Temperature</span><strong>${formatGpuValue(gpu.temperature_c, "°C")}</strong></div>
+          <div class="gpu-unit-metric"><span>Power</span><strong>${formatGpuValue(gpu.power_draw_w)} / ${formatGpuValue(gpu.power_limit_w)} W</strong></div>
+          <div class="gpu-unit-metric"><span>Fan</span><strong>${percent(gpu.fan_speed_percent)}</strong></div>
+          <div class="gpu-unit-pcie">${gen} ${width} · Max ${maxWidth}</div>
+        </div>`;
     }
 
     function drawSparkline(id, values, color) {
@@ -1430,51 +1421,31 @@
         const cpu = data.cpu || {};
         const mem = data.memory || {};
         const disk = data.disk || {};
-        const gpu = data.gpu || {};
         const net = data.network || {};
+        const gpus = data.gpus || [];
+        const uptime = data.server?.uptime || {};
 
         document.getElementById("kpi-cpu").textContent = percent(cpu.usage_percent);
         document.getElementById("kpi-ram").textContent = percent(mem.usage_percent);
-        document.getElementById("kpi-gpu").textContent = percent(gpu.usage_percent);
-        document.getElementById("kpi-vram").textContent = percent(gpu.vram_usage_percent);
-        document.getElementById("kpi-temp").textContent = valueOrUnknown(gpu.temperature_c, "°C");
+        document.getElementById("kpi-download").textContent = formatBps(net.download_bps);
+        document.getElementById("kpi-upload").textContent = formatBps(net.upload_bps);
         document.getElementById("kpi-disk").textContent = percent(disk.usage_percent);
+        document.getElementById("kpi-uptime").textContent = uptime.label || "Unknown";
 
-        document.getElementById("gpu-name").textContent = gpu.name || "Unknown";
-        document.getElementById("gpu-load").textContent = percent(gpu.usage_percent);
-        document.getElementById("gpu-gauge").style.setProperty("--p", clampPercent(gpu.usage_percent));
-        document.getElementById("vram-text").innerHTML =
-          `${valueOrUnknown(gpu.vram_used_gb)} <small>/ ${valueOrUnknown(gpu.vram_total_gb)} GB</small>`;
-        document.getElementById("vram-bar").style.width = `${clampPercent(gpu.vram_usage_percent)}%`;
-        document.getElementById("gpu-temp").textContent = valueOrUnknown(gpu.temperature_c, "°C");
-
-        document.getElementById("cpu-main").textContent = percent(cpu.usage_percent);
-        document.getElementById("mem-main").innerHTML =
-          `${valueOrUnknown(mem.used_gb)} <small>/ ${valueOrUnknown(mem.total_gb)} GB</small>`;
-        document.getElementById("mem-percent").textContent = percent(mem.usage_percent);
-        document.getElementById("mem-bar").style.width = `${clampPercent(mem.usage_percent)}%`;
-
-        document.getElementById("download").textContent = formatBps(net.download_bps);
-        document.getElementById("upload").textContent = formatBps(net.upload_bps);
-
-        pushHistory("cpu", cpu.usage_percent);
-        pushHistory("download", net.download_bps);
-        pushHistory("upload", net.upload_bps);
-        drawSparkline("cpu-chart", history.cpu, "rgba(32, 217, 246, 1)");
-        drawSparkline("download-chart", history.download, "rgba(32, 217, 246, 1)");
-        drawSparkline("upload-chart", history.upload, "rgba(99, 239, 102, 1)");
+        renderGpuCard(0, gpus[0]);
+        renderGpuCard(1, gpus[1]);
         pushKpi("cpu", cpu.usage_percent);
         pushKpi("ram", mem.usage_percent);
-        pushKpi("gpu", gpu.usage_percent);
-        pushKpi("vram", gpu.vram_usage_percent);
-        pushKpi("temp", gpu.temperature_c);
+        pushKpi("download", net.download_bps);
+        pushKpi("upload", net.upload_bps);
         pushKpi("disk", disk.usage_percent);
+        pushKpi("uptime", uptime.seconds);
         drawSparkline("kpi-spark-cpu", kpiHistory.cpu, "rgba(59, 130, 246, 1)");
         drawSparkline("kpi-spark-ram", kpiHistory.ram, "rgba(34, 197, 94, 1)");
-        drawSparkline("kpi-spark-gpu", kpiHistory.gpu, "rgba(59, 130, 246, 1)");
-        drawSparkline("kpi-spark-vram", kpiHistory.vram, "rgba(34, 197, 94, 1)");
-        drawSparkline("kpi-spark-temp", kpiHistory.temp, "rgba(245, 158, 11, 1)");
+        drawSparkline("kpi-spark-download", kpiHistory.download, "rgba(34, 211, 238, 1)");
+        drawSparkline("kpi-spark-upload", kpiHistory.upload, "rgba(34, 197, 94, 1)");
         drawSparkline("kpi-spark-disk", kpiHistory.disk, "rgba(34, 211, 238, 1)");
+        drawSparkline("kpi-spark-uptime", kpiHistory.uptime, "rgba(245, 158, 11, 1)");
 
         setService("svc-openclaw", data.services?.openclaw);
         setService("svc-ollama", data.services?.ollama);
@@ -1612,9 +1583,21 @@
         setText("oc-gateway", gateway.charAt(0).toUpperCase() + gateway.slice(1));
         document.getElementById("oc-status").className = status === "Running" ? "status-running" : "status-unknown";
         document.getElementById("oc-gateway").className = gateway === "healthy" ? "status-running" : gateway === "degraded" ? "status-warning" : "status-unknown";
+        const secretary = agents.find(agent => agent.id === "secretary");
+        const secretaryState = secretary?.session?.state || "unknown";
+        setText("secretary-name", secretary?.name || "Secretary");
+        setText("secretary-model", secretary?.model || "--");
+        setText("secretary-state", secretaryState);
+        setText("secretary-sessions", secretary?.session?.session_count ?? "--");
+        setText("secretary-tokens", Number.isFinite(secretary?.session?.total_tokens) ? formatK(secretary.session.total_tokens) : "--");
+        const secretaryPill = document.getElementById("secretary-status-pill");
+        secretaryPill.textContent = secretaryState.toUpperCase();
+        secretaryPill.className = `erpmanager-status ${["working", "online", "idle"].includes(secretaryState) ? "normal" : ""}`;
       } catch (error) {
         setText("oc-status", "Unknown");
         setText("oc-gateway", "Unknown");
+        setText("secretary-state", "Unavailable");
+        document.getElementById("secretary-status-pill").textContent = "UNAVAILABLE";
       }
     }
 
