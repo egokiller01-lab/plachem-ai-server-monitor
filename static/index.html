@@ -386,6 +386,46 @@
 
     .net-arrow.up { color: var(--green); }
 
+    .codex-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-bottom: 8px;
+    }
+
+    .codex-card {
+      padding: 14px 16px;
+      border-color: rgba(255, 178, 28, 0.55);
+      box-shadow: 0 0 0 1px rgba(255, 178, 28, 0.35), 0 0 28px rgba(255, 178, 28, 0.18), var(--shadow);
+    }
+
+    .codex-percent {
+      font-size: 38px;
+      font-weight: 800;
+      line-height: 1;
+      margin-bottom: 4px;
+    }
+
+    .codex-meta {
+      margin-top: 8px;
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    .codex-sub {
+      margin-top: 6px;
+      font-size: 10px;
+      color: var(--muted);
+      opacity: 0.85;
+    }
+
+    .codex-error {
+      padding: 16px;
+      text-align: center;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
     .services {
       min-height: 58px;
       padding: 12px 14px;
@@ -473,6 +513,7 @@
     @media (max-width: 1350px) {
       .kpis { grid-template-columns: repeat(3, 1fr); }
       .main-grid { grid-template-columns: 1fr; }
+      .codex-grid { grid-template-columns: 1fr; }
       .services { grid-template-columns: 1fr; }
       .service { border-left: 0; justify-content: flex-start; }
     }
@@ -537,6 +578,9 @@
     .net-arrow { font-size: 22px; }
     .network canvas.spark { height: 34px; margin-top: 6px; }
 
+    .codex-grid { grid-template-columns: 1fr; gap: 8px; margin-bottom: 8px; }
+    .codex-card { padding: 10px 12px; }
+    .codex-percent { font-size: 28px; }
     .services { grid-template-columns: 105px repeat(3, 1fr); min-height: 52px; padding: 10px 14px; gap: 10px; margin-bottom: 8px; }
     .service-title { font-size: 18px; gap: 7px; }
     .service-title .icon { font-size: 14px; }
@@ -1023,6 +1067,22 @@
       <div id="svc-tailscale" class="service unknown"><span class="pill"></span><span>Tailscale</span><span class="service-state">Unknown</span></div>
     </section>
 
+    <section class="codex-grid">
+      <article class="card codex-card" id="codex-weekly-card">
+        <div class="card-title"><span class="icon">◈</span><span>Codex + Work Weekly</span></div>
+        <div id="codex-weekly-percent" class="codex-percent">--</div>
+        <div class="reading-label">Remaining</div>
+        <div class="bar"><div id="codex-weekly-bar" class="bar-fill"></div></div>
+        <div class="codex-meta"><span id="codex-weekly-reset">Resets --</span></div>
+      </article>
+      <article class="card codex-card" id="codex-spark-card">
+        <div class="card-title"><span class="icon">✦</span><span>GPT-5.3-Codex-Spark</span></div>
+        <div id="codex-spark-percent" class="codex-percent">--</div>
+        <div class="reading-label">5 hour limit</div>
+        <div class="bar"><div id="codex-spark-bar" class="bar-fill"></div></div>
+        <div class="codex-meta"><span id="codex-spark-reset">Resets --</span></div>
+        <div id="codex-spark-weekly" class="codex-sub">Weekly: --</div>
+      </article>
     </section>
 
     <section id="detail-view" class="detail-view hidden">
@@ -1166,6 +1226,68 @@
       node.className = `live ${state === "normal" ? "" : state}`;
       node.querySelector(".state").textContent =
         state === "normal" ? "System Normal" : state === "warning" ? "System Warning" : "System Error";
+    }
+
+    function formatResetsAt(ts) {
+      if (!ts) return "--";
+      const d = new Date(ts * 1000);
+      const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+      const m = months[d.getMonth()];
+      const day = d.getDate();
+      const h = d.getHours();
+      const min = d.getMinutes().toString().padStart(2, "0");
+      return `${m} ${day}, ${h}:${min}`;
+    }
+
+    function renderCodexError() {
+      document.getElementById("codex-weekly-percent").textContent = "--";
+      document.getElementById("codex-spark-percent").textContent = "--";
+      document.getElementById("codex-weekly-bar").style.width = "0%";
+      document.getElementById("codex-spark-bar").style.width = "0%";
+      document.getElementById("codex-weekly-reset").textContent = "Codex usage unavailable";
+      document.getElementById("codex-spark-reset").textContent = "Codex usage unavailable";
+      document.getElementById("codex-spark-weekly").textContent = "";
+      document.getElementById("codex-weekly-card").classList.add("codex-error");
+      document.getElementById("codex-spark-card").classList.add("codex-error");
+    }
+
+    async function refreshCodex() {
+      try {
+        const response = await fetch("/api/detail/codex", { cache: "no-store" });
+        const data = await response.json();
+
+        if (data.status !== "ok" || !data.codex || !data.spark) {
+          renderCodexError();
+          return;
+        }
+
+        document.getElementById("codex-weekly-card").classList.remove("codex-error");
+        document.getElementById("codex-spark-card").classList.remove("codex-error");
+
+        const weekly = data.codex.weekly || {};
+        const spark = data.spark || {};
+
+        // Weekly
+        const wRemaining = weekly.remaining_percent ?? null;
+        document.getElementById("codex-weekly-percent").textContent = wRemaining !== null ? `${wRemaining}%` : "--";
+        document.getElementById("codex-weekly-bar").style.width = `${Math.max(0, Math.min(100, wRemaining ?? 0))}%`;
+        document.getElementById("codex-weekly-reset").textContent = `Resets ${formatResetsAt(weekly.resets_at)}`;
+
+        // Spark 5h
+        const sparkPrimary = spark.primary || {};
+        const sRemaining = sparkPrimary.remaining_percent ?? null;
+        document.getElementById("codex-spark-percent").textContent = sRemaining !== null ? `${sRemaining}%` : "--";
+        document.getElementById("codex-spark-bar").style.width = `${Math.max(0, Math.min(100, sRemaining ?? 0))}%`;
+        document.getElementById("codex-spark-reset").textContent = `Resets ${formatResetsAt(sparkPrimary.resets_at)}`;
+
+        // Spark weekly sub
+        const sparkSecondary = spark.secondary || {};
+        const swRemaining = sparkSecondary.remaining_percent ?? null;
+        document.getElementById("codex-spark-weekly").textContent =
+          `Weekly: ${swRemaining !== null ? swRemaining + "%" : "--"} remaining · resets ${formatResetsAt(sparkSecondary.resets_at)}`;
+      } catch (err) {
+        renderCodexError();
+      }
     }
 
     async function refresh() {
@@ -1438,6 +1560,8 @@
     routeDetail();
     refresh();
     setInterval(() => { refresh(); refreshDetail(); refreshOpenclaw(); refreshOpenclawMain(); }, 2000);
+    refreshCodex();
+    setInterval(refreshCodex, 60000);
     refreshOpenclawMain(true);
   </script>
 </body>
