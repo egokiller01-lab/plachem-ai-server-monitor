@@ -1369,22 +1369,52 @@ def api_status() -> dict[str, Any]:
     }
 
 
+def _is_automated_session_key(key: str) -> bool:
+    lowered = key.lower()
+    return any(marker in lowered for marker in ("heartbeat", "smoke", "test", "benchmark", ":explicit:"))
+
+
+def _select_erpmanager_session(sessions: dict[str, Any]) -> tuple[str, dict[str, Any]] | tuple[None, None]:
+    candidates: list[tuple[tuple[int, int, int], str, dict[str, Any]]] = []
+    for key, item in sessions.items():
+        if not isinstance(item, dict) or item.get("status") == "failed":
+            continue
+        origin = item.get("origin") if isinstance(item.get("origin"), dict) else {}
+        is_webchat_direct = (
+            origin.get("provider") == "webchat"
+            and origin.get("surface") == "webchat"
+            and (origin.get("chatType") == "direct" or item.get("chatType") == "direct")
+        )
+        is_dashboard = ":dashboard:" in str(key)
+        if _is_automated_session_key(str(key)):
+            continue
+        status_active = item.get("status") in {"running", "working", "active"}
+        priority = (
+            2 if is_webchat_direct and is_dashboard else 1 if is_webchat_direct else 0,
+            1 if status_active else 0,
+            int(item.get("updatedAt") or 0),
+        )
+        candidates.append((priority, str(key), item))
+    if not candidates:
+        return None, None
+    _, key, item = max(candidates, key=lambda candidate: candidate[0])
+    return key, item
+
+
 def _collect_agent_context(agent_id: str) -> dict[str, Any]:
     sessions = read_json_file(openclaw_home() / "agents" / agent_id / "sessions" / "sessions.json")
     if not isinstance(sessions, dict):
         raise RuntimeError("sessions.json not found or invalid")
-    # ERPmanager's monitored conversation is its canonical main session. Other
-    # agents retain the existing most-recent-session behavior.
-    canonical_key = f"agent:{agent_id}:main"
     best_key, best_item, best_updated = None, None, 0
-    for key, item in sessions.items():
-        if not isinstance(item, dict):
-            continue
-        updated = int(item.get("updatedAt") or 0)
-        if updated >= best_updated:
-            best_key, best_item, best_updated = key, item, updated
-    if agent_id == "erpmanager" and isinstance(sessions.get(canonical_key), dict):
-        best_key, best_item = canonical_key, sessions[canonical_key]
+    if agent_id == "erpmanager":
+        best_key, best_item = _select_erpmanager_session(sessions)
+    else:
+        for key, item in sessions.items():
+            if not isinstance(item, dict):
+                continue
+            updated = int(item.get("updatedAt") or 0)
+            if updated >= best_updated:
+                best_key, best_item, best_updated = key, item, updated
     if best_item is None:
         raise RuntimeError("no active session found")
     total_tokens = best_item.get("totalTokens")
@@ -1432,6 +1462,7 @@ def _collect_agent_context(agent_id: str) -> dict[str, Any]:
     duration_seconds = round((now_ms - started) / 1000) if isinstance(started, (int, float)) else None
     return {
         "agent_id": agent_id,
+        "session_key": best_key,
         "session_id": best_item.get("sessionId"),
         "model": best_item.get("model"),
         "total_tokens": total_tokens,
@@ -1478,15 +1509,15 @@ def _read_prompt_budget_from_gateway_journal(
     )
     if result is None or result.returncode != 0:
         return None
-    session_file_marker = f"/sessions/{session_id}.jsonl" if session_id else None
+    if not session_key or not session_id:
+        return None
+    session_file_marker = f"/sessions/{session_id}.jsonl"
     latest = None
     for line in result.stdout.splitlines():
-        if "[context-overflow-precheck]" not in line or f"sessionKey={session_key}" not in line:
-            continue
-        if session_file_marker and session_file_marker not in line:
+        if "[context-overflow-precheck]" not in line or session_file_marker not in line:
             continue
         match = _PROMPT_BUDGET_LOG_RE.search(line)
-        if match:
+        if match and match.group("session_key") == session_key:
             latest = match
     if latest is None:
         return None
