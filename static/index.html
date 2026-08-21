@@ -491,6 +491,11 @@
       background: rgba(255, 92, 113, 0.14);
       border: 1px solid rgba(255, 92, 113, 0.40);
     }
+    .erpmanager-status.overflow {
+      color: var(--red);
+      background: rgba(255, 92, 113, 0.20);
+      border: 1px solid rgba(255, 92, 113, 0.62);
+    }
     .erpmanager-card.erpmanager-error {
       padding: 18px;
       text-align: center;
@@ -1113,14 +1118,14 @@
     <section class="agent-grid">
       <article class="card erpmanager-card" id="erpmanager-card">
         <div class="card-title"><span class="icon" style="color:#63c5ff">⛁</span><span>ERPmanager</span><span id="erpmanager-status-pill" class="erpmanager-status">--</span></div>
-        <div class="erpmanager-percent"><span id="erpmanager-percent">--</span><span class="bar-label">Context</span></div>
+        <div class="erpmanager-percent"><span id="erpmanager-percent">--</span><span class="bar-label">Prompt</span></div>
         <div class="erpmanager-bar"><div id="erpmanager-bar-fill" class="erpmanager-bar-fill"></div></div>
         <div id="erpmanager-tokens" class="reading-label">-- / --</div>
         <div id="erpmanager-meta" class="erpmanager-meta">--</div>
       </article>
       <article class="card secretary-card" id="secretary-card">
         <div class="card-title"><span class="icon" style="color:#a78bfa">◆</span><span>Secretary</span><span id="secretary-status-pill" class="erpmanager-status">--</span></div>
-        <div class="erpmanager-percent"><span id="secretary-percent">--</span><span class="bar-label">Context</span></div>
+        <div class="erpmanager-percent"><span id="secretary-percent">--</span><span class="bar-label">Prompt</span></div>
         <div class="erpmanager-bar"><div id="secretary-bar-fill" class="erpmanager-bar-fill"></div></div>
         <div id="secretary-tokens" class="reading-label">-- / --</div>
         <div id="secretary-meta" class="erpmanager-meta">--</div>
@@ -1384,6 +1389,12 @@
       return `${Math.floor(seconds / 86400)}d ${Math.floor((seconds % 86400) / 3600)}h`;
     }
 
+    function formatPromptRiskMeta(data) {
+      if (data.overflow_tokens > 0) return `Overflow <strong>+${formatK(data.overflow_tokens)}</strong>`;
+      if (data.remaining_prompt_budget_tokens != null) return `Headroom <strong>${formatK(data.remaining_prompt_budget_tokens)}</strong>`;
+      return "Prompt estimate unavailable";
+    }
+
     function renderErpmanagerError() {
       const card = document.getElementById("erpmanager-card");
       card.classList.add("erpmanager-error");
@@ -1403,18 +1414,17 @@
 
         document.getElementById("erpmanager-card").classList.remove("erpmanager-error");
 
-        const pct = data.context_percent;
+        const pct = data.prompt_percent;
         document.getElementById("erpmanager-percent").textContent = pct !== null && pct !== undefined ? `${pct}%` : "--";
         document.getElementById("erpmanager-bar-fill").style.width = `${clampPercent(pct)}%`;
-        document.getElementById("erpmanager-tokens").textContent = `${formatK(data.total_tokens)} / ${formatK(data.context_tokens)}`;
+        document.getElementById("erpmanager-tokens").textContent = `${formatK(data.estimated_prompt_tokens)} / ${formatK(data.prompt_budget_before_reserve)} budget`;
 
         const health = data.health || "unknown";
         const pill = document.getElementById("erpmanager-status-pill");
         pill.textContent = health.toUpperCase();
         pill.className = `erpmanager-status ${health}`;
 
-        document.getElementById("erpmanager-meta").innerHTML =
-          `Input <strong>${formatK(data.input_tokens)}</strong> · Output <strong>${formatK(data.output_tokens)}</strong> · Cache hit <strong>${data.cache_hit_percent ?? "--"}%</strong> · Session <strong>${formatSessionDuration(data.duration_seconds)}</strong>`;
+        document.getElementById("erpmanager-meta").innerHTML = formatPromptRiskMeta(data);
       } catch (err) {
         renderErpmanagerError();
       }
@@ -1436,15 +1446,14 @@
         const data = await response.json();
         if (data.status !== "ok") { renderSecretaryError(); return; }
         document.getElementById("secretary-card").classList.remove("erpmanager-error");
-        document.getElementById("secretary-percent").textContent = data.context_percent != null ? `${data.context_percent}%` : "--";
-        document.getElementById("secretary-bar-fill").style.width = `${clampPercent(data.context_percent)}%`;
-        document.getElementById("secretary-tokens").textContent = `${formatK(data.total_tokens)} / ${formatK(data.context_tokens)}`;
+        document.getElementById("secretary-percent").textContent = data.prompt_percent != null ? `${data.prompt_percent}%` : "--";
+        document.getElementById("secretary-bar-fill").style.width = `${clampPercent(data.prompt_percent)}%`;
+        document.getElementById("secretary-tokens").textContent = `${formatK(data.estimated_prompt_tokens)} / ${formatK(data.prompt_budget_before_reserve)} budget`;
         const health = data.health || "unknown";
         const pill = document.getElementById("secretary-status-pill");
         pill.textContent = health.toUpperCase();
         pill.className = `erpmanager-status ${health}`;
-        document.getElementById("secretary-meta").innerHTML =
-          `Input <strong>${formatK(data.input_tokens)}</strong> · Output <strong>${formatK(data.output_tokens)}</strong> · Cache hit <strong>${data.cache_hit_percent == null ? "--" : data.cache_hit_percent + "%"}</strong> · Session <strong>${formatSessionDuration(data.duration_seconds)}</strong>`;
+        document.getElementById("secretary-meta").innerHTML = formatPromptRiskMeta(data);
       } catch (err) {
         renderSecretaryError();
       }

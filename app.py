@@ -1373,7 +1373,9 @@ def _collect_agent_context(agent_id: str) -> dict[str, Any]:
     sessions = read_json_file(openclaw_home() / "agents" / agent_id / "sessions" / "sessions.json")
     if not isinstance(sessions, dict):
         raise RuntimeError("sessions.json not found or invalid")
-    # Find current active session: most recent updatedAt
+    # ERPmanager's monitored conversation is its canonical main session. Other
+    # agents retain the existing most-recent-session behavior.
+    canonical_key = f"agent:{agent_id}:main"
     best_key, best_item, best_updated = None, None, 0
     for key, item in sessions.items():
         if not isinstance(item, dict):
@@ -1381,6 +1383,8 @@ def _collect_agent_context(agent_id: str) -> dict[str, Any]:
         updated = int(item.get("updatedAt") or 0)
         if updated >= best_updated:
             best_key, best_item, best_updated = key, item, updated
+    if agent_id == "erpmanager" and isinstance(sessions.get(canonical_key), dict):
+        best_key, best_item = canonical_key, sessions[canonical_key]
     if best_item is None:
         raise RuntimeError("no active session found")
     total_tokens = best_item.get("totalTokens")
@@ -1389,14 +1393,37 @@ def _collect_agent_context(agent_id: str) -> dict[str, Any]:
     output_tokens = best_item.get("outputTokens")
     cache_read = best_item.get("cacheRead")
     cache_write = best_item.get("cacheWrite")
-    context_percent = round(total_tokens / context_tokens * 100) if isinstance(total_tokens, (int, float)) and isinstance(context_tokens, (int, float)) and context_tokens else None
+    budget = best_item.get("contextBudgetStatus")
+    estimate_source = None
+    if isinstance(budget, dict) and isinstance(budget.get("estimatedPromptTokens"), (int, float)):
+        budget = dict(budget)
+        estimate_source = str(budget.get("source") or "pre-prompt-estimate")
+    else:
+        budget = _read_prompt_budget_from_gateway_journal(
+            agent_id=agent_id,
+            session_key=str(best_key),
+            session_id=str(best_item.get("sessionId") or ""),
+            context_token_budget=context_tokens,
+        )
+        estimate_source = "gateway-journal" if budget else None
+
+    estimated_prompt_tokens = budget.get("estimatedPromptTokens") if budget else None
+    context_token_budget = budget.get("contextTokenBudget") if budget else context_tokens
+    prompt_budget = budget.get("promptBudgetBeforeReserve") if budget else None
+    reserve_tokens = budget.get("reserveTokens") if budget else None
+    remaining_prompt_budget_tokens = budget.get("remainingPromptBudgetTokens") if budget else None
+    overflow_tokens = budget.get("overflowTokens") if budget else None
+    route = budget.get("route") if budget else None
+    prompt_percent = round(estimated_prompt_tokens / prompt_budget * 100) if isinstance(estimated_prompt_tokens, (int, float)) and isinstance(prompt_budget, (int, float)) and prompt_budget else None
     denom = (cache_read or 0) + (cache_write or 0) + (input_tokens or 0)
     cache_hit_percent = round(cache_read / denom * 100) if cache_read and denom else None
-    if context_percent is None:
+    if prompt_percent is None:
         health = None
-    elif context_percent < 70:
+    elif isinstance(overflow_tokens, (int, float)) and overflow_tokens > 0:
+        health = "overflow"
+    elif prompt_percent < 70:
         health = "normal"
-    elif context_percent < 85:
+    elif prompt_percent < 85:
         health = "warning"
     else:
         health = "critical"
@@ -1409,7 +1436,16 @@ def _collect_agent_context(agent_id: str) -> dict[str, Any]:
         "model": best_item.get("model"),
         "total_tokens": total_tokens,
         "context_tokens": context_tokens,
-        "context_percent": context_percent,
+        "context_percent": prompt_percent,
+        "prompt_percent": prompt_percent,
+        "estimate_source": estimate_source,
+        "estimated_prompt_tokens": estimated_prompt_tokens,
+        "context_token_budget": context_token_budget,
+        "prompt_budget_before_reserve": prompt_budget,
+        "reserve_tokens": reserve_tokens,
+        "remaining_prompt_budget_tokens": remaining_prompt_budget_tokens,
+        "overflow_tokens": overflow_tokens,
+        "route": route,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "cache_read": cache_read,
@@ -1419,6 +1455,55 @@ def _collect_agent_context(agent_id: str) -> dict[str, Any]:
         "updated_at": best_item.get("updatedAt"),
         "duration_seconds": duration_seconds,
         "health": health,
+    }
+
+
+_PROMPT_BUDGET_LOG_RE = re.compile(
+    r"\[context-overflow-precheck\].*?sessionKey=(?P<session_key>\S+).*?"
+    r"route=(?P<route>\S+).*?estimatedPromptTokens=(?P<estimated>\d+).*?"
+    r"promptBudgetBeforeReserve=(?P<prompt_budget>\d+).*?overflowTokens=(?P<overflow>\d+).*?"
+    r"reserveTokens=(?P<reserve>\d+)"
+)
+
+
+def _read_prompt_budget_from_gateway_journal(
+    agent_id: str,
+    session_key: str,
+    session_id: str,
+    context_token_budget: Any,
+) -> dict[str, Any] | None:
+    result = safe_run(
+        ["journalctl", "--user", "-u", "openclaw-gateway", "--no-pager", "-o", "cat", "-n", "5000"],
+        timeout=2.0,
+    )
+    if result is None or result.returncode != 0:
+        return None
+    session_file_marker = f"/sessions/{session_id}.jsonl" if session_id else None
+    latest = None
+    for line in result.stdout.splitlines():
+        if "[context-overflow-precheck]" not in line or f"sessionKey={session_key}" not in line:
+            continue
+        if session_file_marker and session_file_marker not in line:
+            continue
+        match = _PROMPT_BUDGET_LOG_RE.search(line)
+        if match:
+            latest = match
+    if latest is None:
+        return None
+    estimated = int(latest.group("estimated"))
+    prompt_budget = int(latest.group("prompt_budget"))
+    overflow = int(latest.group("overflow"))
+    reserve = int(latest.group("reserve"))
+    resolved_context_budget = int(context_token_budget) if isinstance(context_token_budget, (int, float)) else prompt_budget + reserve
+    return {
+        "source": "gateway-journal",
+        "estimatedPromptTokens": estimated,
+        "contextTokenBudget": resolved_context_budget,
+        "promptBudgetBeforeReserve": prompt_budget,
+        "reserveTokens": reserve,
+        "remainingPromptBudgetTokens": max(0, prompt_budget - estimated),
+        "overflowTokens": overflow,
+        "route": latest.group("route"),
     }
 
 
