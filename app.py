@@ -876,7 +876,17 @@ def api_status() -> dict[str, Any]:
     memory = get_memory()
     disk = get_disk()
     network = get_network()
-    gpu = get_gpu()
+    gpus = get_gpus()
+    gpu = gpus[0] if gpus else {
+        "name": "Unknown",
+        "usage_percent": None,
+        "vram_used_gb": None,
+        "vram_total_gb": None,
+        "vram_usage_percent": None,
+        "temperature_c": None,
+        "status": "unknown",
+        "source": "none",
+    }
     services = get_services()
 
     service_states = [item["state"] for item in services.values()]
@@ -903,6 +913,6 @@ def api_status() -> dict[str, Any]:
         "disk": disk,
         "network": network,
         "gpu": gpu,
-        "gpus": get_gpus(),
+        "gpus": gpus,
         "services": services,
     }
