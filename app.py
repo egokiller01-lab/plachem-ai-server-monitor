@@ -1146,12 +1146,24 @@ def _collect_codex_rate_limits(timeout: float = 12.0) -> dict[str, Any]:
                 if not chunk:
                     break
                 buf += chunk
-                if b"\n" in buf:
+                # Drain all available lines, return the last JSON-RPC response
+                result: dict[str, Any] = {}
+                while b"\n" in buf:
+                    idx = buf.index(b"\n")
+                    line = buf[:idx].decode("utf-8", errors="ignore").strip()
+                    buf = buf[idx+1:]
+                    if not line:
+                        continue
                     try:
-                        line = buf[:buf.index(b"\n")].decode("utf-8", errors="ignore").strip()
-                        return json.loads(line)
+                        obj = json.loads(line)
+                        if isinstance(obj, dict) and "id" in obj:
+                            result = obj
+                        elif isinstance(obj, dict) and obj.get("id") is not None:
+                            result = obj
                     except Exception:
                         pass
+                if result:
+                    return result
         return {}
 
     try:
