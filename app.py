@@ -394,6 +394,7 @@ def get_network() -> dict[str, Any]:
 
 def _gpu_metrics_from_nvidia_smi_row(row: list[str], index: int) -> dict[str, Any] | None:
     name, gpu_util, mem_used, mem_total, temp = row[:5]
+    uuid = row[5] if len(row) > 5 and row[5] else None
     try:
         used = float(mem_used)
         total = float(mem_total)
@@ -402,16 +403,17 @@ def _gpu_metrics_from_nvidia_smi_row(row: list[str], index: int) -> dict[str, An
     used_gb = round(used / 1024, 1)
     total_gb = round(total / 1024, 1)
     vram_percent = round((used / total) * 100, 1) if total else None
-    power_draw = pct(row[5]) if len(row) > 5 else None
-    power_limit = pct(row[6]) if len(row) > 6 else None
-    fan_speed = pct(row[7]) if len(row) > 7 else None
-    pci_bus_id = row[8] if len(row) > 8 and row[8] else None
-    pcie_gen_current = row[9] if len(row) > 9 and row[9].isdigit() else None
-    pcie_gen_max = row[10] if len(row) > 10 and row[10].isdigit() else None
-    pcie_width_current = row[11] if len(row) > 11 and row[11].isdigit() else None
-    pcie_width_max = row[12] if len(row) > 12 and row[12].isdigit() else None
+    power_draw = pct(row[6]) if len(row) > 6 else None
+    power_limit = pct(row[7]) if len(row) > 7 else None
+    fan_speed = pct(row[8]) if len(row) > 8 else None
+    pci_bus_id = row[9] if len(row) > 9 and row[9] else None
+    pcie_gen_current = row[10] if len(row) > 10 and row[10].isdigit() else None
+    pcie_gen_max = row[11] if len(row) > 11 and row[11].isdigit() else None
+    pcie_width_current = row[12] if len(row) > 12 and row[12].isdigit() else None
+    pcie_width_max = row[13] if len(row) > 13 and row[13].isdigit() else None
     return {
         "index": index,
+        "uuid": uuid,
         "name": name,
         "usage_percent": pct(gpu_util),
         "vram_used_gb": used_gb,
@@ -434,7 +436,7 @@ def _gpu_metrics_from_nvidia_smi_row(row: list[str], index: int) -> dict[str, An
 def get_gpus_from_nvidia_smi() -> list[dict[str, Any]]:
     if not shutil.which("nvidia-smi"):
         return []
-    query = "name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit,fan.speed,pci.bus_id,pcie.link.gen.current,pcie.link.gen.max,pcie.link.width.current,pcie.link.width.max"
+    query = "name,utilization.gpu,memory.used,memory.total,temperature.gpu,uuid,power.draw,power.limit,fan.speed,pci.bus_id,pcie.link.gen.current,pcie.link.gen.max,pcie.link.width.current,pcie.link.width.max"
     result = safe_run(["nvidia-smi", f"--query-gpu={query}", "--format=csv,noheader,nounits"])
     if not result or result.returncode != 0 or not result.stdout.strip():
         return []
@@ -444,6 +446,7 @@ def get_gpus_from_nvidia_smi() -> list[dict[str, Any]]:
         if len(parts) < 5:
             out.append({
                 "index": i,
+                "uuid": None,
                 "name": "Unknown",
                 "usage_percent": None,
                 "vram_used_gb": None,
@@ -467,6 +470,7 @@ def get_gpus_from_nvidia_smi() -> list[dict[str, Any]]:
         if metrics is None:
             out.append({
                 "index": i,
+                "uuid": None,
                 "name": "Unknown",
                 "usage_percent": None,
                 "vram_used_gb": None,
@@ -508,9 +512,12 @@ def get_gpus_from_pynvml() -> list[dict[str, Any]]:
             handle = pynvml.nvmlDeviceGetHandleByIndex(i)
             raw_name = pynvml.nvmlDeviceGetName(handle)
             name = raw_name.decode("utf-8") if isinstance(raw_name, bytes) else str(raw_name)
+            uuid = pynvml.nvmlDeviceGetUUID(handle)
+            uuid = uuid.decode("utf-8") if isinstance(uuid, bytes) else str(uuid)
         except Exception as exc:
             out.append({
                 "index": i,
+                "uuid": None,
                 "name": "Unknown",
                 "usage_percent": None,
                 "vram_used_gb": None,
@@ -581,6 +588,7 @@ def get_gpus_from_pynvml() -> list[dict[str, Any]]:
             pcie_width_max = None
         out.append({
             "index": i,
+            "uuid": uuid,
             "name": name,
             "usage_percent": util_gpu,
             "vram_used_gb": bytes_to_gb(mem_used),
@@ -610,6 +618,7 @@ def get_gpus() -> list[dict[str, Any]]:
         gpus = get_gpus_from_nvidia_smi() or get_gpus_from_pynvml()
         return gpus if gpus else [{
             "index": 0,
+            "uuid": None,
             "name": "Unknown",
             "usage_percent": None,
             "vram_used_gb": None,
@@ -630,6 +639,7 @@ def get_gpus() -> list[dict[str, Any]]:
     except Exception as exc:
         return [{
             "index": 0,
+            "uuid": None,
             "name": "Error",
             "usage_percent": None,
             "vram_used_gb": None,
@@ -653,6 +663,7 @@ def get_gpus() -> list[dict[str, Any]]:
 def get_gpu() -> dict[str, Any]:
     gpus = get_gpus()
     return gpus[0] if gpus else {
+        "uuid": None,
         "name": "Unknown",
         "usage_percent": None,
         "vram_used_gb": None,
@@ -813,19 +824,38 @@ def major_folder_sizes() -> list[dict[str, Any]]:
 def gpu_processes() -> list[dict[str, Any]]:
     if not shutil.which("nvidia-smi"):
         return []
-    query = "pid,process_name,used_memory"
+    query = "gpu_bus_id,gpu_uuid,pid,process_name,used_memory"
     result = safe_run(["nvidia-smi", f"--query-compute-apps={query}", "--format=csv,noheader,nounits"], timeout=1.5)
     if not result or result.returncode != 0 or not result.stdout.strip():
         return []
+    gpus = get_gpus()
+    uuid_to_index: dict[str, int] = {}
+    bus_to_index: dict[str, int] = {}
+    for g in gpus:
+        if g.get("uuid"):
+            uuid_to_index[str(g["uuid"])] = g["index"]
+        if g.get("pci_bus_id"):
+            bus_to_index[str(g["pci_bus_id"])] = g["index"]
     rows: list[dict[str, Any]] = []
     for line in result.stdout.strip().splitlines():
         parts = [part.strip() for part in line.split(",")]
-        if len(parts) < 3:
+        if len(parts) < 5:
             continue
         try:
-            rows.append({"pid": int(parts[0]), "name": parts[1], "vram_mb": float(parts[2])})
+            bus_id, uuid, pid, name, vram = parts[0], parts[1], int(parts[2]), parts[3], float(parts[4])
         except Exception:
             continue
+        gpu_index = uuid_to_index.get(uuid) if uuid else None
+        if gpu_index is None:
+            gpu_index = bus_to_index.get(bus_id) if bus_id else None
+        rows.append({
+            "gpu_index": gpu_index,
+            "gpu_uuid": uuid if uuid else None,
+            "gpu_bus_id": bus_id if bus_id else None,
+            "pid": pid,
+            "name": name,
+            "vram_mb": vram,
+        })
     return sorted(rows, key=lambda item: item["vram_mb"], reverse=True)
 
 
@@ -997,6 +1027,7 @@ def api_status() -> dict[str, Any]:
     network = get_network()
     gpus = get_gpus()
     gpu = gpus[0] if gpus else {
+        "uuid": None,
         "name": "Unknown",
         "usage_percent": None,
         "vram_used_gb": None,
