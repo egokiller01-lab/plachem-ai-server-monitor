@@ -392,22 +392,18 @@ def get_network() -> dict[str, Any]:
         return {"upload_bps": None, "download_bps": None, "status": "error", "error": str(exc)}
 
 
-def get_gpu_from_nvidia_smi() -> dict[str, Any] | None:
-    if not shutil.which("nvidia-smi"):
+def _gpu_metrics_from_nvidia_smi_row(row: list[str], index: int) -> dict[str, Any] | None:
+    name, gpu_util, mem_used, mem_total, temp = row[:5]
+    try:
+        used = float(mem_used)
+        total = float(mem_total)
+    except Exception:
         return None
-    query = "name,utilization.gpu,memory.used,memory.total,temperature.gpu"
-    result = safe_run(["nvidia-smi", f"--query-gpu={query}", "--format=csv,noheader,nounits"])
-    if not result or result.returncode != 0 or not result.stdout.strip():
-        return None
-    first = result.stdout.strip().splitlines()[0]
-    parts = [part.strip() for part in first.split(",")]
-    if len(parts) < 5:
-        return None
-    name, gpu_util, mem_used, mem_total, temp = parts[:5]
-    used_gb = round(float(mem_used) / 1024, 1)
-    total_gb = round(float(mem_total) / 1024, 1)
-    vram_percent = round((float(mem_used) / float(mem_total)) * 100, 1) if float(mem_total) else None
+    used_gb = round(used / 1024, 1)
+    total_gb = round(total / 1024, 1)
+    vram_percent = round((used / total) * 100, 1) if total else None
     return {
+        "index": index,
         "name": name,
         "usage_percent": pct(gpu_util),
         "vram_used_gb": used_gb,
@@ -419,35 +415,106 @@ def get_gpu_from_nvidia_smi() -> dict[str, Any] | None:
     }
 
 
-def get_gpu_from_pynvml() -> dict[str, Any] | None:
+def get_gpus_from_nvidia_smi() -> list[dict[str, Any]]:
+    if not shutil.which("nvidia-smi"):
+        return []
+    query = "name,utilization.gpu,memory.used,memory.total,temperature.gpu"
+    result = safe_run(["nvidia-smi", f"--query-gpu={query}", "--format=csv,noheader,nounits"])
+    if not result or result.returncode != 0 or not result.stdout.strip():
+        return []
+    out: list[dict[str, Any]] = []
+    for i, line in enumerate(result.stdout.strip().splitlines()):
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 5:
+            out.append({
+                "index": i,
+                "name": "Unknown",
+                "usage_percent": None,
+                "vram_used_gb": None,
+                "vram_total_gb": None,
+                "vram_usage_percent": None,
+                "temperature_c": None,
+                "status": "error",
+                "source": "nvidia-smi",
+                "error": "invalid nvidia-smi row",
+            })
+            continue
+        metrics = _gpu_metrics_from_nvidia_smi_row(parts, i)
+        if metrics is None:
+            out.append({
+                "index": i,
+                "name": "Unknown",
+                "usage_percent": None,
+                "vram_used_gb": None,
+                "vram_total_gb": None,
+                "vram_usage_percent": None,
+                "temperature_c": None,
+                "status": "error",
+                "source": "nvidia-smi",
+                "error": "parse failure",
+            })
+        else:
+            out.append(metrics)
+    return out
+
+
+def get_gpus_from_pynvml() -> list[dict[str, Any]]:
     try:
         import pynvml
 
         pynvml.nvmlInit()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-        raw_name = pynvml.nvmlDeviceGetName(handle)
-        name = raw_name.decode("utf-8") if isinstance(raw_name, bytes) else str(raw_name)
-        util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-        mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
-        temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
-        pynvml.nvmlShutdown()
-        return {
-            "name": name,
-            "usage_percent": pct(util.gpu),
-            "vram_used_gb": bytes_to_gb(mem.used),
-            "vram_total_gb": bytes_to_gb(mem.total),
-            "vram_usage_percent": pct((mem.used / mem.total) * 100 if mem.total else None),
-            "temperature_c": pct(temp),
-            "status": "ok",
-            "source": "pynvml",
-        }
     except Exception:
-        return None
-
-
-def get_gpu() -> dict[str, Any]:
+        return []
+    count = 0
+    out: list[dict[str, Any]] = []
     try:
-        return get_gpu_from_nvidia_smi() or get_gpu_from_pynvml() or {
+        count = pynvml.nvmlDeviceGetCount()
+    except Exception:
+        count = 0
+    for i in range(count):
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+            raw_name = pynvml.nvmlDeviceGetName(handle)
+            name = raw_name.decode("utf-8") if isinstance(raw_name, bytes) else str(raw_name)
+            util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+            mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
+            out.append({
+                "index": i,
+                "name": name,
+                "usage_percent": pct(util.gpu),
+                "vram_used_gb": bytes_to_gb(mem.used),
+                "vram_total_gb": bytes_to_gb(mem.total),
+                "vram_usage_percent": pct((mem.used / mem.total) * 100 if mem.total else None),
+                "temperature_c": pct(temp),
+                "status": "ok",
+                "source": "pynvml",
+            })
+        except Exception as exc:
+            out.append({
+                "index": i,
+                "name": "Unknown",
+                "usage_percent": None,
+                "vram_used_gb": None,
+                "vram_total_gb": None,
+                "vram_usage_percent": None,
+                "temperature_c": None,
+                "status": "error",
+                "source": "pynvml",
+                "error": str(exc),
+            })
+    try:
+        pynvml.nvmlShutdown()
+    except Exception:
+        pass
+    return out
+
+
+def get_gpus() -> list[dict[str, Any]]:
+    try:
+        gpus = get_gpus_from_nvidia_smi() or get_gpus_from_pynvml()
+        return gpus if gpus else [{
+            "index": 0,
             "name": "Unknown",
             "usage_percent": None,
             "vram_used_gb": None,
@@ -456,9 +523,10 @@ def get_gpu() -> dict[str, Any]:
             "temperature_c": None,
             "status": "unknown",
             "source": "none",
-        }
+        }]
     except Exception as exc:
-        return {
+        return [{
+            "index": 0,
             "name": "Error",
             "usage_percent": None,
             "vram_used_gb": None,
@@ -466,8 +534,23 @@ def get_gpu() -> dict[str, Any]:
             "vram_usage_percent": None,
             "temperature_c": None,
             "status": "error",
+            "source": "none",
             "error": str(exc),
-        }
+        }]
+
+
+def get_gpu() -> dict[str, Any]:
+    gpus = get_gpus()
+    return gpus[0] if gpus else {
+        "name": "Unknown",
+        "usage_percent": None,
+        "vram_used_gb": None,
+        "vram_total_gb": None,
+        "vram_usage_percent": None,
+        "temperature_c": None,
+        "status": "unknown",
+        "source": "none",
+    }
 
 
 def systemctl_status(service: str) -> str | None:
@@ -820,5 +903,6 @@ def api_status() -> dict[str, Any]:
         "disk": disk,
         "network": network,
         "gpu": gpu,
+        "gpus": get_gpus(),
         "services": services,
     }
