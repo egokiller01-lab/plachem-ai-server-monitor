@@ -402,6 +402,14 @@ def _gpu_metrics_from_nvidia_smi_row(row: list[str], index: int) -> dict[str, An
     used_gb = round(used / 1024, 1)
     total_gb = round(total / 1024, 1)
     vram_percent = round((used / total) * 100, 1) if total else None
+    power_draw = pct(row[5]) if len(row) > 5 else None
+    power_limit = pct(row[6]) if len(row) > 6 else None
+    fan_speed = pct(row[7]) if len(row) > 7 else None
+    pci_bus_id = row[8] if len(row) > 8 and row[8] else None
+    pcie_gen_current = row[9] if len(row) > 9 and row[9].isdigit() else None
+    pcie_gen_max = row[10] if len(row) > 10 and row[10].isdigit() else None
+    pcie_width_current = row[11] if len(row) > 11 and row[11].isdigit() else None
+    pcie_width_max = row[12] if len(row) > 12 and row[12].isdigit() else None
     return {
         "index": index,
         "name": name,
@@ -410,6 +418,14 @@ def _gpu_metrics_from_nvidia_smi_row(row: list[str], index: int) -> dict[str, An
         "vram_total_gb": total_gb,
         "vram_usage_percent": vram_percent,
         "temperature_c": pct(temp),
+        "power_draw_w": power_draw,
+        "power_limit_w": power_limit,
+        "fan_speed_percent": fan_speed,
+        "pci_bus_id": pci_bus_id,
+        "pcie_gen_current": int(pcie_gen_current) if pcie_gen_current is not None else None,
+        "pcie_gen_max": int(pcie_gen_max) if pcie_gen_max is not None else None,
+        "pcie_width_current": int(pcie_width_current) if pcie_width_current is not None else None,
+        "pcie_width_max": int(pcie_width_max) if pcie_width_max is not None else None,
         "status": "ok",
         "source": "nvidia-smi",
     }
@@ -418,7 +434,7 @@ def _gpu_metrics_from_nvidia_smi_row(row: list[str], index: int) -> dict[str, An
 def get_gpus_from_nvidia_smi() -> list[dict[str, Any]]:
     if not shutil.which("nvidia-smi"):
         return []
-    query = "name,utilization.gpu,memory.used,memory.total,temperature.gpu"
+    query = "name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit,fan.speed,pci.bus_id,pcie.link.gen.current,pcie.link.gen.max,pcie.link.width.current,pcie.link.width.max"
     result = safe_run(["nvidia-smi", f"--query-gpu={query}", "--format=csv,noheader,nounits"])
     if not result or result.returncode != 0 or not result.stdout.strip():
         return []
@@ -434,6 +450,14 @@ def get_gpus_from_nvidia_smi() -> list[dict[str, Any]]:
                 "vram_total_gb": None,
                 "vram_usage_percent": None,
                 "temperature_c": None,
+                "power_draw_w": None,
+                "power_limit_w": None,
+                "fan_speed_percent": None,
+                "pci_bus_id": None,
+                "pcie_gen_current": None,
+                "pcie_gen_max": None,
+                "pcie_width_current": None,
+                "pcie_width_max": None,
                 "status": "error",
                 "source": "nvidia-smi",
                 "error": "invalid nvidia-smi row",
@@ -449,6 +473,14 @@ def get_gpus_from_nvidia_smi() -> list[dict[str, Any]]:
                 "vram_total_gb": None,
                 "vram_usage_percent": None,
                 "temperature_c": None,
+                "power_draw_w": None,
+                "power_limit_w": None,
+                "fan_speed_percent": None,
+                "pci_bus_id": None,
+                "pcie_gen_current": None,
+                "pcie_gen_max": None,
+                "pcie_width_current": None,
+                "pcie_width_max": None,
                 "status": "error",
                 "source": "nvidia-smi",
                 "error": "parse failure",
@@ -476,20 +508,6 @@ def get_gpus_from_pynvml() -> list[dict[str, Any]]:
             handle = pynvml.nvmlDeviceGetHandleByIndex(i)
             raw_name = pynvml.nvmlDeviceGetName(handle)
             name = raw_name.decode("utf-8") if isinstance(raw_name, bytes) else str(raw_name)
-            util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-            mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
-            temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
-            out.append({
-                "index": i,
-                "name": name,
-                "usage_percent": pct(util.gpu),
-                "vram_used_gb": bytes_to_gb(mem.used),
-                "vram_total_gb": bytes_to_gb(mem.total),
-                "vram_usage_percent": pct((mem.used / mem.total) * 100 if mem.total else None),
-                "temperature_c": pct(temp),
-                "status": "ok",
-                "source": "pynvml",
-            })
         except Exception as exc:
             out.append({
                 "index": i,
@@ -499,10 +517,87 @@ def get_gpus_from_pynvml() -> list[dict[str, Any]]:
                 "vram_total_gb": None,
                 "vram_usage_percent": None,
                 "temperature_c": None,
+                "power_draw_w": None,
+                "power_limit_w": None,
+                "fan_speed_percent": None,
+                "pci_bus_id": None,
+                "pcie_gen_current": None,
+                "pcie_gen_max": None,
+                "pcie_width_current": None,
+                "pcie_width_max": None,
                 "status": "error",
                 "source": "pynvml",
                 "error": str(exc),
             })
+            continue
+        try:
+            util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+            util_gpu = util.gpu
+        except Exception:
+            util_gpu = None
+        try:
+            mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            mem_used = mem.used
+            mem_total = mem.total
+        except Exception:
+            mem_used = None
+            mem_total = None
+        try:
+            temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
+        except Exception:
+            temp = None
+        try:
+            power_draw_w = pct(pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0)
+        except Exception:
+            power_draw_w = None
+        try:
+            power_limit_w = pct(pynvml.nvmlDeviceGetPowerManagementLimit(handle) / 1000.0)
+        except Exception:
+            power_limit_w = None
+        try:
+            fan_speed = pct(pynvml.nvmlDeviceGetFanSpeed(handle))
+        except Exception:
+            fan_speed = None
+        try:
+            pci = pynvml.nvmlDeviceGetPciInfo(handle)
+            pci_bus_id = f"{pci.domain:08X}:{pci.bus:02X}:{pci.device:02X}.0"
+        except Exception:
+            pci_bus_id = None
+        try:
+            pcie_gen_current = int(pynvml.nvmlDeviceGetCurrPcieLinkGeneration(handle))
+        except Exception:
+            pcie_gen_current = None
+        try:
+            pcie_gen_max = int(pynvml.nvmlDeviceGetMaxPcieLinkGeneration(handle))
+        except Exception:
+            pcie_gen_max = None
+        try:
+            pcie_width_current = int(pynvml.nvmlDeviceGetCurrPcieLinkWidth(handle))
+        except Exception:
+            pcie_width_current = None
+        try:
+            pcie_width_max = int(pynvml.nvmlDeviceGetMaxPcieLinkWidth(handle))
+        except Exception:
+            pcie_width_max = None
+        out.append({
+            "index": i,
+            "name": name,
+            "usage_percent": util_gpu,
+            "vram_used_gb": bytes_to_gb(mem_used),
+            "vram_total_gb": bytes_to_gb(mem_total),
+            "vram_usage_percent": pct((mem_used / mem_total) * 100 if mem_total else None),
+            "temperature_c": temp,
+            "power_draw_w": power_draw_w,
+            "power_limit_w": power_limit_w,
+            "fan_speed_percent": fan_speed,
+            "pci_bus_id": pci_bus_id,
+            "pcie_gen_current": pcie_gen_current,
+            "pcie_gen_max": pcie_gen_max,
+            "pcie_width_current": pcie_width_current,
+            "pcie_width_max": pcie_width_max,
+            "status": "ok",
+            "source": "pynvml",
+        })
     try:
         pynvml.nvmlShutdown()
     except Exception:
@@ -521,6 +616,14 @@ def get_gpus() -> list[dict[str, Any]]:
             "vram_total_gb": None,
             "vram_usage_percent": None,
             "temperature_c": None,
+            "power_draw_w": None,
+            "power_limit_w": None,
+            "fan_speed_percent": None,
+            "pci_bus_id": None,
+            "pcie_gen_current": None,
+            "pcie_gen_max": None,
+            "pcie_width_current": None,
+            "pcie_width_max": None,
             "status": "unknown",
             "source": "none",
         }]
@@ -533,6 +636,14 @@ def get_gpus() -> list[dict[str, Any]]:
             "vram_total_gb": None,
             "vram_usage_percent": None,
             "temperature_c": None,
+            "power_draw_w": None,
+            "power_limit_w": None,
+            "fan_speed_percent": None,
+            "pci_bus_id": None,
+            "pcie_gen_current": None,
+            "pcie_gen_max": None,
+            "pcie_width_current": None,
+            "pcie_width_max": None,
             "status": "error",
             "source": "none",
             "error": str(exc),
@@ -548,6 +659,14 @@ def get_gpu() -> dict[str, Any]:
         "vram_total_gb": None,
         "vram_usage_percent": None,
         "temperature_c": None,
+        "power_draw_w": None,
+        "power_limit_w": None,
+        "fan_speed_percent": None,
+        "pci_bus_id": None,
+        "pcie_gen_current": None,
+        "pcie_gen_max": None,
+        "pcie_width_current": None,
+        "pcie_width_max": None,
         "status": "unknown",
         "source": "none",
     }
@@ -884,6 +1003,14 @@ def api_status() -> dict[str, Any]:
         "vram_total_gb": None,
         "vram_usage_percent": None,
         "temperature_c": None,
+        "power_draw_w": None,
+        "power_limit_w": None,
+        "fan_speed_percent": None,
+        "pci_bus_id": None,
+        "pcie_gen_current": None,
+        "pcie_gen_max": None,
+        "pcie_width_current": None,
+        "pcie_width_max": None,
         "status": "unknown",
         "source": "none",
     }
