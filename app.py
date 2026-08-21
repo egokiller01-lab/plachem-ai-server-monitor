@@ -859,6 +859,115 @@ def gpu_processes() -> list[dict[str, Any]]:
     return sorted(rows, key=lambda item: item["vram_mb"], reverse=True)
 
 
+LLAMA_VALUE_FLAGS = {
+    "-m": "model",
+    "--model": "model",
+    "-c": "context_size",
+    "--ctx-size": "context_size",
+    "-ngl": "gpu_layers",
+    "--n-gpu-layers": "gpu_layers",
+    "--tensor-split": "tensor_split",
+    "--host": "host",
+    "-H": "host",
+    "--port": "port",
+    "-p": "port",
+}
+
+LLAMA_BOOL_FLAGS = {"--metrics", "--help", "-h"}
+
+
+def _parse_llama_args(args: list[str]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in LLAMA_BOOL_FLAGS:
+            i += 1
+            continue
+        if arg in LLAMA_VALUE_FLAGS:
+            if i + 1 < len(args):
+                out[LLAMA_VALUE_FLAGS[arg]] = args[i + 1]
+                i += 2
+                continue
+        i += 1
+    return out
+
+
+def _llama_health_probe(host: str | None, port: int | None) -> dict[str, Any] | None:
+    if not host or not port:
+        return None
+    url = f"http://{host}:{port}/health"
+    started = time.time()
+    try:
+        with urllib.request.urlopen(url, timeout=2) as resp:
+            status = resp.status
+            resp.read()
+        return {"ok": status == 200, "http_status": status, "response_ms": int((time.time() - started) * 1000)}
+    except Exception as exc:
+        return {"ok": False, "http_status": None, "response_ms": int((time.time() - started) * 1000), "error": str(exc)}
+
+
+def _llama_gpu_usage(pid: int) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for item in gpu_processes():
+        if item.get("pid") == pid:
+            rows.append({"gpu_index": item.get("gpu_index"), "gpu_uuid": item.get("gpu_uuid"), "vram_mb": item.get("vram_mb")})
+    return rows
+
+
+def detect_llama_server() -> dict[str, Any]:
+    now = time.time()
+    for proc in psutil.process_iter(["pid", "exe", "cmdline", "cpu_percent", "memory_info"]):
+        try:
+            info = proc.info
+            exe = info.get("exe") or ""
+            cmd = info.get("cmdline") or []
+            base = exe.rsplit("/", 1)[-1]
+            if "llama-server" not in base and not any("llama-server" in a for a in cmd):
+                continue
+            args = _parse_llama_args(cmd)
+            model_path = args.get("model")
+            model = model_path.rsplit("/", 1)[-1] if model_path else None
+            gpu_layers = args.get("gpu_layers")
+            if isinstance(gpu_layers, str) and gpu_layers.isdigit():
+                gpu_layers = int(gpu_layers)
+            tensor_split = args.get("tensor_split")
+            if isinstance(tensor_split, str):
+                try:
+                    tensor_split = [float(x) for x in tensor_split.split(",") if x]
+                except Exception:
+                    tensor_split = None
+            port = args.get("port")
+            if isinstance(port, str) and port.isdigit():
+                port = int(port)
+            try:
+                rss_mb = round(info["memory_info"].rss / 1024 / 1024, 1)
+            except Exception:
+                rss_mb = None
+            runtime = {
+                "running": True,
+                "pid": info["pid"],
+                "process_name": base if base else None,
+                "executable": exe or None,
+                "model": model,
+                "model_path": model_path,
+                "port": port,
+                "host": args.get("host"),
+                "context_size": int(args["context_size"]) if isinstance(args.get("context_size"), str) and args["context_size"].isdigit() else None,
+                "gpu_layers": gpu_layers,
+                "tensor_split": tensor_split,
+                "uptime_seconds": int(now - psutil.Process(info["pid"]).create_time()),
+                "cpu_percent": round(info.get("cpu_percent") or 0.0, 1),
+                "memory_rss_mb": rss_mb,
+                "gpus": _llama_gpu_usage(info["pid"]),
+                "health": _llama_health_probe(args.get("host"), port),
+            }
+            return runtime
+        except Exception:
+            continue
+    return {"running": False}
+
+
 def network_interfaces() -> list[dict[str, Any]]:
     counters = psutil.net_io_counters(pernic=True)
     stats = psutil.net_if_stats()
@@ -961,6 +1070,14 @@ def detail_gpu() -> dict[str, Any]:
         return detail_response("gpu", {"summary": get_gpu(), "processes": gpu_processes()})
     except Exception as exc:
         return detail_response("gpu", {"error": str(exc)}, "error")
+
+
+@app.get("/api/detail/llama")
+def detail_llama() -> dict[str, Any]:
+    try:
+        return detail_response("llama", {"runtime": detect_llama_server()})
+    except Exception as exc:
+        return detail_response("llama", {"runtime": {"running": False}}, "error")
 
 
 @app.get("/api/detail/disk")
