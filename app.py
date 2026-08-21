@@ -1080,6 +1080,153 @@ def detail_llama() -> dict[str, Any]:
         return detail_response("llama", {"runtime": {"running": False}}, "error")
 
 
+def _clamp_percent(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        v = int(round(float(value)))
+    except Exception:
+        return None
+    return max(0, min(100, v))
+
+
+def _sanitize_error(exc: Exception) -> str:
+    try:
+        msg = str(exc)
+    except Exception:
+        msg = "internal error"
+    msg = msg[:200]
+    msg = re.sub(r"(?i)(token|secret|api[_-]?key|password|credential|private[_-]?key|authorization|cookie|oauth)[^,\s}]*",
+                 "[REDACTED]", msg)
+    return msg or "unknown error"
+
+
+def _whitelist_bucket(bucket: Any) -> dict[str, Any] | None:
+    if not isinstance(bucket, dict):
+        return None
+    used = bucket.get("usedPercent")
+    resets = bucket.get("resetsAt")
+    window = bucket.get("windowDurationMins")
+    remaining = _clamp_percent(100 - used if isinstance(used, (int, float)) else None)
+    return {
+        "used_percent": used if isinstance(used, (int, float)) else None,
+        "remaining_percent": remaining,
+        "resets_at": resets if isinstance(resets, (int, float)) else None,
+        "window_duration_mins": window if isinstance(window, (int, float)) else None,
+    }
+
+
+def _collect_codex_rate_limits(timeout: float = 12.0) -> dict[str, Any]:
+    codex_bin = shutil.which("codex")
+    if not codex_bin:
+        raise RuntimeError("codex CLI not found on PATH")
+
+    import subprocess as _sp
+    import select as _sel
+    import os as _os
+
+    proc = _sp.Popen(
+        [codex_bin, "app-server", "--listen", "stdio://"],
+        stdin=_sp.PIPE,
+        stdout=_sp.PIPE,
+        stderr=_sp.PIPE,
+    )
+
+    def _send(payload: dict[str, Any]) -> None:
+        proc.stdin.write((json.dumps(payload) + "\n").encode())
+        proc.stdin.flush()
+
+    def _read(timeout: float) -> dict[str, Any]:
+        deadline = time.time() + timeout
+        buf = b""
+        while time.time() < deadline:
+            ready, _, _ = _sel.select([proc.stdout], [], [], 0.2)
+            if ready:
+                chunk = _os.read(proc.stdout.fileno(), 65536)
+                if not chunk:
+                    break
+                buf += chunk
+                if b"\n" in buf:
+                    try:
+                        line = buf[:buf.index(b"\n")].decode("utf-8", errors="ignore").strip()
+                        return json.loads(line)
+                    except Exception:
+                        pass
+        return {}
+
+    try:
+        _send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+               "params": {"clientInfo": {"name": "plachem-monitor", "version": "1.0.0"}}})
+        init = _read(8)
+        if "error" in init:
+            raise RuntimeError(f"initialize failed: {init.get('error', {}).get('message', 'unknown')}")
+
+        _send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+
+        _send({"jsonrpc": "2.0", "id": 2, "method": "account/rateLimits/read", "params": {}})
+        resp = _read(8)
+        if "error" in resp:
+            raise RuntimeError(f"rateLimits/read failed: {resp.get('error', {}).get('message', 'unknown')}")
+
+        result = resp.get("result", {})
+        rate_limits = result.get("rateLimits", {})
+        rate_limits_by_id = result.get("rateLimitsByLimitId", {})
+
+        weekly = {
+            "limit_id": rate_limits.get("limitId"),
+            "used_percent": None,
+            "remaining_percent": None,
+            "resets_at": None,
+            "window_duration_mins": None,
+        }
+        primary = rate_limits.get("primary") or {}
+        if isinstance(primary, dict):
+            weekly.update(_whitelist_bucket(primary))
+
+        spark: dict[str, Any] = {
+            "limit_name": None,
+            "primary": None,
+            "secondary": None,
+        }
+        bengalfox = rate_limits_by_id.get("codex_bengalfox") or {}
+        if isinstance(bengalfox, dict):
+            spark["limit_name"] = bengalfox.get("limitName")
+            spark["primary"] = _whitelist_bucket(bengalfox.get("primary"))
+            spark["secondary"] = _whitelist_bucket(bengalfox.get("secondary"))
+
+        return {"weekly": weekly, "spark": spark}
+    finally:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=3)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+@app.get("/api/detail/codex")
+def detail_codex() -> dict[str, Any]:
+    try:
+        data = _collect_codex_rate_limits()
+        return detail_response("codex", {
+            "codex": {
+                "weekly": data["weekly"],
+            },
+            "spark": {
+                "limit_name": data["spark"].get("limit_name"),
+                "primary": data["spark"].get("primary"),
+                "secondary": data["spark"].get("secondary"),
+            },
+        })
+    except Exception as exc:
+        return detail_response("codex", {"codex": None, "spark": None, "error": _sanitize_error(exc)}, "error")
+
+
 @app.get("/api/detail/disk")
 def detail_disk() -> dict[str, Any]:
     try:
