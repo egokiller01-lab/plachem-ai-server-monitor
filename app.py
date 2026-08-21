@@ -343,9 +343,26 @@ def collect_openclaw_status() -> dict[str, Any]:
 
 def get_cpu() -> dict[str, Any]:
     try:
-        return {"usage_percent": pct(psutil.cpu_percent(interval=None)), "status": "ok"}
+        temperature_c = None
+        temperature_source = None
+        try:
+            temperatures = psutil.sensors_temperatures(fahrenheit=False)
+        except Exception:
+            temperatures = {}
+        for chip, label in (("k10temp", "Tctl"), ("coretemp", "Package id 0")):
+            sensor = next((entry for entry in temperatures.get(chip, []) if entry.label == label), None)
+            if sensor and isinstance(sensor.current, (int, float)):
+                temperature_c = round(sensor.current, 1)
+                temperature_source = f"{chip}:{label}"
+                break
+        return {
+            "usage_percent": pct(psutil.cpu_percent(interval=None)),
+            "temperature_c": temperature_c,
+            "temperature_source": temperature_source,
+            "status": "ok",
+        }
     except Exception as exc:
-        return {"usage_percent": None, "status": "error", "error": str(exc)}
+        return {"usage_percent": None, "temperature_c": None, "temperature_source": None, "status": "error", "error": str(exc)}
 
 
 def get_memory() -> dict[str, Any]:

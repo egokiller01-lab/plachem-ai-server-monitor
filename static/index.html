@@ -1024,8 +1024,8 @@
     .live { font-size: 10px; min-height: 26px; }
     .kpi { min-height: 62px; padding: 8px 9px; grid-template-columns: 24px 1fr; grid-template-rows: auto auto 15px; }
     .kpi .icon { width: 24px; height: 24px; font-size: 11px; }
-    .kpi .label { font-size: 9px; }
-    .kpi .value { font-size: 19px; }
+    .kpi .label { font-size: 8px; white-space: nowrap; }
+    .kpi .value { font-size: 16px; white-space: nowrap; }
     .kpi-spark { height: 15px; }
     .gpu-card { min-height: 210px; padding: 13px 15px; }
     .card-title { font-size: 14px; margin-bottom: 6px; }
@@ -1088,7 +1088,7 @@
       <div class="kpi cyan clickable" data-detail="network"><span class="icon">↓</span><span class="label">Network ↓</span><span id="kpi-download" class="value">--</span></div>
       <div class="kpi green clickable" data-detail="network"><span class="icon">↑</span><span class="label">Network ↑</span><span id="kpi-upload" class="value">--</span></div>
       <div class="kpi cyan clickable" data-detail="disk"><span class="icon">▭</span><span class="label">DISK</span><span id="kpi-disk" class="value">--</span></div>
-      <div class="kpi amber"><span class="icon">◷</span><span class="label">Uptime</span><span id="kpi-uptime" class="value">--</span></div>
+      <div class="kpi amber"><span class="icon">🌡</span><span class="label">CPU TEMP</span><span id="kpi-cpu-temp" class="value">--</span></div>
     </section>
 
     <section class="gpu-grid">
@@ -1196,7 +1196,7 @@
 
   <script>
     const maxPoints = 42;
-    const kpiHistory = { cpu: [], ram: [], download: [], upload: [], disk: [], uptime: [] };
+    const kpiHistory = { cpu: [], ram: [], download: [], upload: [], disk: [], temperature: [] };
 
     function ensureKpiSparks() {
       document.querySelectorAll(".kpi").forEach((node, index) => {
@@ -1205,7 +1205,7 @@
           canvas.className = "kpi-spark";
           canvas.width = 260;
           canvas.height = 54;
-          canvas.id = ["kpi-spark-cpu", "kpi-spark-ram", "kpi-spark-download", "kpi-spark-upload", "kpi-spark-disk", "kpi-spark-uptime"][index];
+          canvas.id = ["kpi-spark-cpu", "kpi-spark-ram", "kpi-spark-download", "kpi-spark-upload", "kpi-spark-disk", "kpi-spark-temperature"][index];
           node.appendChild(canvas);
         }
       });
@@ -1485,14 +1485,12 @@
         const disk = data.disk || {};
         const net = data.network || {};
         const gpus = data.gpus || [];
-        const uptime = data.server?.uptime || {};
-
         document.getElementById("kpi-cpu").textContent = percent(cpu.usage_percent);
         document.getElementById("kpi-ram").textContent = percent(mem.usage_percent);
         document.getElementById("kpi-download").textContent = formatBps(net.download_bps);
         document.getElementById("kpi-upload").textContent = formatBps(net.upload_bps);
         document.getElementById("kpi-disk").textContent = percent(disk.usage_percent);
-        document.getElementById("kpi-uptime").textContent = uptime.label || "Unknown";
+        document.getElementById("kpi-cpu-temp").textContent = valueOrUnknown(cpu.temperature_c, "°C");
 
         renderGpuCard(0, gpus[0]);
         renderGpuCard(1, gpus[1]);
@@ -1501,13 +1499,13 @@
         pushKpi("download", net.download_bps);
         pushKpi("upload", net.upload_bps);
         pushKpi("disk", disk.usage_percent);
-        pushKpi("uptime", uptime.seconds);
+        pushKpi("temperature", cpu.temperature_c);
         drawSparkline("kpi-spark-cpu", kpiHistory.cpu, "rgba(59, 130, 246, 1)");
         drawSparkline("kpi-spark-ram", kpiHistory.ram, "rgba(34, 197, 94, 1)");
         drawSparkline("kpi-spark-download", kpiHistory.download, "rgba(34, 211, 238, 1)");
         drawSparkline("kpi-spark-upload", kpiHistory.upload, "rgba(34, 197, 94, 1)");
         drawSparkline("kpi-spark-disk", kpiHistory.disk, "rgba(34, 211, 238, 1)");
-        drawSparkline("kpi-spark-uptime", kpiHistory.uptime, "rgba(245, 158, 11, 1)");
+        drawSparkline("kpi-spark-temperature", kpiHistory.temperature, "rgba(245, 158, 11, 1)");
 
         setService("svc-openclaw", data.services?.openclaw);
         setService("svc-ollama", data.services?.ollama);
