@@ -1350,3 +1350,64 @@ def api_status() -> dict[str, Any]:
         "gpus": gpus,
         "services": services,
     }
+
+
+def _collect_erpmanager_context(timeout: float = 2.0) -> dict[str, Any]:
+    sessions = read_json_file(openclaw_home() / "agents" / "erpmanager" / "sessions" / "sessions.json")
+    if not isinstance(sessions, dict):
+        raise RuntimeError("sessions.json not found or invalid")
+    # Find current active session: most recent updatedAt
+    best_key, best_item, best_updated = None, None, 0
+    for key, item in sessions.items():
+        if not isinstance(item, dict):
+            continue
+        updated = int(item.get("updatedAt") or 0)
+        if updated >= best_updated:
+            best_key, best_item, best_updated = key, item, updated
+    if best_item is None:
+        raise RuntimeError("no active session found")
+    total_tokens = best_item.get("totalTokens")
+    context_tokens = best_item.get("contextTokens")
+    input_tokens = best_item.get("inputTokens")
+    output_tokens = best_item.get("outputTokens")
+    cache_read = best_item.get("cacheRead")
+    cache_write = best_item.get("cacheWrite")
+    context_percent = round(total_tokens / context_tokens * 100) if isinstance(total_tokens, (int, float)) and isinstance(context_tokens, (int, float)) and context_tokens else None
+    denom = (cache_read or 0) + (cache_write or 0) + (input_tokens or 0)
+    cache_hit_percent = round(cache_read / denom * 100) if cache_read and denom else None
+    if context_percent is None:
+        health = None
+    elif context_percent < 70:
+        health = "normal"
+    elif context_percent < 85:
+        health = "warning"
+    else:
+        health = "critical"
+    started = best_item.get("sessionStartedAt")
+    now_ms = int(time.time() * 1000)
+    duration_seconds = round((now_ms - started) / 1000) if isinstance(started, (int, float)) else None
+    return {
+        "agent_id": "erpmanager",
+        "session_id": best_item.get("sessionId"),
+        "model": best_item.get("model"),
+        "total_tokens": total_tokens,
+        "context_tokens": context_tokens,
+        "context_percent": context_percent,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read": cache_read,
+        "cache_write": cache_write,
+        "cache_hit_percent": cache_hit_percent,
+        "session_started_at": started,
+        "updated_at": best_item.get("updatedAt"),
+        "duration_seconds": duration_seconds,
+        "health": health,
+    }
+
+
+@app.get("/api/detail/erpmanager")
+def detail_erpmanager() -> dict[str, Any]:
+    try:
+        return detail_response("erpmanager", _collect_erpmanager_context())
+    except Exception as exc:
+        return detail_response("erpmanager", {"error": _sanitize_error(exc)}, "error")
