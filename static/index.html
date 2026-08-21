@@ -426,6 +426,79 @@
       font-size: 13px;
     }
 
+    .erpmanager-card {
+      margin-top: 8px;
+      padding: 14px 16px;
+      border-color: rgba(100, 180, 255, 0.45);
+      box-shadow: 0 0 0 1px rgba(100, 180, 255, 0.25), 0 0 28px rgba(100, 180, 255, 0.12), var(--shadow);
+    }
+    .erpmanager-percent {
+      font-size: 34px;
+      font-weight: 800;
+      line-height: 1;
+      margin-bottom: 6px;
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+    }
+    .erpmanager-percent .bar-label {
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--muted);
+    }
+    .erpmanager-bar {
+      height: 10px;
+      background: rgba(56, 189, 248, 0.10);
+      border-radius: 6px;
+      overflow: hidden;
+      margin: 8px 0 10px;
+    }
+    .erpmanager-bar-fill {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, var(--blue), var(--cyan));
+      border-radius: 6px;
+      transition: width 0.4s ease;
+    }
+    .erpmanager-meta {
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.7;
+    }
+    .erpmanager-meta strong { color: var(--text); font-weight: 600; }
+    .erpmanager-status {
+      display: inline-block;
+      padding: 3px 10px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+    .erpmanager-status.normal {
+      color: var(--green);
+      background: rgba(99, 239, 102, 0.12);
+      border: 1px solid rgba(99, 239, 102, 0.35);
+    }
+    .erpmanager-status.warning {
+      color: var(--amber);
+      background: rgba(255, 178, 28, 0.12);
+      border: 1px solid rgba(255, 178, 28, 0.35);
+    }
+    .erpmanager-status.critical {
+      color: var(--red);
+      background: rgba(255, 92, 113, 0.14);
+      border: 1px solid rgba(255, 92, 113, 0.40);
+    }
+    .erpmanager-card.erpmanager-error {
+      padding: 18px;
+      text-align: center;
+      color: var(--muted);
+      font-size: 13px;
+      border-color: rgba(120, 140, 170, 0.35);
+      box-shadow: 0 0 0 1px rgba(120, 140, 170, 0.25), var(--shadow);
+    }
+
     .services {
       min-height: 58px;
       padding: 12px 14px;
@@ -1085,6 +1158,14 @@
       </article>
     </section>
 
+    <section class="card erpmanager-card" id="erpmanager-card">
+      <div class="card-title"><span class="icon" style="color:#63c5ff">⛁</span><span>ERPmanager</span><span id="erpmanager-status-pill" class="erpmanager-status">--</span></div>
+      <div class="erpmanager-percent"><span id="erpmanager-percent">--</span><span class="bar-label">Context</span></div>
+      <div class="erpmanager-bar"><div id="erpmanager-bar-fill" class="erpmanager-bar-fill"></div></div>
+      <div id="erpmanager-tokens" class="reading-label">-- / --</div>
+      <div id="erpmanager-meta" class="erpmanager-meta">--</div>
+    </section>
+
     <section id="detail-view" class="detail-view hidden">
       <div class="detail-header">
         <button id="back-button" class="back-button" type="button">Back</button>
@@ -1287,6 +1368,55 @@
           `Weekly: ${swRemaining !== null ? swRemaining + "%" : "--"} remaining · resets ${formatResetsAt(sparkSecondary.resets_at)}`;
       } catch (err) {
         renderCodexError();
+      }
+    }
+
+    function formatK(value) {
+      if (value === null || value === undefined || Number.isNaN(value)) return "--";
+      return `${(value / 1000).toFixed(1)}k`;
+    }
+
+    function formatSessionDuration(seconds) {
+      if (seconds === null || seconds === undefined || Number.isNaN(seconds)) return "--";
+      if (seconds < 60) return `${Math.round(seconds)}s`;
+      if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
+      if (seconds < 86400) return `${Math.round(seconds / 3600)}h`;
+      return `${Math.round(seconds / 86400)}d`;
+    }
+
+    function renderErpmanagerError() {
+      const card = document.getElementById("erpmanager-card");
+      card.classList.add("erpmanager-error");
+      document.getElementById("erpmanager-percent").textContent = "--";
+      document.getElementById("erpmanager-tokens").textContent = "-- / --";
+      document.getElementById("erpmanager-status-pill").textContent = "Unavailable";
+      document.getElementById("erpmanager-status-pill").className = "erpmanager-status";
+      document.getElementById("erpmanager-bar-fill").style.width = "0%";
+      document.getElementById("erpmanager-meta").textContent = "Status unavailable";
+    }
+
+    async function refreshErpmanager() {
+      try {
+        const response = await fetch("/api/detail/erpmanager", { cache: "no-store" });
+        const data = await response.json();
+        if (data.status !== "ok") { renderErpmanagerError(); return; }
+
+        document.getElementById("erpmanager-card").classList.remove("erpmanager-error");
+
+        const pct = data.context_percent;
+        document.getElementById("erpmanager-percent").textContent = pct !== null && pct !== undefined ? `${pct}%` : "--";
+        document.getElementById("erpmanager-bar-fill").style.width = `${clampPercent(pct)}%`;
+        document.getElementById("erpmanager-tokens").textContent = `${formatK(data.total_tokens)} / ${formatK(data.context_tokens)}`;
+
+        const health = data.health || "unknown";
+        const pill = document.getElementById("erpmanager-status-pill");
+        pill.textContent = health.toUpperCase();
+        pill.className = `erpmanager-status ${health}`;
+
+        document.getElementById("erpmanager-meta").innerHTML =
+          `Input <strong>${formatK(data.input_tokens)}</strong> · Output <strong>${formatK(data.output_tokens)}</strong> · Cache hit <strong>${data.cache_hit_percent ?? "--"}%</strong> · Session <strong>${formatSessionDuration(data.duration_seconds)}</strong>`;
+      } catch (err) {
+        renderErpmanagerError();
       }
     }
 
@@ -1559,7 +1689,9 @@
     ensureKpiSparks();
     routeDetail();
     refresh();
+    refreshErpmanager();
     setInterval(() => { refresh(); refreshDetail(); refreshOpenclaw(); refreshOpenclawMain(); }, 2000);
+    setInterval(refreshErpmanager, 10000);
     refreshCodex();
     setInterval(refreshCodex, 60000);
     refreshOpenclawMain(true);
