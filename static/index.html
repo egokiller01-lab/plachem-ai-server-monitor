@@ -525,10 +525,6 @@
     .gpu-unit-pcie { grid-column: 1 / -1; padding-top: 9px; border-top: 1px solid rgba(148,163,184,.14); color: var(--muted); font-size: 10px; }
     .agent-grid .erpmanager-card { margin-top: 0; }
     .secretary-card { padding: 14px 16px; border-color: rgba(167,139,250,.42); box-shadow: 0 0 0 1px rgba(167,139,250,.20), 0 0 28px rgba(167,139,250,.10), var(--shadow); }
-    .agent-detail-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 14px; margin-top: 10px; padding-top: 9px; border-top: 1px solid rgba(148,163,184,.14); }
-    .agent-detail-row { min-width: 0; color: var(--muted); font-size: 8px; }
-    .agent-detail-row span { display: block; text-transform: uppercase; letter-spacing: .08em; }
-    .agent-detail-row strong { display: block; margin-top: 2px; color: var(--text); font-size: 9px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     @media (max-width: 620px) { .gpu-grid, .agent-grid { grid-template-columns: 1fr; } .gpu-dashboard { grid-template-columns: 120px minmax(0, 1fr); } .gpu-gauge { width: 112px; } }
 
     .services {
@@ -1128,14 +1124,6 @@
         <div class="erpmanager-bar"><div id="secretary-bar-fill" class="erpmanager-bar-fill"></div></div>
         <div id="secretary-tokens" class="reading-label">-- / --</div>
         <div id="secretary-meta" class="erpmanager-meta">--</div>
-        <div class="agent-detail-grid">
-          <div class="agent-detail-row"><span>Model</span><strong id="secretary-model">--</strong></div>
-          <div class="agent-detail-row"><span>Session ID</span><strong id="secretary-session-id">--</strong></div>
-          <div class="agent-detail-row"><span>Started</span><strong id="secretary-started">--</strong></div>
-          <div class="agent-detail-row"><span>Updated</span><strong id="secretary-updated">--</strong></div>
-          <div class="agent-detail-row"><span>Health</span><strong id="secretary-health">--</strong></div>
-          <div class="agent-detail-row"><span>Cache read / write</span><strong id="secretary-cache">--</strong></div>
-        </div>
       </article>
     </section>
 
@@ -1396,11 +1384,6 @@
       return `${Math.floor(seconds / 86400)}d ${Math.floor((seconds % 86400) / 3600)}h`;
     }
 
-    function formatSessionTime(value) {
-      if (!Number.isFinite(value)) return "--";
-      return new Date(value).toLocaleString([], { month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit" });
-    }
-
     function renderErpmanagerError() {
       const card = document.getElementById("erpmanager-card");
       card.classList.add("erpmanager-error");
@@ -1462,12 +1445,6 @@
         pill.className = `erpmanager-status ${health}`;
         document.getElementById("secretary-meta").innerHTML =
           `Input <strong>${formatK(data.input_tokens)}</strong> · Output <strong>${formatK(data.output_tokens)}</strong> · Cache hit <strong>${data.cache_hit_percent == null ? "--" : data.cache_hit_percent + "%"}</strong> · Session <strong>${formatSessionDuration(data.duration_seconds)}</strong>`;
-        setText("secretary-model", data.model || "--");
-        setText("secretary-session-id", data.session_id || "--");
-        setText("secretary-started", formatSessionTime(data.session_started_at));
-        setText("secretary-updated", formatSessionTime(data.updated_at));
-        setText("secretary-health", health.toUpperCase());
-        setText("secretary-cache", `${formatK(data.cache_read)} / ${formatK(data.cache_write)}`);
       } catch (err) {
         renderSecretaryError();
       }
