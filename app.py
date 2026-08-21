@@ -1352,8 +1352,8 @@ def api_status() -> dict[str, Any]:
     }
 
 
-def _collect_erpmanager_context(timeout: float = 2.0) -> dict[str, Any]:
-    sessions = read_json_file(openclaw_home() / "agents" / "erpmanager" / "sessions" / "sessions.json")
+def _collect_agent_context(agent_id: str) -> dict[str, Any]:
+    sessions = read_json_file(openclaw_home() / "agents" / agent_id / "sessions" / "sessions.json")
     if not isinstance(sessions, dict):
         raise RuntimeError("sessions.json not found or invalid")
     # Find current active session: most recent updatedAt
@@ -1387,7 +1387,7 @@ def _collect_erpmanager_context(timeout: float = 2.0) -> dict[str, Any]:
     now_ms = int(time.time() * 1000)
     duration_seconds = round((now_ms - started) / 1000) if isinstance(started, (int, float)) else None
     return {
-        "agent_id": "erpmanager",
+        "agent_id": agent_id,
         "session_id": best_item.get("sessionId"),
         "model": best_item.get("model"),
         "total_tokens": total_tokens,
@@ -1405,9 +1405,21 @@ def _collect_erpmanager_context(timeout: float = 2.0) -> dict[str, Any]:
     }
 
 
+def _collect_erpmanager_context(timeout: float = 2.0) -> dict[str, Any]:
+    return _collect_agent_context("erpmanager")
+
+
 @app.get("/api/detail/erpmanager")
 def detail_erpmanager() -> dict[str, Any]:
     try:
         return detail_response("erpmanager", _collect_erpmanager_context())
     except Exception as exc:
         return detail_response("erpmanager", {"error": _sanitize_error(exc)}, "error")
+
+
+@app.get("/api/detail/secretary")
+def detail_secretary() -> dict[str, Any]:
+    try:
+        return detail_response("secretary", _collect_agent_context("secretary"))
+    except Exception as exc:
+        return detail_response("secretary", {"error": _sanitize_error(exc)}, "error")

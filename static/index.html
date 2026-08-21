@@ -506,18 +506,30 @@
       gap: 12px;
       margin-bottom: 12px;
     }
-    .gpu-unit-card { padding: 18px; }
-    .gpu-unit-name { color: var(--muted); font-size: 12px; margin: -4px 0 14px; }
-    .gpu-unit-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 18px; }
+    .gpu-unit-card { padding: 16px; }
+    .gpu-unit-name { color: var(--muted); font-size: 11px; margin: -3px 0 12px 22px; }
+    .gpu-dashboard { display: grid; grid-template-columns: 138px minmax(0, 1fr); gap: 16px; align-items: center; }
+    .gpu-gauge { --p: 0; position: relative; width: 132px; aspect-ratio: 1; border-radius: 50%; background: conic-gradient(#63ef66 calc(var(--p) * 1%), rgba(99,239,102,.12) 0); }
+    .gpu-gauge::before { content: ""; position: absolute; inset: 11px; border-radius: 50%; background: #0c1628; border: 1px solid rgba(148,163,184,.14); }
+    .gpu-gauge-center { position: absolute; inset: 23px; z-index: 1; display: grid; place-content: center; text-align: center; border-radius: 50%; background: radial-gradient(circle, rgba(25,42,67,.96), rgba(11,20,35,.98)); }
+    .gpu-gauge-value { color: #f2f7ff; font-size: 30px; font-weight: 800; line-height: 1; }
+    .gpu-gauge-label { margin-top: 7px; color: #63ef66; font-size: 8px; font-weight: 700; letter-spacing: .14em; }
+    .gpu-unit-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 11px 14px; }
     .gpu-unit-metric { min-width: 0; }
-    .gpu-unit-metric span { display: block; color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .08em; }
-    .gpu-unit-metric strong { display: block; margin-top: 3px; font-size: 18px; color: var(--text); }
-    .gpu-unit-pcie { grid-column: 1 / -1; padding-top: 10px; border-top: 1px solid rgba(148,163,184,.14); color: var(--muted); font-size: 12px; }
+    .gpu-unit-metric span { display: block; color: var(--muted); font-size: 8px; text-transform: uppercase; letter-spacing: .1em; }
+    .gpu-unit-metric strong { display: block; margin-top: 3px; font-size: 13px; color: var(--text); white-space: nowrap; }
+    .gpu-unit-metric.vram, .gpu-unit-metric.power { grid-column: 1 / -1; }
+    .gpu-unit-metric.vram strong, .gpu-unit-metric.power strong { color: #63ef66; }
+    .gpu-unit-metric.temp strong { color: var(--amber); }
+    .gpu-unit-metric.fan strong { color: #a78bfa; }
+    .gpu-unit-pcie { grid-column: 1 / -1; padding-top: 9px; border-top: 1px solid rgba(148,163,184,.14); color: var(--muted); font-size: 10px; }
     .agent-grid .erpmanager-card { margin-top: 0; }
     .secretary-card { padding: 14px 16px; border-color: rgba(167,139,250,.42); box-shadow: 0 0 0 1px rgba(167,139,250,.20), 0 0 28px rgba(167,139,250,.10), var(--shadow); }
-    .secretary-body { display: grid; gap: 9px; margin-top: 12px; }
-    .secretary-row { display: flex; justify-content: space-between; gap: 16px; color: var(--muted); font-size: 12px; }
-    .secretary-row strong { color: var(--text); text-align: right; overflow-wrap: anywhere; }
+    .agent-detail-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 14px; margin-top: 10px; padding-top: 9px; border-top: 1px solid rgba(148,163,184,.14); }
+    .agent-detail-row { min-width: 0; color: var(--muted); font-size: 8px; }
+    .agent-detail-row span { display: block; text-transform: uppercase; letter-spacing: .08em; }
+    .agent-detail-row strong { display: block; margin-top: 2px; color: var(--text); font-size: 9px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    @media (max-width: 620px) { .gpu-grid, .agent-grid { grid-template-columns: 1fr; } .gpu-dashboard { grid-template-columns: 120px minmax(0, 1fr); } .gpu-gauge { width: 112px; } }
 
     .services {
       min-height: 58px;
@@ -1112,12 +1124,17 @@
       </article>
       <article class="card secretary-card" id="secretary-card">
         <div class="card-title"><span class="icon" style="color:#a78bfa">◆</span><span>Secretary</span><span id="secretary-status-pill" class="erpmanager-status">--</span></div>
-        <div class="secretary-body">
-          <div class="secretary-row"><span>Agent</span><strong id="secretary-name">Secretary</strong></div>
-          <div class="secretary-row"><span>Model</span><strong id="secretary-model">--</strong></div>
-          <div class="secretary-row"><span>Session state</span><strong id="secretary-state">--</strong></div>
-          <div class="secretary-row"><span>Sessions</span><strong id="secretary-sessions">--</strong></div>
-          <div class="secretary-row"><span>Total tokens</span><strong id="secretary-tokens">--</strong></div>
+        <div class="erpmanager-percent"><span id="secretary-percent">--</span><span class="bar-label">Context</span></div>
+        <div class="erpmanager-bar"><div id="secretary-bar-fill" class="erpmanager-bar-fill"></div></div>
+        <div id="secretary-tokens" class="reading-label">-- / --</div>
+        <div id="secretary-meta" class="erpmanager-meta">--</div>
+        <div class="agent-detail-grid">
+          <div class="agent-detail-row"><span>Model</span><strong id="secretary-model">--</strong></div>
+          <div class="agent-detail-row"><span>Session ID</span><strong id="secretary-session-id">--</strong></div>
+          <div class="agent-detail-row"><span>Started</span><strong id="secretary-started">--</strong></div>
+          <div class="agent-detail-row"><span>Updated</span><strong id="secretary-updated">--</strong></div>
+          <div class="agent-detail-row"><span>Health</span><strong id="secretary-health">--</strong></div>
+          <div class="agent-detail-row"><span>Cache read / write</span><strong id="secretary-cache">--</strong></div>
         </div>
       </article>
     </section>
@@ -1234,17 +1251,21 @@
       const gen = Number.isFinite(gpu.pcie_gen_max) ? `PCIe ${gpu.pcie_gen_max}.0` : "PCIe --";
       const width = Number.isFinite(gpu.pcie_width_current) ? `x${gpu.pcie_width_current}` : "x--";
       const maxWidth = Number.isFinite(gpu.pcie_width_max) ? `x${gpu.pcie_width_max}` : "x--";
+      const load = clampPercent(gpu.usage_percent);
+      const powerPercent = Number.isFinite(gpu.power_draw_w) && Number.isFinite(gpu.power_limit_w) && gpu.power_limit_w > 0
+        ? Math.round(gpu.power_draw_w / gpu.power_limit_w * 100) : null;
       card.innerHTML = `
         <div class="card-title"><span class="icon">▧</span><span>GPU ${index}</span></div>
         <div class="gpu-unit-name">${escapeHtml(gpu.name || "Unknown")}</div>
-        <div class="gpu-unit-metrics">
-          <div class="gpu-unit-metric"><span>Load</span><strong>${percent(gpu.usage_percent)}</strong></div>
-          <div class="gpu-unit-metric"><span>VRAM</span><strong>${formatGpuValue(gpu.vram_used_gb)} / ${formatGpuValue(gpu.vram_total_gb)} GB</strong></div>
-          <div class="gpu-unit-metric"><span>VRAM usage</span><strong>${percent(gpu.vram_usage_percent)}</strong></div>
-          <div class="gpu-unit-metric"><span>Temperature</span><strong>${formatGpuValue(gpu.temperature_c, "°C")}</strong></div>
-          <div class="gpu-unit-metric"><span>Power</span><strong>${formatGpuValue(gpu.power_draw_w)} / ${formatGpuValue(gpu.power_limit_w)} W</strong></div>
-          <div class="gpu-unit-metric"><span>Fan</span><strong>${percent(gpu.fan_speed_percent)}</strong></div>
-          <div class="gpu-unit-pcie">${gen} ${width} · Max ${maxWidth}</div>
+        <div class="gpu-dashboard">
+          <div class="gpu-gauge" style="--p:${load}"><div class="gpu-gauge-center"><div class="gpu-gauge-value">${percent(gpu.usage_percent)}</div><div class="gpu-gauge-label">GPU LOAD</div></div></div>
+          <div class="gpu-unit-metrics">
+            <div class="gpu-unit-metric vram"><span>VRAM</span><strong>${formatGpuValue(gpu.vram_used_gb)} / ${formatGpuValue(gpu.vram_total_gb)} GB · ${percent(gpu.vram_usage_percent)}</strong></div>
+            <div class="gpu-unit-metric temp"><span>Temperature</span><strong>${formatGpuValue(gpu.temperature_c, "°C")}</strong></div>
+            <div class="gpu-unit-metric power"><span>Power</span><strong>${formatGpuValue(gpu.power_draw_w)} / ${formatGpuValue(gpu.power_limit_w)} W · ${powerPercent === null ? "--" : powerPercent + "%"}</strong></div>
+            <div class="gpu-unit-metric fan"><span>Fan</span><strong>${percent(gpu.fan_speed_percent)}</strong></div>
+            <div class="gpu-unit-pcie">${gen} ${width} · Max ${maxWidth}</div>
+          </div>
         </div>`;
     }
 
@@ -1370,9 +1391,14 @@
     function formatSessionDuration(seconds) {
       if (seconds === null || seconds === undefined || Number.isNaN(seconds)) return "--";
       if (seconds < 60) return `${Math.round(seconds)}s`;
-      if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
-      if (seconds < 86400) return `${Math.round(seconds / 3600)}h`;
-      return `${Math.round(seconds / 86400)}d`;
+      if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+      if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+      return `${Math.floor(seconds / 86400)}d ${Math.floor((seconds % 86400) / 3600)}h`;
+    }
+
+    function formatSessionTime(value) {
+      if (!Number.isFinite(value)) return "--";
+      return new Date(value).toLocaleString([], { month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit" });
     }
 
     function renderErpmanagerError() {
@@ -1408,6 +1434,42 @@
           `Input <strong>${formatK(data.input_tokens)}</strong> · Output <strong>${formatK(data.output_tokens)}</strong> · Cache hit <strong>${data.cache_hit_percent ?? "--"}%</strong> · Session <strong>${formatSessionDuration(data.duration_seconds)}</strong>`;
       } catch (err) {
         renderErpmanagerError();
+      }
+    }
+
+    function renderSecretaryError() {
+      document.getElementById("secretary-card").classList.add("erpmanager-error");
+      document.getElementById("secretary-percent").textContent = "--";
+      document.getElementById("secretary-tokens").textContent = "-- / --";
+      document.getElementById("secretary-status-pill").textContent = "Unavailable";
+      document.getElementById("secretary-status-pill").className = "erpmanager-status";
+      document.getElementById("secretary-bar-fill").style.width = "0%";
+      document.getElementById("secretary-meta").textContent = "Status unavailable";
+    }
+
+    async function refreshSecretary() {
+      try {
+        const response = await fetch("/api/detail/secretary", { cache: "no-store" });
+        const data = await response.json();
+        if (data.status !== "ok") { renderSecretaryError(); return; }
+        document.getElementById("secretary-card").classList.remove("erpmanager-error");
+        document.getElementById("secretary-percent").textContent = data.context_percent != null ? `${data.context_percent}%` : "--";
+        document.getElementById("secretary-bar-fill").style.width = `${clampPercent(data.context_percent)}%`;
+        document.getElementById("secretary-tokens").textContent = `${formatK(data.total_tokens)} / ${formatK(data.context_tokens)}`;
+        const health = data.health || "unknown";
+        const pill = document.getElementById("secretary-status-pill");
+        pill.textContent = health.toUpperCase();
+        pill.className = `erpmanager-status ${health}`;
+        document.getElementById("secretary-meta").innerHTML =
+          `Input <strong>${formatK(data.input_tokens)}</strong> · Output <strong>${formatK(data.output_tokens)}</strong> · Cache hit <strong>${data.cache_hit_percent == null ? "--" : data.cache_hit_percent + "%"}</strong> · Session <strong>${formatSessionDuration(data.duration_seconds)}</strong>`;
+        setText("secretary-model", data.model || "--");
+        setText("secretary-session-id", data.session_id || "--");
+        setText("secretary-started", formatSessionTime(data.session_started_at));
+        setText("secretary-updated", formatSessionTime(data.updated_at));
+        setText("secretary-health", health.toUpperCase());
+        setText("secretary-cache", `${formatK(data.cache_read)} / ${formatK(data.cache_write)}`);
+      } catch (err) {
+        renderSecretaryError();
       }
     }
 
@@ -1583,21 +1645,9 @@
         setText("oc-gateway", gateway.charAt(0).toUpperCase() + gateway.slice(1));
         document.getElementById("oc-status").className = status === "Running" ? "status-running" : "status-unknown";
         document.getElementById("oc-gateway").className = gateway === "healthy" ? "status-running" : gateway === "degraded" ? "status-warning" : "status-unknown";
-        const secretary = agents.find(agent => agent.id === "secretary");
-        const secretaryState = secretary?.session?.state || "unknown";
-        setText("secretary-name", secretary?.name || "Secretary");
-        setText("secretary-model", secretary?.model || "--");
-        setText("secretary-state", secretaryState);
-        setText("secretary-sessions", secretary?.session?.session_count ?? "--");
-        setText("secretary-tokens", Number.isFinite(secretary?.session?.total_tokens) ? formatK(secretary.session.total_tokens) : "--");
-        const secretaryPill = document.getElementById("secretary-status-pill");
-        secretaryPill.textContent = secretaryState.toUpperCase();
-        secretaryPill.className = `erpmanager-status ${["working", "online", "idle"].includes(secretaryState) ? "normal" : ""}`;
       } catch (error) {
         setText("oc-status", "Unknown");
         setText("oc-gateway", "Unknown");
-        setText("secretary-state", "Unavailable");
-        document.getElementById("secretary-status-pill").textContent = "UNAVAILABLE";
       }
     }
 
@@ -1673,8 +1723,10 @@
     routeDetail();
     refresh();
     refreshErpmanager();
+    refreshSecretary();
     setInterval(() => { refresh(); refreshDetail(); refreshOpenclaw(); refreshOpenclawMain(); }, 2000);
     setInterval(refreshErpmanager, 10000);
+    setInterval(refreshSecretary, 10000);
     refreshCodex();
     setInterval(refreshCodex, 60000);
     refreshOpenclawMain(true);
