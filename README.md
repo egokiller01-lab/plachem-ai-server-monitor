@@ -52,6 +52,29 @@ GET /api/status
 
 Returns one JSON payload with system, GPU, network, and service state.
 
+## Agent War Room — read-only phase
+
+The first approved War Room phase is available at:
+
+```text
+GET /war-room
+```
+
+Its API is intentionally read-only:
+
+```text
+GET /api/war-room/projects
+GET /api/war-room/projects/{project_id}
+GET /api/war-room/projects/{project_id}/participants
+GET /api/war-room/projects/{project_id}/timeline
+GET /api/war-room/projects/{project_id}/operations
+GET /api/war-room/projects/{project_id}/manyfast-baseline
+```
+
+The default database location is `~/.openclaw/war-room/war_room.sqlite3`. Override it with
+`PLACHEM_WAR_ROOM_DB` for testing or deployment. No agent call, approval, execution, stop,
+or resume endpoint is exposed in this phase.
+
 ## systemd Example
 
 The example unit is located at:

@@ -17,12 +17,15 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from war_room import router as war_room_router
+
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 
 app = FastAPI(title="PLACHEM AI Server Monitor")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+app.include_router(war_room_router)
 
 _network_prev: dict[str, float | int] | None = None
 
@@ -1305,6 +1308,11 @@ def openclaw_page() -> FileResponse:
 @app.get("/openclaw-control")
 def openclaw_control_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/war-room")
+def war_room_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "war-room.html")
 
 
 @app.get("/")
