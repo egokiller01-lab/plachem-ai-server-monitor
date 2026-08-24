@@ -13,15 +13,19 @@
     h1,h2,h3,p { margin-top:0; } h1 { font-size:20px; margin-bottom:3px; } h2 { font-size:15px; }
     .badge { padding:5px 9px; border:1px solid var(--green); border-radius:999px; color:var(--green); font-weight:700; }
     .shell { display:grid; grid-template-columns:260px minmax(0,1fr) 310px; gap:14px; padding:14px; max-width:1600px; margin:auto; }
+    .shell > * { min-width:0; }
     .panel { background:rgba(17,28,48,.94); border:1px solid var(--line); border-radius:14px; padding:15px; box-shadow:0 14px 35px rgba(0,0,0,.18); }
     .stack { display:grid; gap:10px; }
     .project,.agent,.event,.placeholder { border:1px solid var(--line); border-radius:10px; padding:11px; background:#0d1729; }
     .project.active { border-color:var(--cyan); }
+    button.project { width:100%; text-align:left; cursor:pointer; }
     .muted { color:var(--muted); } .accent { color:var(--cyan); }
     .stat-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; }
     .stat { padding:10px; border-radius:9px; background:#0b1526; border:1px solid var(--line); text-align:center; }
     .stat strong { display:block; font-size:18px; color:var(--cyan); }
     .toolbar { display:flex; gap:8px; justify-content:space-between; align-items:center; margin-bottom:12px; }
+    .filterbar { display:flex; gap:7px; flex-wrap:wrap; align-items:center; margin:10px 0; }
+    .filterbar input { min-width:150px; border:1px solid var(--line); background:#0c1728; color:var(--text); border-radius:8px; padding:8px; }
     button,select { border:1px solid var(--line); background:#0c1728; color:var(--text); border-radius:8px; padding:8px 10px; }
     button[disabled] { opacity:.42; cursor:not-allowed; }
     .event { display:grid; grid-template-columns:90px 1fr; gap:10px; }
@@ -31,52 +35,108 @@
     .status { color:var(--green); }
     .empty { padding:28px; text-align:center; color:var(--muted); border:1px dashed var(--line); border-radius:10px; }
     .error { color:#ff8f9b; }
+    .flow-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; margin-top:14px; }
+    .flow-card { border:1px solid var(--line); border-radius:10px; padding:12px; background:#0d1729; min-width:0; }
+    .flow-card h3 { color:var(--cyan); font-size:14px; margin-bottom:6px; }
+    .flow-card form { display:flex; gap:6px; flex-wrap:wrap; }
+    .flow-card input,.flow-card textarea { flex:1 1 150px; min-width:0; padding:8px; background:#0c1728; color:var(--text); border:1px solid var(--line); border-radius:8px; }
+    .flow-card textarea { width:100%; min-height:64px; resize:vertical; }
+    .check { display:inline-flex; align-items:center; gap:4px; color:var(--muted); }
+    .check input { flex:0 0 auto; min-width:0; }
+    .flow-card button { white-space:nowrap; }
+    .audit-list { max-height:220px; overflow:auto; }
+    .quick-start { margin-top:16px; padding:18px; border:1px solid var(--cyan); border-radius:14px; background:linear-gradient(145deg,rgba(85,216,255,.10),rgba(13,23,41,.96)); }
+    .quick-steps { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; margin:12px 0; }
+    .quick-step { padding:10px; border:1px solid var(--line); border-radius:9px; background:#0b1526; color:var(--muted); }
+    .quick-step.active { border-color:var(--cyan); color:var(--text); }
+    .quick-step.done { border-color:var(--green); color:var(--green); }
+    .quick-form { display:grid; gap:10px; }
+    .quick-form textarea { width:100%; min-height:84px; padding:10px; background:#0c1728; color:var(--text); border:1px solid var(--line); border-radius:8px; resize:vertical; }
+    .primary { border-color:var(--cyan); background:#12334b; font-weight:700; }
+    .advanced-toggle { margin-top:14px; }
+    .advanced-area[hidden] { display:none; }
     @media(max-width:1000px){ .shell{grid-template-columns:220px 1fr}.right{grid-column:1/-1}.right .stack{grid-template-columns:repeat(2,1fr)} }
-    @media(max-width:700px){ header{padding:13px}.shell{grid-template-columns:1fr;padding:10px}.right{grid-column:auto}.right .stack{grid-template-columns:1fr}.event{grid-template-columns:1fr} }
+    @media(max-width:700px){ header{padding:13px}.shell{grid-template-columns:1fr;padding:10px}.right{grid-column:auto}.right .stack{grid-template-columns:1fr}.event{grid-template-columns:1fr}.flow-grid,.quick-steps{grid-template-columns:1fr}.panel{padding:12px}button,select{max-width:100%}.filterbar>*{flex:1 1 140px;min-width:0}.toolbar{align-items:flex-start;flex-wrap:wrap} }
   </style>
 </head>
 <body>
   <header>
     <div><h1>PLACHEM Agent War Room</h1><div class="muted">멀티에이전트 통합 작전실 · 1단계</div></div>
-    <span class="badge">READ ONLY</span>
+    <span class="badge">CONTROLLED · AUTH REQUIRED</span>
   </header>
   <main class="shell">
-    <aside class="panel">
-      <div class="toolbar"><h2>프로젝트</h2><button disabled>새 작전실</button></div>
+    <aside class="panel" data-advanced-section hidden>
+      <div class="toolbar"><h2>프로젝트</h2><button id="new-project-button" data-permission="manage" onclick="showProjectForm()">새 작전실</button></div>
       <div id="projects" class="stack"><div class="empty">불러오는 중…</div></div>
+      <form id="project-form" class="placeholder" data-permission="manage" hidden><input id="project-name" required maxlength="200" placeholder="작전실 이름" style="width:100%;margin:8px 0;padding:8px;background:#0c1728;color:var(--text);border:1px solid var(--line);border-radius:8px"><button>생성</button><span id="project-result" class="muted"></span></form>
     </aside>
     <section class="panel">
-      <div class="toolbar">
+      <div class="toolbar" data-advanced-section hidden>
         <div><h2 id="project-title">공동 타임라인</h2><div id="baseline" class="muted"></div></div>
         <div><select disabled><option>최근 100건</option></select> <button disabled>지시 작성</button></div>
       </div>
-      <div id="stats" class="stat-grid"></div>
+      <div id="stats" class="stat-grid" data-advanced-section hidden></div>
+      <section class="quick-start" aria-labelledby="quick-title">
+        <h2 id="quick-title">간편 실행</h2>
+        <div class="muted">내용과 담당자만 정하면 필요한 한도와 문서 버전은 자동으로 설정됩니다.</div>
+        <div class="quick-steps" aria-label="간편 실행 진행 단계">
+          <div id="quick-step-1" class="quick-step active"><strong>1. 작업 입력</strong><br><small>내용과 담당자 선택</small></div>
+          <div id="quick-step-2" class="quick-step"><strong>2. 작업 시작</strong><br><small>승인·전달은 자동 처리</small></div>
+          <div id="quick-step-3" class="quick-step"><strong>3. 결과 검토</strong><br><small>충돌·다음 행동 확인</small></div>
+        </div>
+        <form id="quick-task-form" class="quick-form">
+          <textarea id="quick-instruction" data-permission="manage" required maxlength="4096" placeholder="에이전트에게 맡길 일을 자연스럽게 입력하세요. 예: 재고 화면 오류를 확인하고 수정한 뒤 QA 결과를 보고해."></textarea>
+          <fieldset id="quick-agent-targets" data-permission="manage" aria-label="담당 에이전트"><legend>담당 에이전트</legend><label><input type="checkbox" value="ERPcoder" checked> ERPcoder</label> <label><input type="checkbox" value="ERPqa" checked> ERPqa</label> <label><input type="checkbox" value="ERPmanager" checked> ERPmanager (단순 요약)</label></fieldset>
+          <div class="filterbar"><button id="quick-prepare" class="primary" type="submit" data-permission="manage">작업 시작</button><button id="quick-approve-run" class="primary" type="button" data-permission="approve" onclick="quickApproveAndRun()" hidden disabled>작업 시작</button><button id="quick-open-qa" type="button" onclick="quickOpenQa()" hidden>QA 검수 열기</button><button id="quick-complete" class="primary" type="button" data-representative="true" onclick="quickCompleteTask()" hidden>최종 완료 승인</button><button id="quick-demo-process" type="button" onclick="quickProcessResults()" hidden>시연 응답 처리</button></div>
+          <div id="quick-result" class="muted" role="status">작업 내용을 입력해 주세요.</div>
+          <div id="quick-delivery-cards" class="stack"><div class="empty">실행 후 에이전트별 결과가 여기에 표시됩니다.</div></div>
+        </form>
+      </section>
+      <button class="advanced-toggle" type="button" aria-expanded="false" aria-controls="advanced-area" onclick="toggleAdvanced(this)">고급 관리 열기</button>
+      <div id="advanced-area" class="advanced-area" hidden>
       <h2 style="margin-top:16px">타임라인</h2>
+      <div class="filterbar" aria-label="타임라인 고급 필터">
+        <select id="timeline-type" onchange="loadTimeline()"><option value="">전체 유형</option><option>instruction</option><option>opinion</option><option>question</option><option>decision</option><option>result</option><option>status</option></select>
+        <select id="timeline-author" onchange="loadTimeline()"><option value="">전체 작성자</option><option>main</option><option>ERPcoder</option><option>ERPmanager</option><option>ERPqa</option></select>
+        <select id="timeline-delivery" onchange="loadTimeline()"><option value="">전체 전달 상태</option><option>queued</option><option>received</option><option>responded</option><option>failed</option><option>timed_out</option><option>stopped</option></select>
+        <input id="timeline-from" type="datetime-local" aria-label="시작 일시" onchange="loadTimeline()">
+        <input id="timeline-to" type="datetime-local" aria-label="종료 일시" onchange="loadTimeline()">
+        <button type="button" onclick="resetTimelineFilters()">초기화</button>
+      </div>
       <div id="timeline" class="stack"><div class="empty">불러오는 중…</div></div>
-      <h2 style="margin-top:16px">후속 화면</h2>
+      <h2 style="margin-top:16px">작업·승인·감사</h2>
       <div class="stack">
-        <div class="placeholder"><strong>실행 승인·담당자 지정</strong><div class="muted">후속 단계에서 활성화 · 승인 없는 실행 차단</div></div>
-        <div class="placeholder"><strong>실행 결과·증거·QA</strong><div class="muted">후속 단계에서 활성화 · QA PASS와 증거 필수</div></div>
-        <div class="placeholder"><strong>중지·재개·감사 이력</strong><div class="muted">후속 단계에서 활성화 · 재개 시 새 승인 필수</div></div>
+        <form id="task-form" class="placeholder" data-permission="manage">
+          <strong>작업 생성</strong><div class="muted">인증된 project_manager만 생성할 수 있습니다.</div>
+          <div class="muted">인증 principal이 없는 환경에서는 서버가 쓰기를 거부합니다.</div>
+          <input id="task-scope" required maxlength="4096" placeholder="작업 범위" style="width:100%;margin:8px 0;padding:8px;background:#0c1728;color:var(--text);border:1px solid var(--line);border-radius:8px">
+          <div class="filterbar"><select id="task-assignee" required aria-label="담당 에이전트"><option value="">담당자 선택</option><option value="ERPcoder">ERPcoder</option><option value="ERPmanager">ERPmanager</option><option value="ERPqa">ERPqa</option></select><input id="task-call-limit" type="number" min="1" max="100" value="1" required aria-label="호출 한도"><input id="task-turn-limit" type="number" min="1" max="1000" value="1" required aria-label="턴 한도"><input id="task-deadline" type="number" min="60" value="600" required aria-label="마감 초"><input id="task-document-version" required maxlength="128" placeholder="문서 버전" aria-label="문서 버전"></div>
+          <fieldset id="task-agent-targets" aria-label="전달 대상 에이전트"><label><input type="checkbox" value="ERPcoder">ERPcoder</label><label><input type="checkbox" value="ERPmanager">ERPmanager</label><label><input type="checkbox" value="ERPqa">ERPqa</label><label><input type="checkbox" value="main">main</label></fieldset>
+          <button type="submit">Draft 작업 생성</button><span id="task-result" class="muted"></span>
+        </form>
+        <div class="toolbar"><strong>작업 목록</strong><select id="task-status-filter" onchange="refreshTasks()"><option value="">전체 상태</option><option>draft</option><option>awaiting_approval</option><option>approved</option><option>running</option><option>qa</option><option>completed</option><option>stopped</option></select><input id="task-search-filter" oninput="refreshTasks()" placeholder="범위 검색" style="max-width:180px;padding:6px;background:#0c1728;color:var(--text);border:1px solid var(--line);border-radius:8px"></div>
+        <div id="tasks" class="stack"><div class="empty">작업 없음</div></div>
+        <div class="flow-grid" aria-label="War Room six core flows">
+          <section class="flow-card" id="project-management"><h3>1. 프로젝트·참여자 관리</h3>
+            <form id="project-edit-form" data-permission="manage"><input id="project-edit-name" required maxlength="200" placeholder="프로젝트 이름"><select id="project-edit-status"><option>planning</option><option>active</option><option>paused</option><option>archived</option></select><button>프로젝트 수정</button><button type="button" onclick="archiveProject()">보관</button></form>
+            <form id="participant-form" data-permission="manage"><select id="participant-principal"><option>ERPcoder</option><option>ERPmanager</option><option>ERPqa</option><option>main</option></select><select id="participant-role" onchange="syncParticipantFlags()"><option>developer</option><option>qa</option><option>observer</option><option>project_manager</option></select><label class="check"><input id="participant-read" type="checkbox" checked>읽기</label><label class="check"><input id="participant-comment" type="checkbox" checked>댓글</label><label class="check"><input id="participant-approve" type="checkbox">승인</label><label class="check"><input id="participant-execute" type="checkbox">실행</label><button>추가·수정</button></form>
+            <div id="participant-list" class="stack muted">참여자 불러오는 중…</div><small id="project-management-result" class="muted"></small>
+          </section>
+          <section class="flow-card" id="instruction-delivery"><h3>2. 타임라인·지시·delivery</h3><form id="message-form" data-permission="manage"><select id="message-task" required aria-label="연결 작업"><option value="">작업을 먼저 생성하세요</option></select><textarea id="message-body" required maxlength="4096" placeholder="대표 지시 원문"></textarea><button>선택 작업에 지시 연결</button></form><div id="demo-controls" hidden><label>테스트 에이전트 <select id="demo-session-agent" aria-label="테스트 세션 에이전트"><option>ERPcoder</option><option>ERPmanager</option><option>ERPqa</option><option>main</option></select></label><input id="demo-session-key" aria-label="Disposable 테스트 세션 키" placeholder="test:ERPcoder:demo"><input id="demo-session-id" aria-label="테스트 세션 ID" placeholder="session-demo"><button type="button" onclick="bindDemoSession()">테스트 세션 결속</button><button type="button" onclick="processDemoQueue()">격리 worker 처리</button></div><small id="message-result" class="muted"></small><div id="delivery-cards"></div></section>
+          <section class="flow-card" id="approval-flow"><h3>3. 승인·실행</h3><form id="approval-form"><select id="approval-task" required><option value="">작업 선택</option></select><input id="approval-expiry" type="number" min="60" max="604800" value="1800" required aria-label="승인 유효 초"><button type="button" data-permission="approve" onclick="approveSelectedTask()">승인</button><button type="button" data-permission="approve" onclick="rejectSelectedTask()">거절</button><button type="button" data-permission="execute" onclick="runSelectedTask()">실행·전달</button></form><small id="approval-result" class="muted"></small></section>
+          <section class="flow-card" id="results-qa"><h3>4. 결과·독립 QA</h3><form id="result-form"><select id="qa-task" required><option value="">QA 작업 선택</option></select><textarea id="result-body" maxlength="4096" placeholder="작업 결과"></textarea><button type="button" data-permission="comment" onclick="saveResult()">결과 저장</button><input id="evidence-uri" placeholder="/local/evidence/path" required><select id="evidence-type"><option>test</option><option>artifact</option></select><input id="evidence-summary" maxlength="4096" placeholder="증거 요약"><button type="button" data-permission="comment" onclick="addEvidence()">증거 추가</button><select id="qa-verdict"><option>PASS</option><option>FAIL</option><option>REWORK</option></select><button type="button" data-role="qa" onclick="submitQaVerdict()">QA 에이전트 판정</button></form><small id="qa-result" class="muted"></small></section>
+          <section class="flow-card" id="stop-resume"><h3>5. 중지·재개</h3><form id="stop-form"><button type="button" data-permission="execute" onclick="stopProject()">프로젝트 중지 요청</button><select id="stop-ack-delivery" aria-label="중지 확인 delivery"><option value="">중지된 delivery 선택</option></select><button type="button" data-permission="execute" onclick="acknowledgeStop()">중지 확인</button><button type="button" data-permission="approve" onclick="resumeProject()">새 승인 후 재개</button></form><small id="stop-result" class="muted"></small></section>
+          <section class="flow-card" id="audit-flow"><h3>6. 감사·운영 상태</h3><button type="button" onclick="loadAudit()">감사 기록 새로고침</button><div id="audit-summary" class="muted"></div><div id="audit-list" class="audit-list stack muted">append-only audit 기록을 불러옵니다.</div></section>
+        </div>
+        <div class="placeholder"><strong>안전 경계</strong><div class="muted">외부 에이전트 호출은 실제 adapter가 명시적으로 활성화되기 전까지 발생하지 않습니다. Browser는 actor token을 받지 않으며, 인증 principal은 서버 세션에서 결정됩니다.</div></div>
+      </div>
       </div>
     </section>
-    <aside class="panel right">
+    <aside class="panel right" data-advanced-section hidden>
       <h2>참여 에이전트</h2><div id="agents" class="stack"><div class="empty">불러오는 중…</div></div>
       <h2 style="margin-top:16px">기획 기준선</h2><div id="gaps" class="stack"></div>
     </aside>
   </main>
-  <script>
-    const projectId = "plachem-agent-war-room";
-    const esc = value => String(value ?? "").replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
-    async function get(url){ const response=await fetch(url,{cache:"no-store"}); if(!response.ok) throw new Error(`${response.status} ${response.statusText}`); return response.json(); }
-    function fail(id,error){ document.getElementById(id).innerHTML=`<div class="empty error">조회 실패: ${esc(error.message)}</div>`; }
-    async function load(){
-      try { const data=await get('/api/war-room/projects'); document.getElementById('projects').innerHTML=data.items.map(p=>`<div class="project active"><strong>${esc(p.name)}</strong><div class="muted">${esc(p.status)} · 참여자 ${p.participant_count}</div></div>`).join('')||'<div class="empty">프로젝트 없음</div>'; } catch(e){ fail('projects',e); }
-      try { const data=await get(`/api/war-room/projects/${projectId}/timeline`); document.getElementById('timeline').innerHTML=data.items.map(m=>`<article class="event"><div class="event-type">${esc(m.message_type)}</div><div><strong>${esc(m.author_id)}</strong><p>${esc(m.body)}</p><small class="muted">${new Date(m.created_at*1000).toLocaleString()}</small></div></article>`).join('')||'<div class="empty">기록 없음</div>'; } catch(e){ fail('timeline',e); }
-      try { const [ops,participants]=await Promise.all([get(`/api/war-room/projects/${projectId}/operations`),get(`/api/war-room/projects/${projectId}/participants`)]); const roles=Object.fromEntries(participants.items.map(p=>[p.principal_id,p.role])); document.getElementById('agents').innerHTML=ops.agents.map(a=>`<div class="agent"><div class="agent-head"><strong>${esc(a.agent_id)}</strong><span class="status">${esc(a.state)}</span></div><div class="muted">${esc(roles[a.agent_id]||'participant')} · 세션 ${a.session_count}</div><small>${a.latest?esc(a.latest.status):'최근 세션 없음'}</small></div>`).join(''); } catch(e){ fail('agents',e); }
-      try { const b=await get(`/api/war-room/projects/${projectId}/manyfast-baseline`); document.getElementById('baseline').textContent=`ManyFast ${b.version}`; document.getElementById('stats').innerHTML=[['요구사항',b.counts.requirements],['기능',b.counts.features],['상세 기능',b.counts.specs]].map(x=>`<div class="stat"><strong>${x[1]}</strong>${x[0]}</div>`).join(''); document.getElementById('gaps').innerHTML=b.known_gaps.map(x=>`<div class="placeholder gap">보완 설계: ${esc(x)}</div>`).join(''); } catch(e){ fail('gaps',e); }
-    }
-    load(); setInterval(load,15000);
-  </script>
+  <script src="/static/war-room-ui.js"></script>
 </body>
 </html>

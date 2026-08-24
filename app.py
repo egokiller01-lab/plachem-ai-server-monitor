@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import hmac
 import os
 import platform
 import re
@@ -13,11 +15,13 @@ from pathlib import Path
 from typing import Any
 
 import psutil
-from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+import war_room
 from war_room import router as war_room_router
+from war_room_actions import router as war_room_actions_router
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -26,6 +30,91 @@ STATIC_DIR = BASE_DIR / "static"
 app = FastAPI(title="PLACHEM AI Server Monitor")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 app.include_router(war_room_router)
+app.include_router(war_room_actions_router)
+
+
+@app.on_event("startup")
+def provision_war_room_on_startup() -> None:
+    """Idempotently provision the local War Room store before serving UI/API."""
+    war_room.provision_database()
+    if os.environ.get("PLACHEM_WAR_ROOM_REAL_ADAPTER") == "1" and os.environ.get("PLACHEM_WAR_ROOM_TEST_ADAPTER") != "1":
+        from war_room_runtime import get_runtime
+        get_runtime().start(db_path=war_room._db_path())
+
+
+@app.on_event("shutdown")
+def stop_war_room_runtime() -> None:
+    if os.environ.get("PLACHEM_WAR_ROOM_REAL_ADAPTER") == "1" and os.environ.get("PLACHEM_WAR_ROOM_TEST_ADAPTER") != "1":
+        from war_room_runtime import get_runtime
+        get_runtime().close()
+
+
+def _war_room_principal(request: Request) -> str | None:
+    """Resolve a trusted reverse-proxy, signed-session, or server token principal."""
+    return war_room._request_principal(request, None, None)
+
+
+def _war_room_read_project(path: str) -> str | None:
+    parts = path.split("/")
+    # /api/war-room/projects/{project_id}/...
+    if len(parts) >= 5 and parts[3] == "projects":
+        return parts[4]
+    return None
+
+
+@app.middleware("http")
+async def war_room_read_rbac(request: Request, call_next):
+    """Require authenticated membership for every War Room GET route.
+
+    This middleware is intentionally HTTP-only, so the pure read-model
+    functions remain usable by isolated unit tests without bypassing production
+    route protection.
+    """
+    if request.url.path == "/war-room":
+        response = await call_next(request)
+        proxy_secret = os.environ.get("PLACHEM_WAR_ROOM_REVERSE_PROXY_SECRET", "")
+        proxy_principal = request.headers.get("X-Authenticated-Principal") or request.headers.get("X-Forwarded-User")
+        presented_secret = request.headers.get("X-War-Room-Proxy-Secret")
+        if proxy_secret and proxy_principal and hmac.compare_digest(proxy_secret, presented_secret or "") and proxy_principal in war_room.ALLOWED_AGENT_IDS and os.environ.get("PLACHEM_WAR_ROOM_SESSION_SECRET"):
+            session_secret = os.environ["PLACHEM_WAR_ROOM_SESSION_SECRET"]
+            signature = hmac.new(session_secret.encode(), proxy_principal.encode(), hashlib.sha256).hexdigest()
+            response.set_cookie("war_room_session", f"{proxy_principal}.{signature}", httponly=True, samesite="lax", secure=request.url.scheme == "https", path="/")
+        return response
+    if request.url.path.startswith("/api/war-room"):
+        principal = _war_room_principal(request)
+        if principal is None:
+            return JSONResponse({"detail": "War Room authentication required"}, status_code=401)
+        if request.url.path == "/api/war-room/demo-mode":
+            return await call_next(request)
+    if request.url.path.startswith("/api/war-room") and request.method == "GET":
+        import sqlite3
+        project_id = _war_room_read_project(request.url.path)
+        db_path = war_room._db_path()
+        if not db_path.is_file():
+            return JSONResponse({"detail": "War Room data unavailable"}, status_code=503)
+        try:
+            with sqlite3.connect(db_path) as con:
+                con.row_factory = sqlite3.Row
+                if project_id is None and request.url.path.rstrip("/") == "/api/war-room/projects":
+                    allowed = con.execute("SELECT 1 FROM war_participants WHERE principal_id=? AND can_read=1 AND active=1 LIMIT 1", (principal,)).fetchone()
+                elif project_id is not None:
+                    allowed = con.execute("SELECT 1 FROM war_participants WHERE project_id=? AND principal_id=? AND can_read=1 AND active=1", (project_id, principal)).fetchone()
+                else:
+                    # Task/message detail routes resolve their project through
+                    # the referenced row before applying membership.
+                    ref = request.url.path.split("/")
+                    allowed = None
+                    if "tasks" in ref:
+                        task_id = ref[ref.index("tasks") + 1]
+                        allowed = con.execute("SELECT 1 FROM war_participants p JOIN war_tasks t ON t.project_id=p.project_id WHERE t.id=? AND p.principal_id=? AND p.can_read=1 AND p.active=1", (task_id, principal)).fetchone()
+                    elif "messages" in ref:
+                        message_id = ref[ref.index("messages") + 1]
+                        allowed = con.execute("SELECT 1 FROM war_participants p JOIN war_messages m ON m.project_id=p.project_id WHERE m.id=? AND p.principal_id=? AND p.can_read=1 AND p.active=1", (message_id, principal)).fetchone()
+                if not allowed:
+                    return JSONResponse({"detail": "War Room permission denied"}, status_code=403)
+        except sqlite3.Error:
+            return JSONResponse({"detail": "War Room data unavailable"}, status_code=503)
+    return await call_next(request)
 
 _network_prev: dict[str, float | int] | None = None
 
@@ -1452,6 +1541,15 @@ def _collect_agent_context(agent_id: str) -> dict[str, Any]:
     remaining_prompt_budget_tokens = budget.get("remainingPromptBudgetTokens") if budget else None
     overflow_tokens = budget.get("overflowTokens") if budget else None
     route = budget.get("route") if budget else None
+    # Dashboard sessions do not always persist contextBudgetStatus. In that
+    # case totalTokens is the best available live context usage counter.
+    if estimated_prompt_tokens is None and isinstance(total_tokens, (int, float)):
+        estimated_prompt_tokens = total_tokens
+        estimate_source = "session-total-tokens"
+    if prompt_budget is None and isinstance(context_tokens, (int, float)):
+        prompt_budget = context_tokens
+    if remaining_prompt_budget_tokens is None and isinstance(estimated_prompt_tokens, (int, float)) and isinstance(prompt_budget, (int, float)):
+        remaining_prompt_budget_tokens = max(0, prompt_budget - estimated_prompt_tokens)
     prompt_percent = round(estimated_prompt_tokens / prompt_budget * 100) if isinstance(estimated_prompt_tokens, (int, float)) and isinstance(prompt_budget, (int, float)) and prompt_budget else None
     denom = (cache_read or 0) + (cache_write or 0) + (input_tokens or 0)
     cache_hit_percent = round(cache_read / denom * 100) if cache_read and denom else None

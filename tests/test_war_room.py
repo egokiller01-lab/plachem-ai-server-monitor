@@ -39,7 +39,10 @@ class WarRoomReadOnlyTests(unittest.TestCase):
         project = war_room.get_project(project_id)
         self.assertFalse(project["write_actions_enabled"])
         participants = war_room.get_participants(project_id)["items"]
-        self.assertEqual(["ERPcoder", "ERPqa", "main"], [row["principal_id"] for row in participants])
+        self.assertEqual(["ERPcoder", "ERPmanager", "ERPqa", "main"], [row["principal_id"] for row in participants])
+        manager = next(row for row in participants if row["principal_id"] == "ERPmanager")
+        self.assertEqual("observer", manager["role"])
+        self.assertEqual((1, 1, 0, 0), tuple(manager[name] for name in ("can_read", "can_comment", "can_approve", "can_execute")))
 
     def test_timeline_and_manyfast_baseline(self) -> None:
         war_room.provision_database()
@@ -53,8 +56,19 @@ class WarRoomReadOnlyTests(unittest.TestCase):
     def test_missing_openclaw_sessions_are_isolated(self) -> None:
         war_room.provision_database()
         operations = war_room.get_operations(war_room.PROJECT_ID)
-        self.assertEqual(3, len(operations["agents"]))
+        self.assertEqual(4, len(operations["agents"]))
         self.assertTrue(all(row["state"] == "unmapped" and row["session_count"] == 0 for row in operations["agents"]))
+
+    def test_openclaw_sessions_auto_adapter_is_read_only(self) -> None:
+        war_room.provision_database()
+        session_dir = Path(os.environ["OPENCLAW_HOME"]) / "agents" / "main" / "sessions"
+        session_dir.mkdir(parents=True)
+        (session_dir / "sessions.json").write_text(json.dumps({"agent:main:main": {"sessionId": "s1", "updatedAt": 123, "model": "safe-model"}}), encoding="utf-8")
+        operations = war_room.get_operations(war_room.PROJECT_ID)
+        main = next(row for row in operations["agents"] if row["agent_id"] == "main")
+        self.assertEqual("available", main["state"])
+        self.assertEqual("openclaw-sessions-readonly", main["adapter"])
+        self.assertEqual(1, main["session_count"])
 
     def test_get_does_not_create_database(self) -> None:
         with self.assertRaises(Exception):
@@ -94,13 +108,26 @@ class WarRoomReadOnlyTests(unittest.TestCase):
         session_dir.mkdir(parents=True)
         (session_dir / "sessions.json").write_text("{broken", encoding="utf-8")
         with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as connection:
-            connection.execute("INSERT INTO war_project_sessions VALUES (?, ?, ?, ?, 1)", (war_room.PROJECT_ID, "main", "s", "s"))
+            connection.execute("INSERT INTO war_project_sessions(project_id,agent_id,session_key,session_id,enabled) VALUES (?, ?, ?, ?, 1)", (war_room.PROJECT_ID, "main", "s", "s"))
             connection.commit()
         corrupt = war_room.get_operations(war_room.PROJECT_ID)
         self.assertEqual("corrupt", next(row for row in corrupt["agents"] if row["agent_id"] == "main")["state"])
         (session_dir / "sessions.json").write_text(json.dumps({"s": {"sessionId": "s", "updatedAt": "bad"}}), encoding="utf-8")
         invalid = war_room.get_operations(war_room.PROJECT_ID)
         self.assertEqual("invalid", next(row for row in invalid["agents"] if row["agent_id"] == "main")["state"])
+
+    def test_R_RAHBQI_operations_exposes_last_good_snapshot_when_degraded(self) -> None:
+        war_room.provision_database()
+        session_dir = Path(os.environ["OPENCLAW_HOME"]) / "agents" / "main" / "sessions"
+        session_dir.mkdir(parents=True)
+        sessions = session_dir / "sessions.json"
+        sessions.write_text(json.dumps({"agent:main:main": {"sessionId": "s1", "updatedAt": 123}}), encoding="utf-8")
+        healthy = war_room.get_operations(war_room.PROJECT_ID)
+        self.assertFalse(healthy["degraded"])
+        sessions.write_text("{broken", encoding="utf-8")
+        degraded = war_room.get_operations(war_room.PROJECT_ID)
+        self.assertTrue(degraded["degraded"])
+        self.assertEqual(healthy["last_checked"], degraded["last_good_snapshot"]["captured_at"])
 
 
 if __name__ == "__main__":

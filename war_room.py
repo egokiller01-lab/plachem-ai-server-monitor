@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import json
 import math
 import os
@@ -10,7 +12,7 @@ import time
 from pathlib import Path
 from typing import Annotated, Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Header, HTTPException, Query, Request
 
 
 router = APIRouter(prefix="/api/war-room", tags=["war-room"])
@@ -18,7 +20,9 @@ router = APIRouter(prefix="/api/war-room", tags=["war-room"])
 PROJECT_ID = "plachem-agent-war-room"
 MANYFAST_PROJECT_ID = "1b2eeb07-03bb-4e98-8b52-2f0ae1f716d9"
 ALLOWED_PROJECT_IDS = frozenset({PROJECT_ID})
-ALLOWED_AGENT_IDS = frozenset({"main", "ERPcoder", "ERPqa"})
+ALLOWED_AGENT_IDS = frozenset({"main", "ERPcoder", "ERPmanager", "ERPqa"})
+MESSAGE_TYPES = frozenset({"instruction", "opinion", "question", "decision", "result", "status", "system"})
+DELIVERY_STATUSES = frozenset({"queued", "sent", "received", "responded", "failed", "timed_out", "stopped"})
 SCHEMA_TABLES = frozenset(
     {
         "war_projects",
@@ -52,6 +56,7 @@ OPAQUE_SECRET_PATTERN = re.compile(
     r")"
 )
 MAX_PUBLIC_STRING_LENGTH = 4096
+_OPERATIONS_LAST_GOOD: dict[tuple[str, str], dict[str, Any]] = {}
 
 
 def _openclaw_home() -> Path:
@@ -87,7 +92,8 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
             can_read INTEGER NOT NULL DEFAULT 1,
             can_comment INTEGER NOT NULL DEFAULT 0,
             can_approve INTEGER NOT NULL DEFAULT 0,
-            can_execute INTEGER NOT NULL DEFAULT 0
+            can_execute INTEGER NOT NULL DEFAULT 0,
+            active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0, 1))
         );
         CREATE TABLE IF NOT EXISTS war_messages (
             id TEXT PRIMARY KEY,
@@ -143,8 +149,9 @@ def provision_database(path: str | Path | None = None) -> Path:
             ),
         )
         participants = (
-            ("participant-main", "main", "project_manager", 1, 1, 0),
+            ("participant-main", "main", "project_manager", 1, 1, 1),
             ("participant-erpcoder", "ERPcoder", "developer", 1, 0, 0),
+            ("participant-erpmanager", "ERPmanager", "observer", 1, 0, 0),
             ("participant-erpqa", "ERPqa", "qa", 1, 0, 0),
         )
         for row_id, agent_id, role, can_comment, can_approve, can_execute in participants:
@@ -172,6 +179,10 @@ def provision_database(path: str | Path | None = None) -> Path:
             ),
         )
         connection.commit()
+    # The controlled write model is provisioned explicitly with the read model;
+    # request handlers never create schema or data.
+    from war_room_actions import provision_action_schema
+    provision_action_schema(str(target))
     return target
 
 
@@ -236,12 +247,41 @@ def _redact(value: Any) -> Any:
 
 
 def _project_or_404(connection: sqlite3.Connection, project_id: str) -> sqlite3.Row:
-    if project_id not in ALLOWED_PROJECT_IDS:
-        raise HTTPException(status_code=404, detail="Project not found")
     row = connection.execute("SELECT * FROM war_projects WHERE id = ?", (project_id,)).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="Project not found")
     return row
+
+
+def _request_principal(request: Request | None, actor: str | None, token: str | None) -> str | None:
+    """Resolve the server-side principal for list filtering; never trust actor alone."""
+    if request is not None:
+        proxy_principal = request.headers.get("X-Authenticated-Principal") or request.headers.get("X-Forwarded-User")
+        proxy_secret = os.environ.get("PLACHEM_WAR_ROOM_REVERSE_PROXY_SECRET", "")
+        presented_proxy_secret = request.headers.get("X-War-Room-Proxy-Secret", "")
+        if (
+            proxy_secret
+            and proxy_principal in ALLOWED_AGENT_IDS
+            and hmac.compare_digest(proxy_secret, presented_proxy_secret)
+        ):
+            return proxy_principal
+        cookie = request.cookies.get("war_room_session")
+        if cookie:
+            try:
+                principal, signature = cookie.split(".", 1)
+                secret = os.environ.get("PLACHEM_WAR_ROOM_SESSION_SECRET", "")
+                if secret and hmac.compare_digest(signature, hmac.new(secret.encode(), principal.encode(), hashlib.sha256).hexdigest()):
+                    return principal if principal in ALLOWED_AGENT_IDS else None
+            except ValueError:
+                pass
+    supplied_token = token or (request.headers.get("X-War-Room-Token") if request is not None else None)
+    advertised = actor or (request.headers.get("X-War-Room-Actor") if request is not None else None)
+    try:
+        token_map = json.loads(os.environ.get("PLACHEM_WAR_ROOM_PRINCIPAL_TOKENS", "{}"))
+    except json.JSONDecodeError:
+        return None
+    principal = next((str(key) for key, value in token_map.items() if isinstance(value, str) and value == supplied_token), None)
+    return principal if principal and (not advertised or advertised == principal) else None
 
 
 def _parse_updated_at(value: Any) -> int | None:
@@ -265,6 +305,30 @@ def _session_summary(agent_id: str, bindings: list[sqlite3.Row]) -> dict[str, An
         "latest": None,
     }
     if not bindings:
+        # Read-only auto adapter: discover only metadata from the named
+        # agent's own sessions index. No session mapping or message data is
+        # written, and no arbitrary project/session is exposed.
+        sessions_path = _openclaw_home() / "agents" / agent_id / "sessions" / "sessions.json"
+        raw = _safe_json(sessions_path) if sessions_path.is_file() else None
+        if not isinstance(raw, dict):
+            return base
+        rows: list[dict[str, Any]] = []
+        for key, item in raw.items():
+            if not isinstance(item, dict):
+                continue
+            updated_at = _parse_updated_at(item.get("updatedAt"))
+            if updated_at is None:
+                continue
+            rows.append({
+                "key": str(key),
+                "session_id": item.get("sessionId"),
+                "status": item.get("status") or "unknown",
+                "updated_at": updated_at,
+                "model": _redact_string(str(item.get("model") or "unknown")),
+            })
+        rows.sort(key=lambda item: (item["updated_at"], item["key"]), reverse=True)
+        if rows:
+            base.update({"state": "available", "session_count": len(rows), "latest": _redact(rows[0]), "adapter": "openclaw-sessions-readonly"})
         return base
     if agent_id not in ALLOWED_AGENT_IDS:
         base.update({"state": "unavailable", "error_code": "agent_not_allowed"})
@@ -348,22 +412,39 @@ def _decode_cursor(value: str) -> tuple[int, str]:
 
 
 @router.get("/projects")
-def list_projects() -> dict[str, Any]:
+def list_projects(request: Request = None, status: str | None = None, q: str | None = None, x_war_room_actor: str | None = Header(default=None), x_war_room_token: str | None = Header(default=None)) -> dict[str, Any]:
     with _connect_readonly() as connection:
-        placeholders = ",".join("?" for _ in ALLOWED_PROJECT_IDS)
-        rows = connection.execute(
-            f"""
+        principal = _request_principal(request, x_war_room_actor, x_war_room_token)
+        if principal:
+            rows = connection.execute(
+                """
+                SELECT p.*,
+                       (SELECT COUNT(*) FROM war_participants x WHERE x.project_id = p.id AND x.active=1) AS participant_count,
+                       (SELECT MAX(created_at) FROM war_messages m WHERE m.project_id = p.id) AS last_activity
+                FROM war_projects p JOIN war_participants me ON me.project_id=p.id
+                WHERE me.principal_id=? AND me.can_read=1 AND me.active=1
+                ORDER BY p.updated_at DESC
+                """, (principal,)
+            ).fetchall()
+        else:
+            rows = connection.execute(
+            """
             SELECT p.*,
                    (SELECT COUNT(*) FROM war_participants x
-                    WHERE x.project_id = p.id AND x.principal_id IN ('main', 'ERPcoder', 'ERPqa')) AS participant_count,
+                    WHERE x.project_id = p.id AND x.principal_id IN ('main', 'ERPcoder', 'ERPmanager', 'ERPqa')) AS participant_count,
                    (SELECT MAX(created_at) FROM war_messages m WHERE m.project_id = p.id) AS last_activity
             FROM war_projects p
-            WHERE p.id IN ({placeholders})
+            WHERE p.id IN ('plachem-agent-war-room')
             ORDER BY updated_at DESC
             """,
-            tuple(ALLOWED_PROJECT_IDS),
-        ).fetchall()
-    return {"mode": "readonly", "items": _redact([dict(row) for row in rows])}
+            ).fetchall()
+    # FastAPI may expose Query marker defaults when this route function is
+    # called directly by the read-model unit tests. Normalize those markers
+    # instead of treating them as user-provided strings.
+    status_value = status if isinstance(status, str) else None
+    query_value = q if isinstance(q, str) else None
+    items = [dict(row) for row in rows if (status_value is None or row["status"] == status_value) and (query_value is None or query_value.lower() in row["name"].lower())]
+    return {"mode": "readonly", "items": _redact(items)}
 
 
 @router.get("/projects/{project_id}")
@@ -380,7 +461,7 @@ def get_participants(project_id: str) -> dict[str, Any]:
         rows = connection.execute(
             """
             SELECT * FROM war_participants
-            WHERE project_id = ? AND principal_id IN ('main', 'ERPcoder', 'ERPqa')
+            WHERE project_id = ? AND principal_id IN ('main', 'ERPcoder', 'ERPmanager', 'ERPqa')
             ORDER BY id
             """,
             (project_id,),
@@ -388,26 +469,89 @@ def get_participants(project_id: str) -> dict[str, Any]:
     return {"mode": "readonly", "items": _redact([dict(row) for row in rows])}
 
 
+@router.get("/projects/{project_id}/access")
+def get_project_access(
+    project_id: str,
+    request: Request,
+    x_war_room_actor: str | None = Header(default=None),
+    x_war_room_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Return the server-derived permissions used to gate UI controls."""
+    with _connect_readonly() as connection:
+        _project_or_404(connection, project_id)
+        principal = _request_principal(request, x_war_room_actor, x_war_room_token)
+        if not principal:
+            raise HTTPException(status_code=401, detail="War Room authentication required")
+        row = connection.execute(
+            "SELECT principal_id, role, active, can_read, can_comment, can_approve, can_execute FROM war_participants WHERE project_id=? AND principal_id=?",
+            (project_id, principal),
+        ).fetchone()
+    if not row or not row["active"] or not row["can_read"]:
+        raise HTTPException(status_code=403, detail="War Room permission denied")
+    permissions = [name for name, column in (
+        ("read", "can_read"), ("comment", "can_comment"),
+        ("approve", "can_approve"), ("execute", "can_execute"),
+    ) if row[column]]
+    if row["role"] == "project_manager" and row["can_execute"]:
+        permissions.append("manage")
+    return {
+        "mode": "readonly", "principal_id": row["principal_id"], "role": row["role"],
+        "permissions": permissions,
+        "is_representative": row["principal_id"] in {
+            value.strip() for value in os.environ.get("PLACHEM_WAR_ROOM_REPRESENTATIVE_PRINCIPALS", "main").split(",") if value.strip()
+        },
+        "capabilities": {column: bool(row[column]) for column in ("can_read", "can_comment", "can_approve", "can_execute")},
+    }
+
+
 @router.get("/projects/{project_id}/timeline")
 def get_timeline(
     project_id: str,
     limit: Annotated[int, Query(ge=1, le=100)] = 100,
     before: Annotated[str | None, Query(min_length=1, max_length=256)] = None,
+    message_type: Annotated[str | None, Query(max_length=32)] = None,
+    author_id: Annotated[str | None, Query(max_length=128)] = None,
+    delivery_status: Annotated[str | None, Query(max_length=32)] = None,
+    from_ts: Annotated[int | None, Query(ge=0)] = None,
+    to_ts: Annotated[int | None, Query(ge=0)] = None,
 ) -> dict[str, Any]:
+    if message_type is not None and message_type not in MESSAGE_TYPES:
+        raise HTTPException(status_code=422, detail="Invalid message type")
+    if delivery_status is not None and delivery_status not in DELIVERY_STATUSES:
+        raise HTTPException(status_code=422, detail="Invalid delivery status")
+    if from_ts is not None and to_ts is not None and from_ts > to_ts:
+        raise HTTPException(status_code=422, detail="Invalid timeline range")
     with _connect_readonly() as connection:
         _project_or_404(connection, project_id)
         params: list[Any] = [project_id]
-        condition = ""
+        conditions = ["m.project_id = ?"]
+        if message_type is not None:
+            conditions.append("m.message_type = ?")
+            params.append(message_type)
+        if author_id is not None:
+            conditions.append("m.author_id = ?")
+            params.append(author_id)
+        if delivery_status is not None:
+            conditions.append("EXISTS (SELECT 1 FROM war_deliveries ds WHERE ds.message_id=m.id AND ds.status=?)")
+            params.append(delivery_status)
+        if from_ts is not None:
+            conditions.append("m.created_at >= ?")
+            params.append(from_ts)
+        if to_ts is not None:
+            conditions.append("m.created_at <= ?")
+            params.append(to_ts)
         if before is not None:
             before_created_at, before_id = _decode_cursor(before)
-            condition = "AND (created_at < ? OR (created_at = ? AND id < ?))"
+            conditions.append("(m.created_at < ? OR (m.created_at = ? AND m.id < ?))")
             params.extend([before_created_at, before_created_at, before_id])
         params.append(limit + 1)
         rows = connection.execute(
             f"""
-            SELECT * FROM war_messages
-            WHERE project_id = ? {condition}
-            ORDER BY created_at DESC, id DESC LIMIT ?
+            SELECT m.*, GROUP_CONCAT(DISTINCT d.status) AS delivery_statuses
+            FROM war_messages m LEFT JOIN war_deliveries d ON d.message_id=m.id
+            WHERE {' AND '.join(conditions)}
+            GROUP BY m.id
+            ORDER BY m.created_at DESC, m.id DESC LIMIT ?
             """,
             params,
         ).fetchall()
@@ -431,7 +575,7 @@ def get_operations(project_id: str) -> dict[str, Any]:
         participants = connection.execute(
             """
             SELECT principal_id FROM war_participants
-            WHERE project_id = ? AND principal_id IN ('main', 'ERPcoder', 'ERPqa')
+            WHERE project_id = ? AND principal_id IN ('main', 'ERPcoder', 'ERPmanager', 'ERPqa')
             ORDER BY principal_id
             """,
             (project_id,),
@@ -441,7 +585,7 @@ def get_operations(project_id: str) -> dict[str, Any]:
             SELECT project_id, agent_id, session_key, session_id, enabled
             FROM war_project_sessions
             WHERE project_id = ? AND enabled = 1
-              AND agent_id IN ('main', 'ERPcoder', 'ERPqa')
+              AND agent_id IN ('main', 'ERPcoder', 'ERPmanager', 'ERPqa')
             ORDER BY agent_id, session_key, session_id
             """,
             (project_id,),
@@ -449,10 +593,20 @@ def get_operations(project_id: str) -> dict[str, Any]:
     by_agent: dict[str, list[sqlite3.Row]] = {agent_id: [] for agent_id in ALLOWED_AGENT_IDS}
     for binding in bindings:
         by_agent.setdefault(str(binding["agent_id"]), []).append(binding)
+    checked_at = int(time.time())
+    agents = [_redact(_session_summary(row["principal_id"], by_agent.get(row["principal_id"], []))) for row in participants]
+    cache_key = (str(_db_path()), project_id)
+    available = any(agent.get("state") == "available" for agent in agents)
+    if available:
+        _OPERATIONS_LAST_GOOD[cache_key] = {"captured_at": checked_at, "agents": agents}
+    last_good = _OPERATIONS_LAST_GOOD.get(cache_key)
     return {
         "mode": "readonly",
-        "agents": [_redact(_session_summary(row["principal_id"], by_agent.get(row["principal_id"], []))) for row in participants],
-        "last_checked": int(time.time()),
+        "agents": agents,
+        "last_checked": checked_at,
+        "degraded": bool(last_good and not available),
+        "failure_time": checked_at if last_good and not available else None,
+        "last_good_snapshot": last_good if last_good and not available else None,
     }
 
 
