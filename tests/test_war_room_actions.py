@@ -950,6 +950,87 @@ class WarRoomControlledApiTests(unittest.TestCase):
         self.assertEqual([{"delivery_id":"restart-delivery","run_id":"run-restart","status":"responded"}], result)
         self.assertEqual(("agent:erpcoder:war-room-test:fixture","session-disposable"), adapter.bound["run-restart"])
 
+    def test_grounding_accepts_short_and_full_git_revision_of_same_commit(self) -> None:
+        from war_room_worker import _structured_result
+
+        headers = {"X-War-Room-Actor":"main","X-War-Room-Token":"fixture-main-token","Idempotency-Key":"prefix-prepare"}
+        prepared = self.client.post("/api/war-room/projects/plachem-agent-war-room/prepare", json={
+            "instruction":"revision prefix", "agent_ids":["ERPcoder"],
+            "deadline_at":int(time.time())+600, "document_version":"baseline-2026-08-23",
+            "grounding":{"worktree":"/safe/worktree","branch":"fix/runtime","revision":"27c5015","api_base":"/api","db_label":"isolated","forbidden":["production DB"],"completion_conditions":["tests pass"]},
+        }, headers=headers).json()
+        response = json.dumps({
+            "confirmed_worktree":"/safe/worktree",
+            "confirmed_revision":"27c5015aabbccddeeff001122334455667788990",
+            "verdict":"PASS", "evidence":["/tmp/test.log"], "summary":"ok",
+            "representative_completion_claimed":False,
+        })
+        with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
+            con.row_factory = sqlite3.Row
+            result, error = _structured_result(con, prepared["message_id"], "ERPcoder", response)
+        self.assertIsNone(error)
+        self.assertEqual("PASS", result["verdict"])
+
+    def test_grounding_revision_normalization_is_bidirectional_and_rejects_unsafe_prefixes(self) -> None:
+        from war_room_worker import _structured_result
+
+        def prepare(revision: str, key: str) -> dict:
+            return self.client.post("/api/war-room/projects/plachem-agent-war-room/prepare", json={
+                "instruction":f"revision {key}", "agent_ids":["ERPcoder"],
+                "deadline_at":int(time.time())+600, "document_version":"baseline-2026-08-23",
+                "grounding":{"worktree":"/safe/worktree","branch":"fix/runtime","revision":revision,"api_base":"/api","db_label":"isolated","forbidden":["production DB"],"completion_conditions":["tests pass"]},
+            }, headers={"X-War-Room-Actor":"main","X-War-Room-Token":"fixture-main-token","Idempotency-Key":key}).json()
+
+        def validate(prepared: dict, revision: str) -> str | None:
+            response = json.dumps({
+                "confirmed_worktree":"/safe/worktree", "confirmed_revision":revision,
+                "verdict":"PASS", "evidence":["/tmp/test.log"], "summary":"ok",
+                "representative_completion_claimed":False,
+            })
+            with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
+                con.row_factory = sqlite3.Row
+                _, error = _structured_result(con, prepared["message_id"], "ERPcoder", response)
+            return error
+
+        full = "27c5015aabbccddeeff001122334455667788990"
+        self.assertIsNone(validate(prepare(full, "full-to-short"), "27c5015"))
+        self.assertIsNone(validate(prepare(" 27C5015 ", "normalized-short"), f" {full.upper()} "))
+        self.assertEqual("context_mismatch", validate(prepare("27c5015", "unrelated-sha"), "37c5015aabbccddeeff001122334455667788990"))
+        for length in range(1, 7):
+            short = "abcdef"[:length]
+            self.assertEqual("context_mismatch", validate(prepare(short, f"too-short-{length}"), short + "1234567890"))
+
+    def test_recovery_validation_failure_does_not_mutate_frozen_receipt(self) -> None:
+        from war_room_adapter import DeliveryReceipt
+        from war_room_worker import recover_received_deliveries
+
+        headers = {"X-War-Room-Actor":"main","X-War-Room-Token":"fixture-main-token"}
+        prepared = self.client.post("/api/war-room/projects/plachem-agent-war-room/prepare", json={
+            "instruction":"immutable recovery", "agent_ids":["ERPcoder"],
+            "deadline_at":int(time.time())+600, "document_version":"baseline-2026-08-23",
+            "grounding":{"worktree":"/safe/worktree","branch":"fix/runtime","revision":"27c5015","api_base":"/api","db_label":"isolated","forbidden":["production DB"],"completion_conditions":["tests pass"]},
+        }, headers={**headers,"Idempotency-Key":"frozen-prepare"}).json()
+        self.client.post(f"/api/war-room/tasks/{prepared['task_id']}/approve-execute", json={"expires_at":int(time.time())+500}, headers={**headers,"Idempotency-Key":"frozen-run"})
+        db = Path(os.environ["PLACHEM_WAR_ROOM_DB"])
+        with sqlite3.connect(db) as con:
+            delivery_id = con.execute("SELECT id FROM war_deliveries WHERE message_id=?", (prepared["message_id"],)).fetchone()[0]
+            con.execute("UPDATE war_deliveries SET status='received',run_id='frozen-run' WHERE id=?", (delivery_id,))
+            con.commit()
+
+        invalid = json.dumps({
+            "confirmed_worktree":"/wrong/worktree", "confirmed_revision":"27c5015",
+            "verdict":"PASS", "evidence":["/tmp/test.log"], "summary":"wrong",
+            "representative_completion_claimed":False,
+        })
+        class FrozenGateway:
+            def poll(self, *, run_id: str, agent_id: str) -> DeliveryReceipt:
+                return DeliveryReceipt(run_id, "responded", run_id=run_id, response_body=invalid)
+
+        recovered = recover_received_deliveries(db_path=db, gateway=FrozenGateway(), now=int(time.time()))
+        self.assertEqual("failed", recovered[0]["status"])
+        with sqlite3.connect(db) as con:
+            self.assertEqual(("failed","context_mismatch"), con.execute("SELECT status,error_code FROM war_deliveries WHERE id=?", (delivery_id,)).fetchone())
+
     def test_explicit_binding_and_byte_equivalent_selected_fanout(self) -> None:
         headers={"X-War-Room-Actor":"main","X-War-Room-Token":"fixture-main-token"}; base="/api/war-room/projects/plachem-agent-war-room"
         task=self.client.post(base+"/tasks",json=self.task_body("fanout",agent_ids=["ERPcoder","ERPqa"],call_limit=2),headers={**headers,"Idempotency-Key":"fan-task"})

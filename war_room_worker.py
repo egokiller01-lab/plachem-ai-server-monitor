@@ -8,6 +8,7 @@ original delivery identifier.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 import uuid
@@ -60,7 +61,25 @@ def _structured_result(con: sqlite3.Connection, message_id: str, agent_id: str, 
     if not isinstance(result, dict) or not required.issubset(result):
         return None, "structured_response_fields_missing"
     packet = json.loads(con.execute("SELECT packet_json FROM war_grounding_packets WHERE task_id=?", (task["id"],)).fetchone()[0])
-    if result["confirmed_worktree"] != packet["worktree"] or result["confirmed_revision"] != packet["revision"]:
+    expected_revision = packet["revision"]
+    confirmed_revision = result["confirmed_revision"]
+    normalized_expected = expected_revision.strip().lower() if isinstance(expected_revision, str) else expected_revision
+    normalized_confirmed = confirmed_revision.strip().lower() if isinstance(confirmed_revision, str) else confirmed_revision
+    revisions_match = normalized_confirmed == normalized_expected
+    if (
+        not revisions_match
+        and isinstance(normalized_confirmed, str)
+        and isinstance(normalized_expected, str)
+        and len(normalized_confirmed) >= 7
+        and len(normalized_expected) >= 7
+        and re.fullmatch(r"[0-9a-f]+", normalized_confirmed)
+        and re.fullmatch(r"[0-9a-f]+", normalized_expected)
+    ):
+        revisions_match = (
+            normalized_confirmed.startswith(normalized_expected)
+            or normalized_expected.startswith(normalized_confirmed)
+        )
+    if result["confirmed_worktree"] != packet["worktree"] or not revisions_match:
         return None, "context_mismatch"
     if result["verdict"] not in {"PASS","FAIL","REWORK"} or not isinstance(result["summary"], str):
         return None, "structured_response_invalid_verdict"
@@ -241,14 +260,15 @@ def recover_received_deliveries(*, db_path: str | Path, gateway: Any, now: int |
                 continue
             response_message_id = row["response_message_id"]
             response_body = getattr(run, "response_body", None)
+            error_code = getattr(run, "error_code", None)
             if status == "responded" and (not isinstance(response_body, str) or not response_body.strip()) and not response_message_id:
                 status = "failed"
-                run.error_code = getattr(run, "error_code", None) or "response_body_missing"
+                error_code = error_code or "response_body_missing"
             if status == "responded" and isinstance(response_body, str) and response_body.strip():
                 _, validation_error = _structured_result(con, row["message_id"], row["agent_id"], response_body)
                 if validation_error:
                     status = "failed"
-                    run.error_code = validation_error
+                    error_code = validation_error
                     _terminal_validation_failure(con, message_id=row["message_id"], project_id=row["project_id"], delivery_id=row["id"], error_code=validation_error, now=current)
             if status == "responded" and isinstance(response_body, str) and response_body.strip() and not response_message_id:
                 response_message_id = str(uuid.uuid4())
@@ -258,7 +278,7 @@ def recover_received_deliveries(*, db_path: str | Path, gateway: Any, now: int |
                        VALUES (?,?,'result','agent',?,?,?,?,?,'clean')""",
                     (response_message_id, row["project_id"], row["agent_id"], war_room._redact_string(response_body), row["message_id"], current, str(uuid.uuid4())),
                 )
-            con.execute("UPDATE war_deliveries SET status=?,responded_at=CASE WHEN ?='responded' THEN ? ELSE responded_at END,error_code=?,response_message_id=? WHERE id=?", (status, status, current, getattr(run, "error_code", None), response_message_id, row["id"]))
+            con.execute("UPDATE war_deliveries SET status=?,responded_at=CASE WHEN ?='responded' THEN ? ELSE responded_at END,error_code=?,response_message_id=? WHERE id=?", (status, status, current, error_code, response_message_id, row["id"]))
             if status == "responded":
                 task = con.execute("SELECT id FROM war_tasks WHERE source_message_id=?", (row["message_id"],)).fetchone()
                 if task:
