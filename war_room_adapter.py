@@ -318,6 +318,30 @@ class OpenClawSessionAdapter:
             return error
         status = str(data.get("status", "pending")) if data else "pending"
         if status in {"pending", "timeout"}:
+            session = self._run_bindings.get(run_id)
+            started_at_ms = self._run_started_at_ms.get(run_id)
+            if session is not None and started_at_ms is not None:
+                session_key, session_id = session
+                history, history_error = self._gateway("chat.history", {"sessionKey": session_key, "agentId": agent_id, "limit": 20}, run_id)
+                if history_error is None and history is not None:
+                    session_info = history.get("sessionInfo", {})
+                    active_ids = session_info.get("activeRunIds", []) if isinstance(session_info, dict) else []
+                    active = bool(
+                        isinstance(session_info, dict)
+                        and (session_info.get("hasActiveRun") is True or (isinstance(active_ids, list) and active_ids))
+                    )
+                    if not active:
+                        messages = history.get("messages", [])
+                        if isinstance(messages, list):
+                            for message in reversed(messages):
+                                if not isinstance(message, dict) or message.get("role") != "assistant":
+                                    continue
+                                timestamp = message.get("timestamp")
+                                if not isinstance(timestamp, (int, float)) or int(timestamp) < started_at_ms:
+                                    continue
+                                response_body = self._latest_assistant_text({"messages":[message]}, not_before_ms=started_at_ms)
+                                if response_body:
+                                    return DeliveryReceipt(run_id, "responded", session_id=session_id, run_id=run_id, response_body=response_body)
             return DeliveryReceipt(run_id, "received", run_id=run_id)
         if status == "error":
             return DeliveryReceipt(run_id, "failed", error_code=str(data.get("error") or "openclaw_run_failed"), run_id=run_id)

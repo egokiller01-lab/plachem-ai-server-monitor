@@ -831,6 +831,66 @@ class WarRoomControlledApiTests(unittest.TestCase):
         self.assertEqual("openclaw_session_active_run_exists", receipt.error_code)
         self.assertEqual(["chat.history"], methods)
 
+    def test_poll_recovers_pending_run_from_durable_new_assistant_history(self) -> None:
+        from war_room_adapter import OpenClawSessionAdapter
+
+        class Bridge:
+            connection_id = "recovery-connection"
+            def request(self, method, params, timeout_ms=15000):
+                if method == "agent.wait":
+                    return {"status":"timeout"}, self.connection_id
+                return {"sessionInfo":{"hasActiveRun":False,"activeRunIds":[]},"messages":[{"role":"assistant","timestamp":100001,"content":[{"type":"text","text":"durable result"}]}]}, self.connection_id
+
+        adapter = OpenClawSessionAdapter(bridge=Bridge())
+        adapter.bind_run("durable-run", session_key="agent:erpcoder:war-room-test:durable", session_id="durable-session", disposable=True, purpose="test", started_at=100, agent_id="ERPcoder")
+        receipt = adapter.poll(run_id="durable-run", agent_id="ERPcoder")
+        self.assertEqual("responded", receipt.status)
+        self.assertEqual("durable result", receipt.response_body)
+
+    def test_poll_does_not_recover_history_while_session_has_active_run(self) -> None:
+        from war_room_adapter import OpenClawSessionAdapter
+
+        class Bridge:
+            connection_id = "active-connection"
+            def request(self, method, params, timeout_ms=15000):
+                if method == "agent.wait":
+                    return {"status":"pending"}, self.connection_id
+                return {"sessionInfo":{"hasActiveRun":True,"activeRunIds":["active-run"]},"messages":[{"role":"assistant","timestamp":100001,"content":"partial"}]}, self.connection_id
+
+        adapter = OpenClawSessionAdapter(bridge=Bridge())
+        adapter.bind_run("active-run", session_key="agent:erpcoder:war-room-test:active-poll", session_id="active-session", disposable=True, purpose="test", started_at=100, agent_id="ERPcoder")
+        self.assertEqual("received", adapter.poll(run_id="active-run", agent_id="ERPcoder").status)
+
+    def test_poll_rejects_assistant_history_older_than_bound_run(self) -> None:
+        from war_room_adapter import OpenClawSessionAdapter
+
+        class Bridge:
+            connection_id = "old-connection"
+            def request(self, method, params, timeout_ms=15000):
+                if method == "agent.wait":
+                    return {"status":"timeout"}, self.connection_id
+                return {"sessionInfo":{"hasActiveRun":False,"activeRunIds":[]},"messages":[{"role":"assistant","timestamp":99999,"content":"old result"}]}, self.connection_id
+
+        adapter = OpenClawSessionAdapter(bridge=Bridge())
+        adapter.bind_run("new-run", session_key="agent:erpcoder:war-room-test:old-history", session_id="old-session", disposable=True, purpose="test", started_at=100, agent_id="ERPcoder")
+        self.assertEqual("received", adapter.poll(run_id="new-run", agent_id="ERPcoder").status)
+
+    def test_poll_history_error_preserves_received_state(self) -> None:
+        from war_room_adapter import OpenClawSessionAdapter
+
+        class Bridge:
+            connection_id = "error-connection"
+            def request(self, method, params, timeout_ms=15000):
+                if method == "agent.wait":
+                    return {"status":"pending"}, self.connection_id
+                raise RuntimeError("history unavailable")
+
+        adapter = OpenClawSessionAdapter(bridge=Bridge())
+        adapter.bind_run("error-run", session_key="agent:erpcoder:war-room-test:history-error", session_id="error-session", disposable=True, purpose="test", started_at=100, agent_id="ERPcoder")
+        receipt = adapter.poll(run_id="error-run", agent_id="ERPcoder")
+        self.assertEqual("received", receipt.status)
+        self.assertIsNone(receipt.error_code)
+
     def test_abort_requires_same_persistent_gateway_connection_as_send(self) -> None:
         from war_room_adapter import OpenClawSessionAdapter
 
