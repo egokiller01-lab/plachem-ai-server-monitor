@@ -791,6 +791,9 @@ class WarRoomControlledApiTests(unittest.TestCase):
         def runner(args, **kwargs):
             calls.append(args)
             method = args[args.index("call") + 1]
+            if method in {"chat.history", "chat.send"}:
+                params = json.loads(args[args.index("--params") + 1])
+                self.assertEqual("erpcoder", params["agentId"])
             if method == "chat.history":
                 payload = {"result":{"sessionInfo":{"hasActiveRun":False,"activeRunIds":[]},"messages":[]}}
             elif method == "chat.send":

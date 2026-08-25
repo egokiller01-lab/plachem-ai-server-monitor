@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS war_deliveries (
  attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0), max_attempts INTEGER NOT NULL DEFAULT 3 CHECK(max_attempts BETWEEN 1 AND 20),
  sent_at INTEGER, received_at INTEGER,
  responded_at INTEGER, error_code TEXT, run_id TEXT, response_message_id TEXT,
+ session_key TEXT, session_id TEXT, correlation_id TEXT,
  next_attempt_at INTEGER, deadline_at INTEGER,
  retry_count INTEGER NOT NULL DEFAULT 0, error_class TEXT, last_error_at INTEGER,
  created_at INTEGER NOT NULL, UNIQUE(message_id, agent_id)
@@ -201,6 +202,9 @@ def provision_action_schema(path: str | None = None) -> str:
             con.execute("ALTER TABLE war_deliveries ADD COLUMN error_class TEXT")
         if "last_error_at" not in delivery_columns:
             con.execute("ALTER TABLE war_deliveries ADD COLUMN last_error_at INTEGER")
+        for column, definition in (("session_key", "TEXT"), ("session_id", "TEXT"), ("correlation_id", "TEXT")):
+            if column not in delivery_columns:
+                con.execute(f"ALTER TABLE war_deliveries ADD COLUMN {column} {definition}")
         con.execute("UPDATE war_deliveries SET retry_count=attempt_count WHERE retry_count=0 AND attempt_count>0")
         reference_columns = {row[1] for row in con.execute("PRAGMA table_info(war_manyfast_refs)")}
         if "drift_status" not in reference_columns:
@@ -499,8 +503,9 @@ async def approve_and_execute_task(task_id: str, request: Request, x_war_room_ac
         deliveries = []
         for agent in agents:
             delivery_id = str(uuid.uuid4())
-            con.execute("INSERT INTO war_deliveries (id,message_id,agent_id,status,attempt_count,deadline_at,created_at) VALUES (?,?,?,'queued',0,?,?)", (delivery_id,task["source_message_id"],agent,task["deadline_at"],now))
-            deliveries.append({"delivery_id":delivery_id,"agent_id":agent,"status":"queued"})
+            delivery_correlation = str(uuid.uuid4())
+            con.execute("INSERT INTO war_deliveries (id,message_id,agent_id,status,attempt_count,deadline_at,created_at,correlation_id) VALUES (?,?,?,'queued',0,?,?,?)", (delivery_id,task["source_message_id"],agent,task["deadline_at"],now,delivery_correlation))
+            deliveries.append({"delivery_id":delivery_id,"agent_id":agent,"status":"queued","correlation_id":delivery_correlation})
         _audit(con, task["project_id"], actor, "task_approved_executed", "task", task_id, {"approval_id":approval_id,"agent_ids":agents}, correlation)
         result = {"mode":"controlled","task_id":task_id,"status":"running","execution_state":"queued","approval_id":approval_id,"deliveries":deliveries,"correlation_id":correlation}
         _save_idem(con, actor, idempotency_key, idem_scope, body, result)
@@ -643,10 +648,10 @@ async def deliver_message(message_id: str, request: Request, x_war_room_actor: s
         correlation = str(uuid.uuid4()); deliveries = []
         delivery_deadline = int(task["deadline_at"])
         for agent_id in requested_agents:
-            delivery_id = str(uuid.uuid4())
-            con.execute("INSERT INTO war_deliveries (id,message_id,agent_id,status,attempt_count,deadline_at,created_at) VALUES (?,?,?,'queued',0,?,?)", (delivery_id, message_id, agent_id, delivery_deadline, _now()))
-            deliveries.append({"delivery_id":delivery_id,"agent_id":agent_id,"status":"queued"})
-            _audit(con, message["project_id"], actor, "delivery_queued", "delivery", delivery_id, {"message_id": message_id, "agent_id": agent_id}, correlation)
+            delivery_id = str(uuid.uuid4()); delivery_correlation = str(uuid.uuid4())
+            con.execute("INSERT INTO war_deliveries (id,message_id,agent_id,status,attempt_count,deadline_at,created_at,correlation_id) VALUES (?,?,?,'queued',0,?,?,?)", (delivery_id, message_id, agent_id, delivery_deadline, _now(), delivery_correlation))
+            deliveries.append({"delivery_id":delivery_id,"agent_id":agent_id,"status":"queued","correlation_id":delivery_correlation})
+            _audit(con, message["project_id"], actor, "delivery_queued", "delivery", delivery_id, {"message_id": message_id, "agent_id": agent_id, "delivery_correlation_id": delivery_correlation}, delivery_correlation)
         result = {"mode":"controlled","deliveries":deliveries,"delivery_id":deliveries[0]["delivery_id"],"status":"queued","correlation_id":correlation}
         _save_idem(con, actor, idempotency_key, idem_scope, body, result); con.commit(); return result
 

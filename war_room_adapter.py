@@ -267,7 +267,8 @@ class OpenClawSessionAdapter:
         if session is None:
             return DeliveryReceipt(delivery_id, "failed", error_code="openclaw_session_missing")
         session_key, session_id = session
-        history, history_error = self._gateway("chat.history", {"sessionKey": session_key, "agentId": agent_id, "limit": 1}, delivery_id)
+        gateway_agent_id = agent_id.lower()
+        history, history_error = self._gateway("chat.history", {"sessionKey": session_key, "agentId": gateway_agent_id, "limit": 1}, delivery_id)
         if history_error:
             return history_error
         session_info = history.get("sessionInfo", {}) if history else {}
@@ -276,7 +277,7 @@ class OpenClawSessionAdapter:
             return DeliveryReceipt(delivery_id, "failed", session_id=session_id, error_code="openclaw_session_active_run_exists")
         data, error = self._gateway("chat.send", {
             "sessionKey": session_key,
-            "agentId": agent_id,
+            "agentId": gateway_agent_id,
             "sessionId": session_id,
             "message": body,
             "deliver": False,
@@ -322,7 +323,7 @@ class OpenClawSessionAdapter:
             started_at_ms = self._run_started_at_ms.get(run_id)
             if session is not None and started_at_ms is not None:
                 session_key, session_id = session
-                history, history_error = self._gateway("chat.history", {"sessionKey": session_key, "agentId": agent_id, "limit": 20}, run_id)
+                history, history_error = self._gateway("chat.history", {"sessionKey": session_key, "agentId": agent_id.lower(), "limit": 20}, run_id)
                 if history_error is None and history is not None:
                     session_info = history.get("sessionInfo", {})
                     active_ids = session_info.get("activeRunIds", []) if isinstance(session_info, dict) else []
@@ -352,7 +353,7 @@ class OpenClawSessionAdapter:
         session_id = None
         if session is not None:
             session_key, session_id = session
-            history, history_error = self._gateway("chat.history", {"sessionKey": session_key, "agentId": agent_id, "limit": 20}, run_id)
+            history, history_error = self._gateway("chat.history", {"sessionKey": session_key, "agentId": agent_id.lower(), "limit": 20}, run_id)
             if history_error is None:
                 response_body = self._latest_assistant_text(history, not_before_ms=self._run_started_at_ms.get(run_id))
         return DeliveryReceipt(run_id, "responded", session_id=session_id, run_id=run_id, response_body=response_body)
@@ -367,7 +368,7 @@ class OpenClawSessionAdapter:
         if session is None:
             return DeliveryReceipt(delivery_id, "failed", error_code="openclaw_session_missing")
         session_key, session_id = session
-        params = {"sessionKey": session_key, "agentId": agent_id}
+        params = {"sessionKey": session_key, "agentId": agent_id.lower()}
         run_id = self._delivery_runs.get(delivery_id)
         if run_id:
             owner_connection = self._run_connections.get(run_id)

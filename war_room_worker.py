@@ -41,14 +41,17 @@ def _connect(db_path: str | Path) -> sqlite3.Connection:
         con.execute("ALTER TABLE war_deliveries ADD COLUMN error_class TEXT")
     if "last_error_at" not in columns:
         con.execute("ALTER TABLE war_deliveries ADD COLUMN last_error_at INTEGER")
+    for column, definition in (("session_key", "TEXT"), ("session_id", "TEXT"), ("correlation_id", "TEXT")):
+        if column not in columns:
+            con.execute(f"ALTER TABLE war_deliveries ADD COLUMN {column} {definition}")
     return con
 
 
-def _audit(con: sqlite3.Connection, project_id: str, event: str, target_id: str, payload: dict[str, Any]) -> None:
+def _audit(con: sqlite3.Connection, project_id: str, event: str, target_id: str, payload: dict[str, Any], correlation_id: str | None = None) -> None:
     con.execute(
         "INSERT INTO war_audit_events VALUES (?,?,?,?,?,?,?,?,?)",
         (str(uuid.uuid4()), project_id, "worker", event, "delivery", target_id,
-         json.dumps(war_room._redact(payload), sort_keys=True), str(uuid.uuid4()), _now()),
+         json.dumps(war_room._redact(payload), sort_keys=True), correlation_id or str(uuid.uuid4()), _now()),
     )
 
 
@@ -155,6 +158,8 @@ def process_due_deliveries(*, db_path: str | Path, adapter: SessionAdapter, now:
                 results.append({"delivery_id":row["id"],"status":"timed_out"})
                 continue
             binding = con.execute("SELECT session_key,session_id,purpose,disposable FROM war_project_sessions WHERE project_id=? AND agent_id=? AND enabled=1 LIMIT 1", (row["project_id"],row["agent_id"])).fetchone()
+            if binding:
+                con.execute("UPDATE war_deliveries SET session_key=?,session_id=? WHERE id=?", (binding["session_key"], binding["session_id"], row["id"]))
             binder = getattr(adapter, "bind_delivery", None)
             if binder and not binding:
                 receipt = DeliveryReceipt(row["id"], "failed", error_code="explicit_session_binding_missing")
@@ -186,7 +191,7 @@ def process_due_deliveries(*, db_path: str | Path, adapter: SessionAdapter, now:
                     """INSERT INTO war_messages
                        (id,project_id,message_type,author_type,author_id,body,source_message_id,created_at,correlation_id,redaction_state)
                        VALUES (?,?,'result','agent',?,?,?,?,?,'clean')""",
-                    (response_message_id,row["project_id"],row["agent_id"],war_room._redact_string(response_body),row["message_id"],current,str(uuid.uuid4())),
+                    (response_message_id,row["project_id"],row["agent_id"],war_room._redact_string(response_body),row["message_id"],current,row["correlation_id"] or str(uuid.uuid4())),
                 )
             total_attempt = int(row["attempt_count"] or 0) + 1
             cycle_attempt = int(row["retry_count"] or 0) + 1
@@ -200,8 +205,8 @@ def process_due_deliveries(*, db_path: str | Path, adapter: SessionAdapter, now:
                    sent_at=COALESCE(sent_at,?),
                    received_at=CASE WHEN ? IN ('received','responded') THEN ? ELSE received_at END,
                    responded_at=CASE WHEN ?='responded' THEN ? ELSE responded_at END,
-                   error_code=?,run_id=COALESCE(?,run_id),response_message_id=?,next_attempt_at=?,claim_token=NULL,claim_expires_at=NULL WHERE id=? AND claim_token=?""",
-                (stored_status,total_attempt,cycle_attempt,error_class,error_class,current,current,status,current,status,current,receipt.error_code,receipt.run_id,response_message_id,next_attempt_at,row["id"],claim_token),
+                   error_code=?,run_id=COALESCE(?,run_id),response_message_id=?,session_id=COALESCE(?,session_id),next_attempt_at=?,claim_token=NULL,claim_expires_at=NULL WHERE id=? AND claim_token=?""",
+                (stored_status,total_attempt,cycle_attempt,error_class,error_class,current,current,status,current,status,current,receipt.error_code,receipt.run_id,response_message_id,receipt.session_id,next_attempt_at,row["id"],claim_token),
             )
             task = con.execute("SELECT id FROM war_tasks WHERE source_message_id=?", (row["message_id"],)).fetchone()
             if task:
@@ -210,7 +215,7 @@ def process_due_deliveries(*, db_path: str | Path, adapter: SessionAdapter, now:
                     pending = con.execute("SELECT COUNT(*) FROM war_deliveries WHERE message_id=? AND status!='responded'", (row["message_id"],)).fetchone()[0]
                     if pending == 0:
                         _apply_collaboration_outcome(con, task["id"], row["project_id"], row["message_id"], current)
-            _audit(con, row["project_id"], "delivery_retry_scheduled" if retryable else "delivery_"+status, row["id"], {"error_code":receipt.error_code,"attempt":total_attempt,"retry_count":cycle_attempt,"max_attempts":maximum,"next_attempt_at":next_attempt_at})
+            _audit(con, row["project_id"], "delivery_retry_scheduled" if retryable else "delivery_"+status, row["id"], {"error_code":receipt.error_code,"attempt":total_attempt,"retry_count":cycle_attempt,"max_attempts":maximum,"next_attempt_at":next_attempt_at,"session_key":row["session_key"],"session_id":receipt.session_id or row["session_id"],"run_id":receipt.run_id,"source_message_id":row["message_id"],"response_message_id":response_message_id}, row["correlation_id"])
             results.append({"delivery_id":row["id"],"status":"retry_scheduled" if retryable else status,"state":"system_error" if error_class else stored_status,"attempt_count":total_attempt,"retry_count":cycle_attempt,"next_attempt_at":next_attempt_at})
         con.commit()
     return results
@@ -289,9 +294,9 @@ def recover_received_deliveries(*, db_path: str | Path, gateway: Any, now: int |
                     """INSERT INTO war_messages
                        (id,project_id,message_type,author_type,author_id,body,source_message_id,created_at,correlation_id,redaction_state)
                        VALUES (?,?,'result','agent',?,?,?,?,?,'clean')""",
-                    (response_message_id, row["project_id"], row["agent_id"], war_room._redact_string(response_body), row["message_id"], current, str(uuid.uuid4())),
+                    (response_message_id, row["project_id"], row["agent_id"], war_room._redact_string(response_body), row["message_id"], current, row["correlation_id"] or str(uuid.uuid4())),
                 )
-            con.execute("UPDATE war_deliveries SET status=?,responded_at=CASE WHEN ?='responded' THEN ? ELSE responded_at END,error_code=?,response_message_id=? WHERE id=?", (status, status, current, error_code, response_message_id, row["id"]))
+            con.execute("UPDATE war_deliveries SET status=?,responded_at=CASE WHEN ?='responded' THEN ? ELSE responded_at END,error_code=?,response_message_id=?,session_id=COALESCE(?,session_id) WHERE id=?", (status, status, current, error_code, response_message_id, getattr(run, "session_id", None), row["id"]))
             if status == "responded":
                 task = con.execute("SELECT id FROM war_tasks WHERE source_message_id=?", (row["message_id"],)).fetchone()
                 if task:
