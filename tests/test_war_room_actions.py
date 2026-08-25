@@ -1322,6 +1322,57 @@ class WarRoomControlledApiTests(unittest.TestCase):
         with sqlite3.connect(db) as con:
             self.assertEqual("responded", con.execute("SELECT status FROM war_deliveries WHERE id='recovery-delivery'").fetchone()[0])
 
+    def test_agent_inputs_casefold_to_canonical_and_reject_casefold_duplicates(self) -> None:
+        base = "/api/war-room/projects/plachem-agent-war-room"
+        headers = {"X-War-Room-Actor":"main", "X-War-Room-Token":"fixture-main-token"}
+        mixed = self.client.post(base + "/prepare", json={
+            "instruction":"canonical disposable echo",
+            "agent_ids":[" ErPcOdEr ", "eRpQa"],
+            "assignee_agent_id":" erpcoder ",
+            "deadline_at":int(time.time()) + 600,
+            "document_version":"baseline-2026-08-23",
+        }, headers={**headers, "Idempotency-Key":"canonical-mixed"})
+        self.assertEqual(201, mixed.status_code, mixed.text)
+        self.assertEqual(["ERPcoder", "ERPqa"], mixed.json()["agent_ids"])
+        duplicate = self.client.post(base + "/prepare", json={
+            "instruction":"duplicate canonical ids",
+            "agent_ids":["ErPcOdEr", " erpcoder "],
+            "deadline_at":int(time.time()) + 600,
+            "document_version":"baseline-2026-08-23",
+        }, headers={**headers, "Idempotency-Key":"canonical-duplicate"})
+        self.assertEqual(422, duplicate.status_code, duplicate.text)
+        with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
+            rows = con.execute("SELECT agent_id FROM war_task_agents WHERE task_id=? ORDER BY agent_id", (mixed.json()["task_id"],)).fetchall()
+        self.assertEqual([("ERPcoder",), ("ERPqa",)], rows)
+
+    def test_structured_result_contract_precedes_instruction_and_response_is_immutable(self) -> None:
+        from war_room_adapter import TestSessionAdapter
+        from war_room_worker import process_due_deliveries
+        base = "/api/war-room/projects/plachem-agent-war-room"
+        headers = {"X-War-Room-Actor":"main", "X-War-Room-Token":"fixture-main-token"}
+        prepared = self.client.post(base + "/prepare", json={
+            "instruction":"echo this phrase but return the required JSON",
+            "agent_ids":["ERPcoder"],
+            "deadline_at":int(time.time()) + 600,
+            "document_version":"baseline-2026-08-23",
+            "grounding":{"worktree":"/safe/echo","branch":"p1","revision":"rev-echo","api_base":"/api","db_label":"temp","forbidden":["production DB"],"completion_conditions":["echo"]},
+        }, headers={**headers, "Idempotency-Key":"contract-priority"}).json()
+        with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
+            prompt = con.execute("SELECT body FROM war_messages WHERE id=?", (prepared["message_id"],)).fetchone()[0]
+        self.assertTrue(prompt.startswith("[STRUCTURED_RESULT]"))
+        self.assertLess(prompt.index("[STRUCTURED_RESULT]"), prompt.index("[ORIGINAL_INSTRUCTION_CONTEXT]"))
+        run = self.client.post(f"/api/war-room/tasks/{prepared['task_id']}/approve-execute", json={"expires_at":int(time.time())+500}, headers={**headers, "Idempotency-Key":"contract-run"})
+        self.assertEqual(200, run.status_code, run.text)
+        processed = process_due_deliveries(db_path=Path(os.environ["PLACHEM_WAR_ROOM_DB"]), adapter=TestSessionAdapter())
+        self.assertEqual("responded", processed[0]["status"])
+        with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
+            row = con.execute("SELECT d.status,d.response_message_id,m.body,m.original_body FROM war_deliveries d JOIN war_messages m ON m.id=d.response_message_id WHERE d.message_id=?", (prepared["message_id"],)).fetchone()
+        self.assertEqual("responded", row[0])
+        self.assertTrue(row[1])
+        result = json.loads(row[2])
+        self.assertEqual(result, json.loads(row[3]))
+        self.assertEqual("PASS", result["verdict"])
+
 
 if __name__ == "__main__":
     unittest.main()

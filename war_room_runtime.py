@@ -19,9 +19,13 @@ import war_room
 
 def provision_disposable_sessions(*, db_path: str | Path, adapter: Any, project_id: str, agent_ids: list[str]) -> list[dict[str, Any]]:
     """Provision and bind explicit test-only sessions without touching work sessions."""
-    if (not agent_ids or len(agent_ids) != len(set(agent_ids))
-            or any(agent not in war_room.ALLOWED_AGENT_IDS or agent == "main" for agent in agent_ids)):
+    canonical_by_casefold = {agent.casefold(): agent for agent in war_room.ALLOWED_AGENT_IDS}
+    canonical_ids = [canonical_by_casefold.get(agent.strip().casefold()) if isinstance(agent, str) else None for agent in agent_ids]
+    if (not agent_ids or any(agent is None for agent in canonical_ids)
+            or len(canonical_ids) != len(set(canonical_ids))
+            or any(agent == "main" for agent in canonical_ids)):
         raise ValueError("unique non-main allowlisted agent_ids required")
+    agent_ids = [agent for agent in canonical_ids if agent is not None]
     with sqlite3.connect(Path(db_path)) as con:
         placeholders = ",".join("?" for _ in agent_ids)
         if not con.execute("SELECT 1 FROM war_projects WHERE id=?", (project_id,)).fetchone():

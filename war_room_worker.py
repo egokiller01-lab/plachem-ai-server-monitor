@@ -99,6 +99,20 @@ def _structured_result(con: sqlite3.Connection, message_id: str, agent_id: str, 
     return result, None
 
 
+def _store_response_message(con: sqlite3.Connection, row: sqlite3.Row, response_body: str, now: int) -> str:
+    """Persist the exact recovered response before validation so lineage survives FAIL."""
+    response_message_id = str(uuid.uuid4())
+    clean = war_room._redact_string(response_body)
+    con.execute(
+        """INSERT INTO war_messages
+           (id,project_id,message_type,author_type,author_id,body,source_message_id,created_at,correlation_id,redaction_state,original_body)
+           VALUES (?,?,'result','agent',?,?,?,?,?,'clean',?)""",
+        (response_message_id, row["project_id"], row["agent_id"], clean, row["message_id"], now,
+         row["correlation_id"] or str(uuid.uuid4()), clean),
+    )
+    return response_message_id
+
+
 def _apply_collaboration_outcome(con: sqlite3.Connection, task_id: str, project_id: str, message_id: str, now: int) -> None:
     rows = con.execute("""SELECT d.agent_id,m.body FROM war_deliveries d LEFT JOIN war_messages m ON m.id=d.response_message_id
         WHERE d.message_id=? AND d.status='responded'""", (message_id,)).fetchall()
@@ -180,19 +194,13 @@ def process_due_deliveries(*, db_path: str | Path, adapter: SessionAdapter, now:
                 status = "failed"
                 receipt = DeliveryReceipt(row["id"], "failed", run_id=receipt.run_id, error_code="response_body_missing")
             if status == "responded" and isinstance(response_body, str) and response_body.strip():
+                if not response_message_id:
+                    response_message_id = _store_response_message(con, row, response_body, current)
                 _, validation_error = _structured_result(con, row["message_id"], row["agent_id"], response_body)
                 if validation_error:
                     status = "failed"
                     receipt = DeliveryReceipt(row["id"], "failed", run_id=receipt.run_id, error_code=validation_error)
                     _terminal_validation_failure(con, message_id=row["message_id"], project_id=row["project_id"], delivery_id=row["id"], error_code=validation_error, now=current)
-            if status == "responded" and isinstance(response_body, str) and response_body.strip() and not response_message_id:
-                response_message_id = str(uuid.uuid4())
-                con.execute(
-                    """INSERT INTO war_messages
-                       (id,project_id,message_type,author_type,author_id,body,source_message_id,created_at,correlation_id,redaction_state)
-                       VALUES (?,?,'result','agent',?,?,?,?,?,'clean')""",
-                    (response_message_id,row["project_id"],row["agent_id"],war_room._redact_string(response_body),row["message_id"],current,row["correlation_id"] or str(uuid.uuid4())),
-                )
             total_attempt = int(row["attempt_count"] or 0) + 1
             cycle_attempt = int(row["retry_count"] or 0) + 1
             maximum = int(row["max_attempts"] or 3)
@@ -283,19 +291,13 @@ def recover_received_deliveries(*, db_path: str | Path, gateway: Any, now: int |
                 status = "failed"
                 error_code = error_code or "response_body_missing"
             if status == "responded" and isinstance(response_body, str) and response_body.strip():
+                if not response_message_id:
+                    response_message_id = _store_response_message(con, row, response_body, current)
                 _, validation_error = _structured_result(con, row["message_id"], row["agent_id"], response_body)
                 if validation_error:
                     status = "failed"
                     error_code = validation_error
                     _terminal_validation_failure(con, message_id=row["message_id"], project_id=row["project_id"], delivery_id=row["id"], error_code=validation_error, now=current)
-            if status == "responded" and isinstance(response_body, str) and response_body.strip() and not response_message_id:
-                response_message_id = str(uuid.uuid4())
-                con.execute(
-                    """INSERT INTO war_messages
-                       (id,project_id,message_type,author_type,author_id,body,source_message_id,created_at,correlation_id,redaction_state)
-                       VALUES (?,?,'result','agent',?,?,?,?,?,'clean')""",
-                    (response_message_id, row["project_id"], row["agent_id"], war_room._redact_string(response_body), row["message_id"], current, row["correlation_id"] or str(uuid.uuid4())),
-                )
             con.execute("UPDATE war_deliveries SET status=?,responded_at=CASE WHEN ?='responded' THEN ? ELSE responded_at END,error_code=?,response_message_id=?,session_id=COALESCE(?,session_id) WHERE id=?", (status, status, current, error_code, response_message_id, getattr(run, "session_id", None), row["id"]))
             if status == "responded":
                 task = con.execute("SELECT id FROM war_tasks WHERE source_message_id=?", (row["message_id"],)).fetchone()

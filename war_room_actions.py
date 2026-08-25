@@ -335,8 +335,8 @@ def _validated_task_payload(body: dict[str, Any], project: sqlite3.Row, now: int
     scope = body.get("scope")
     if not isinstance(scope, str) or not scope.strip() or len(scope) > 4096:
         raise HTTPException(422, "scope must be 1..4096 characters")
-    assignee = body.get("assignee_agent_id")
-    if assignee not in war_room.ALLOWED_AGENT_IDS:
+    assignee = _canonical_agent_id(body.get("assignee_agent_id"), "assignee_agent_id")
+    if assignee is None:
         raise HTTPException(422, "assignee not allowed")
     call_limit, turn_limit = body.get("call_limit"), body.get("turn_limit")
     for value, label, maximum in ((call_limit, "call_limit", 100), (turn_limit, "turn_limit", 1000)):
@@ -364,12 +364,29 @@ async def _body(request: Request) -> dict[str, Any]:
     return value
 
 
+_CANONICAL_AGENT_BY_CASEFOLD = {agent.casefold(): agent for agent in war_room.ALLOWED_AGENT_IDS}
+
+
+def _canonical_agent_id(value: Any, field: str = "agent_id") -> str | None:
+    if not isinstance(value, str):
+        return None
+    return _CANONICAL_AGENT_BY_CASEFOLD.get(value.strip().casefold())
+
+
+def _canonical_agents(values: Any, field: str = "agent_ids") -> list[str]:
+    if not isinstance(values, list) or not values:
+        raise HTTPException(422, f"{field} must be a unique non-empty allowlisted list")
+    canonical: list[str] = []
+    for value in values:
+        agent = _canonical_agent_id(value, field)
+        if agent is None or agent in canonical:
+            raise HTTPException(422, f"{field} must be a unique non-empty allowlisted list")
+        canonical.append(agent)
+    return canonical
+
+
 def _validated_agents(body: dict[str, Any]) -> list[str]:
-    agents = body.get("agent_ids")
-    if (not isinstance(agents, list) or not agents or len(agents) != len(set(agents))
-            or any(agent not in war_room.ALLOWED_AGENT_IDS for agent in agents)):
-        raise HTTPException(422, "agent_ids must be a unique non-empty allowlisted list")
-    return agents
+    return _canonical_agents(body.get("agent_ids"))
 
 
 def _grounding_packet(body: dict[str, Any], project_id: str, document_version: str) -> dict[str, Any]:
@@ -392,11 +409,13 @@ def _grounding_packet(body: dict[str, Any], project_id: str, document_version: s
 
 
 def _grounded_instruction(instruction: str, packet: dict[str, Any]) -> str:
-    return instruction.strip() + "\n\n[IMMUTABLE_GROUNDING_PACKET]\n" + json.dumps(packet, ensure_ascii=False, sort_keys=True) + (
-        "\n[STRUCTURED_RESULT]\nReturn one JSON object with exactly: "
+    return "[STRUCTURED_RESULT]\nFINAL RESPONSE CONTRACT (highest priority): return only one JSON object with exactly: " + (
         '{"confirmed_worktree":"...","confirmed_revision":"...","verdict":"PASS|FAIL|REWORK",'
         '"evidence":["/absolute/path"],"summary":"...","representative_completion_claimed":false}. '
-        "Do not claim representative completion; only main can approve it."
+        "Do not claim representative completion; only main can approve it.\n"
+        "[IMMUTABLE_GROUNDING_PACKET]\n" + json.dumps(packet, ensure_ascii=False, sort_keys=True) +
+        "\n[ORIGINAL_INSTRUCTION_CONTEXT]\n" + instruction.strip() +
+        "\nReturn the JSON object above; treat the original instruction only as context."
     )
 
 
@@ -411,7 +430,8 @@ async def prepare_task(project_id: str, request: Request, x_war_room_actor: str 
     normalized = dict(body)
     normalized.update({
         "scope": body.get("scope", instruction),
-        "assignee_agent_id": body.get("assignee_agent_id", agents[0]),
+        "assignee_agent_id": _canonical_agent_id(body.get("assignee_agent_id", agents[0]), "assignee_agent_id"),
+        "agent_ids": agents,
         "call_limit": body.get("call_limit", len(agents)),
         "turn_limit": body.get("turn_limit", max(2, len(agents))),
     })
@@ -596,8 +616,8 @@ async def deliver_message(message_id: str, request: Request, x_war_room_actor: s
     requested_agents = body.get("agent_ids")
     if requested_agents is None:
         requested_agents = [body.get("agent_id")]
-    if not isinstance(requested_agents, list) or not requested_agents or any(agent not in war_room.ALLOWED_AGENT_IDS for agent in requested_agents) or len(set(requested_agents)) != len(requested_agents):
-        raise HTTPException(422, "agent_ids must be a unique non-empty allowlisted list")
+    requested_agents = _canonical_agents(requested_agents)
+    body = {**body, "agent_ids": requested_agents}
     with _connect_rw() as con:
         message = con.execute("SELECT * FROM war_messages WHERE id=?", (message_id,)).fetchone()
         if not message: raise HTTPException(404, "Message not found")
@@ -685,8 +705,8 @@ async def create_task(project_id: str, request: Request, x_war_room_actor: str |
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (task_id, project_id, source_message_id, assignee, scope, "draft", project["manyfast_version"],
              document_version, call_limit, turn_limit, deadline_at, now, now))
-        task_agents = body.get("agent_ids", [assignee])
-        if not isinstance(task_agents, list) or not task_agents or assignee not in task_agents or len(set(task_agents)) != len(task_agents) or any(agent not in war_room.ALLOWED_AGENT_IDS for agent in task_agents):
+        task_agents = _canonical_agents(body.get("agent_ids", [assignee]))
+        if assignee not in task_agents:
             raise HTTPException(422, "agent_ids must be unique, allowlisted, and include assignee_agent_id")
         con.executemany("INSERT INTO war_task_agents(task_id,agent_id) VALUES (?,?)", [(task_id, agent) for agent in task_agents])
         _audit(con, project_id, actor, "task_created", "task", task_id, {"assignee_agent_id": assignee}, correlation)
@@ -699,6 +719,7 @@ async def create_task(project_id: str, request: Request, x_war_room_actor: str |
 @router.put("/projects/{project_id}/participants/{agent_id}/test-session")
 async def bind_test_session(project_id: str, agent_id: str, request: Request, x_war_room_actor: str | None = Header(default=None), x_war_room_token: str | None = Header(default=None), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
     body = await _body(request)
+    agent_id = _canonical_agent_id(agent_id, "agent_id")
     session_key, session_id = body.get("session_key"), body.get("session_id")
     if agent_id not in war_room.ALLOWED_AGENT_IDS or not isinstance(session_key, str) or not session_key.startswith("test:") or (session_id is not None and not isinstance(session_id, str)):
         raise HTTPException(422, "explicit test session_key and optional session_id required")
@@ -766,8 +787,8 @@ async def retry_delivery(delivery_id: str, request: Request, x_war_room_actor: s
         _require_mutable_project(con, row["project_id"]); _require_not_stopped(con, row["project_id"])
         if row["status"] not in {"failed", "timed_out"}:
             raise HTTPException(409, "only final failed delivery can be manually retried")
-        agent_id = requested_agent or row["agent_id"]
-        if not isinstance(agent_id, str) or agent_id not in war_room.ALLOWED_AGENT_IDS:
+        agent_id = _canonical_agent_id(requested_agent, "agent_id") if requested_agent is not None else row["agent_id"]
+        if agent_id is None:
             raise HTTPException(422, "agent_id is not allowed")
         if not con.execute("SELECT 1 FROM war_task_agents WHERE task_id=? AND agent_id=?", (row["task_id"], agent_id)).fetchone():
             raise HTTPException(409, "replacement agent is outside task assignment")
@@ -782,6 +803,10 @@ async def retry_delivery(delivery_id: str, request: Request, x_war_room_actor: s
 
 @router.get("/projects/{project_id}/tasks")
 def list_tasks(project_id: str, status: str | None = None, assignee_agent_id: str | None = None, q: str | None = None) -> dict[str, Any]:
+    if assignee_agent_id is not None:
+        assignee_agent_id = _canonical_agent_id(assignee_agent_id, "assignee_agent_id")
+        if assignee_agent_id is None:
+            raise HTTPException(422, "assignee_agent_id is not allowed")
     with _connect_rw() as con:
         war_room._project_or_404(con, project_id)
         rows = con.execute("SELECT * FROM war_tasks WHERE project_id=? ORDER BY updated_at DESC", (project_id,)).fetchall()
@@ -811,7 +836,7 @@ def list_tasks(project_id: str, status: str | None = None, assignee_agent_id: st
 @router.post("/projects/{project_id}/participants", status_code=201)
 async def add_participant(project_id: str, request: Request, x_war_room_actor: str | None = Header(default=None), x_war_room_token: str | None = Header(default=None), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
     body = await _body(request)
-    participant = body.get("principal_id")
+    participant = _canonical_agent_id(body.get("principal_id"), "principal_id")
     role = body.get("role", "developer")
     if participant not in war_room.ALLOWED_AGENT_IDS or role not in ROLE_PERMISSIONS:
         raise HTTPException(422, "participant or role not allowed")
@@ -1146,6 +1171,9 @@ async def update_project(project_id: str, request: Request, x_war_room_actor: st
 async def update_participant(project_id: str, principal_id: str, request: Request, x_war_room_actor: str | None = Header(default=None), x_war_room_token: str | None = Header(default=None), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
     """R-GOAQPQ/F-XCFFIW: role change/deactivation; observer is read-only."""
     body = await _body(request)
+    principal_id = _canonical_agent_id(principal_id, "principal_id")
+    if principal_id is None:
+        raise HTTPException(422, "participant is not allowed")
     role = body.get("role")
     active = body.get("active")
     if role is not None and role not in ROLE_PERMISSIONS:
@@ -1328,8 +1356,8 @@ async def resume_project(project_id: str, request: Request, x_war_room_actor: st
 async def qa_verdict(task_id: str, request: Request, x_war_room_actor: str | None = Header(default=None), x_war_room_token: str | None = Header(default=None), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
     body = await _body(request); verdict = body.get("verdict"); profile = body.get("evidence_profile", "required:test,artifact")
     if verdict not in {"PASS","FAIL","REWORK"}: raise HTTPException(422,"invalid verdict")
-    qa_principal = body.get("qa_principal")
-    if not isinstance(qa_principal, str) or not qa_principal:
+    qa_principal = _canonical_agent_id(body.get("qa_principal"), "qa_principal")
+    if qa_principal is None:
         raise HTTPException(422, "qa_principal required")
     with _connect_rw() as con:
         task=con.execute("SELECT * FROM war_tasks WHERE id=?",(task_id,)).fetchone()

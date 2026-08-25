@@ -71,7 +71,7 @@ class TestSessionAdapter:
     def deliver(self, *, delivery_id: str, agent_id: str, instruction_id: str, body: str) -> DeliveryReceipt:
         self.deliveries.append((delivery_id, agent_id, instruction_id, body))
         if "[IMMUTABLE_GROUNDING_PACKET]" in body:
-            packet_text = body.split("[IMMUTABLE_GROUNDING_PACKET]\n", 1)[1].split("\n[STRUCTURED_RESULT]", 1)[0]
+            packet_text = body.split("[IMMUTABLE_GROUNDING_PACKET]\n", 1)[1].split("\n[ORIGINAL_INSTRUCTION_CONTEXT]", 1)[0]
             packet = json.loads(packet_text)
             response = json.dumps({
                 "confirmed_worktree":packet["worktree"], "confirmed_revision":packet["revision"],
