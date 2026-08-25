@@ -549,6 +549,23 @@ class WarRoomControlledApiTests(unittest.TestCase):
         self.assertEqual([], process_due_deliveries(db_path=db, adapter=adapter, now=now + 4))
         self.assertEqual(2, len(adapter.calls))
 
+    def test_manual_retry_is_available_after_automatic_cycle_is_exhausted(self) -> None:
+        """A human-authorized retry starts a new bounded cycle on the same delivery."""
+        import war_room
+        base = "/api/war-room/projects/plachem-agent-war-room"
+        headers = {"X-War-Room-Actor":"main", "X-War-Room-Token":"fixture-main-token"}
+        task = self.client.post(base + "/tasks", json=self.task_body("manual retry after exhaustion"), headers={**headers, "Idempotency-Key":"manual-cycle-task"}).json()
+        instruction = self.client.post(base + "/instructions", json={"task_id":task["task_id"],"body":"manual retry body"}, headers={**headers, "Idempotency-Key":"manual-cycle-instruction"}).json()
+        db = Path(os.environ["PLACHEM_WAR_ROOM_DB"]); now = int(time.time())
+        with sqlite3.connect(db) as con:
+            con.execute("INSERT INTO war_deliveries (id,message_id,agent_id,status,attempt_count,max_attempts,retry_count,error_class,error_code,deadline_at,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", ("manual-cycle-delivery",instruction["message_id"],"ERPcoder","failed",3,3,3,"system_error","transport_error",now+3600,now))
+            con.commit()
+        result = self.client.post("/api/war-room/deliveries/manual-cycle-delivery/retry", json={}, headers={**headers, "Idempotency-Key":"manual-cycle-retry"})
+        self.assertEqual(200, result.status_code, result.text)
+        self.assertEqual("manual-cycle-delivery", result.json()["delivery_id"])
+        with sqlite3.connect(db) as con:
+            self.assertEqual(("queued", 0, None), con.execute("SELECT status,retry_count,error_class FROM war_deliveries WHERE id='manual-cycle-delivery'").fetchone())
+
     def test_R_OTWMNJ_stop_ack_timeout_and_adapter_failure_timers(self) -> None:
         """R-OTWMNJ: stop ack wins; expiry is unconfirmed; adapter failure is failed."""
         import war_room

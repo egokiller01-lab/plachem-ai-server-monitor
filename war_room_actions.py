@@ -761,8 +761,6 @@ async def retry_delivery(delivery_id: str, request: Request, x_war_room_actor: s
         _require_mutable_project(con, row["project_id"]); _require_not_stopped(con, row["project_id"])
         if row["status"] not in {"failed", "timed_out"}:
             raise HTTPException(409, "only final failed delivery can be manually retried")
-        if int(row["retry_count"] or 0) >= int(row["max_attempts"] or 3):
-            raise HTTPException(409, "delivery retry limit reached")
         agent_id = requested_agent or row["agent_id"]
         if not isinstance(agent_id, str) or agent_id not in war_room.ALLOWED_AGENT_IDS:
             raise HTTPException(422, "agent_id is not allowed")
@@ -771,7 +769,7 @@ async def retry_delivery(delivery_id: str, request: Request, x_war_room_actor: s
         idem_scope = f"POST:/deliveries/{delivery_id}/retry"; previous = _idem(con, actor, idempotency_key, idem_scope, body)
         if previous: return previous
         now = _now(); correlation = str(uuid.uuid4())
-        con.execute("UPDATE war_deliveries SET agent_id=?,status='queued',next_attempt_at=?,error_code=NULL,error_class=NULL,last_error_at=NULL WHERE id=?", (agent_id, now, delivery_id))
+        con.execute("UPDATE war_deliveries SET agent_id=?,status='queued',retry_count=0,next_attempt_at=?,error_code=NULL,error_class=NULL,last_error_at=NULL WHERE id=?", (agent_id, now, delivery_id))
         _audit(con, row["project_id"], actor, "delivery_manual_retry", "delivery", delivery_id, {"agent_id": agent_id, "replaced_agent": agent_id != row["agent_id"]}, correlation)
         result = {"mode":"controlled", "delivery_id":delivery_id, "status":"queued", "agent_id":agent_id, "correlation_id":correlation}
         _save_idem(con, actor, idempotency_key, idem_scope, body, result); con.commit(); return result

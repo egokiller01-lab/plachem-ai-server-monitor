@@ -188,11 +188,12 @@ def process_due_deliveries(*, db_path: str | Path, adapter: SessionAdapter, now:
                        VALUES (?,?,'result','agent',?,?,?,?,?,'clean')""",
                     (response_message_id,row["project_id"],row["agent_id"],war_room._redact_string(response_body),row["message_id"],current,str(uuid.uuid4())),
                 )
-            attempt = int(row["attempt_count"] or 0) + 1
+            total_attempt = int(row["attempt_count"] or 0) + 1
+            cycle_attempt = int(row["retry_count"] or 0) + 1
             maximum = int(row["max_attempts"] or 3)
-            retryable = status in {"failed", "timed_out"} and attempt < maximum and (row["deadline_at"] is None or int(row["deadline_at"]) > current)
+            retryable = status in {"failed", "timed_out"} and cycle_attempt < maximum and (row["deadline_at"] is None or int(row["deadline_at"]) > current)
             stored_status = "queued" if retryable else status
-            next_attempt_at = current + min(60, 2 ** attempt) if retryable else None
+            next_attempt_at = current + min(60, 2 ** cycle_attempt) if retryable else None
             error_class = "system_error" if status in {"failed", "timed_out"} else None
             con.execute(
                 """UPDATE war_deliveries SET status=?,attempt_count=?,retry_count=?,error_class=?,last_error_at=CASE WHEN ?='system_error' THEN ? ELSE last_error_at END,
@@ -200,7 +201,7 @@ def process_due_deliveries(*, db_path: str | Path, adapter: SessionAdapter, now:
                    received_at=CASE WHEN ? IN ('received','responded') THEN ? ELSE received_at END,
                    responded_at=CASE WHEN ?='responded' THEN ? ELSE responded_at END,
                    error_code=?,run_id=COALESCE(?,run_id),response_message_id=?,next_attempt_at=?,claim_token=NULL,claim_expires_at=NULL WHERE id=? AND claim_token=?""",
-                (stored_status,attempt,attempt,error_class,error_class,current,current,status,current,status,current,receipt.error_code,receipt.run_id,response_message_id,next_attempt_at,row["id"],claim_token),
+                (stored_status,total_attempt,cycle_attempt,error_class,error_class,current,current,status,current,status,current,receipt.error_code,receipt.run_id,response_message_id,next_attempt_at,row["id"],claim_token),
             )
             task = con.execute("SELECT id FROM war_tasks WHERE source_message_id=?", (row["message_id"],)).fetchone()
             if task:
@@ -209,8 +210,8 @@ def process_due_deliveries(*, db_path: str | Path, adapter: SessionAdapter, now:
                     pending = con.execute("SELECT COUNT(*) FROM war_deliveries WHERE message_id=? AND status!='responded'", (row["message_id"],)).fetchone()[0]
                     if pending == 0:
                         _apply_collaboration_outcome(con, task["id"], row["project_id"], row["message_id"], current)
-            _audit(con, row["project_id"], "delivery_retry_scheduled" if retryable else "delivery_"+status, row["id"], {"error_code":receipt.error_code,"attempt":attempt,"max_attempts":maximum,"next_attempt_at":next_attempt_at})
-            results.append({"delivery_id":row["id"],"status":"retry_scheduled" if retryable else status,"state":"system_error" if error_class else stored_status,"attempt_count":attempt,"next_attempt_at":next_attempt_at})
+            _audit(con, row["project_id"], "delivery_retry_scheduled" if retryable else "delivery_"+status, row["id"], {"error_code":receipt.error_code,"attempt":total_attempt,"retry_count":cycle_attempt,"max_attempts":maximum,"next_attempt_at":next_attempt_at})
+            results.append({"delivery_id":row["id"],"status":"retry_scheduled" if retryable else status,"state":"system_error" if error_class else stored_status,"attempt_count":total_attempt,"retry_count":cycle_attempt,"next_attempt_at":next_attempt_at})
         con.commit()
     return results
 
