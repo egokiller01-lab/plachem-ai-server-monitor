@@ -81,8 +81,8 @@ class WarRoomReadOnlyTests(unittest.TestCase):
         with sqlite3.connect(db) as connection:
             connection.execute("INSERT INTO war_projects VALUES (?, ?, ?, ?, ?, ?, ?)",
                 ("other-project", "Other", "active", "other", "v1", 1, 1))
-            connection.execute("INSERT INTO war_messages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                ("other-message", "other-project", "note", "x", "x", "token=synthetic-secret-value", None, None, 2, None, "clean"))
+            connection.execute("INSERT INTO war_messages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("other-message", "other-project", "note", "x", "x", "token=synthetic-secret-value", None, None, 2, None, "clean", None))
             connection.commit()
         self.assertEqual([war_room.PROJECT_ID], [row["id"] for row in war_room.list_projects()["items"]])
         timeline = war_room.get_timeline(war_room.PROJECT_ID)
@@ -93,8 +93,8 @@ class WarRoomReadOnlyTests(unittest.TestCase):
         db = Path(os.environ["PLACHEM_WAR_ROOM_DB"])
         with sqlite3.connect(db) as connection:
             for message_id in ("tie-a", "tie-b", "tie-c"):
-                connection.execute("INSERT INTO war_messages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (message_id, war_room.PROJECT_ID, "note", "test", "tester", message_id, None, None, 777, None, "clean"))
+                connection.execute("INSERT INTO war_messages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (message_id, war_room.PROJECT_ID, "note", "test", "tester", message_id, None, None, 777, None, "clean", None))
             connection.commit()
         first = war_room.get_timeline(war_room.PROJECT_ID, limit=2)
         second = war_room.get_timeline(war_room.PROJECT_ID, limit=2, before=first["next_cursor"])

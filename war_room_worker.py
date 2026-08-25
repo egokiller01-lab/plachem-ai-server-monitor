@@ -35,6 +35,12 @@ def _connect(db_path: str | Path) -> sqlite3.Connection:
         con.execute("ALTER TABLE war_deliveries ADD COLUMN claim_expires_at INTEGER")
     if "stop_cycle_at" not in columns:
         con.execute("ALTER TABLE war_deliveries ADD COLUMN stop_cycle_at INTEGER")
+    if "retry_count" not in columns:
+        con.execute("ALTER TABLE war_deliveries ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0")
+    if "error_class" not in columns:
+        con.execute("ALTER TABLE war_deliveries ADD COLUMN error_class TEXT")
+    if "last_error_at" not in columns:
+        con.execute("ALTER TABLE war_deliveries ADD COLUMN last_error_at INTEGER")
     return con
 
 
@@ -144,7 +150,7 @@ def process_due_deliveries(*, db_path: str | Path, adapter: SessionAdapter, now:
                 continue
             con.commit()
             if row["deadline_at"] is not None and int(row["deadline_at"]) <= current:
-                con.execute("UPDATE war_deliveries SET status='timed_out',error_code='delivery_deadline_exceeded' WHERE id=?", (row["id"],))
+                con.execute("UPDATE war_deliveries SET status='timed_out',error_code='delivery_deadline_exceeded',error_class='system_error',last_error_at=? WHERE id=?", (current,row["id"]))
                 _audit(con, row["project_id"], "delivery_timed_out", row["id"], {"reason":"deadline"})
                 results.append({"delivery_id":row["id"],"status":"timed_out"})
                 continue
@@ -182,13 +188,19 @@ def process_due_deliveries(*, db_path: str | Path, adapter: SessionAdapter, now:
                        VALUES (?,?,'result','agent',?,?,?,?,?,'clean')""",
                     (response_message_id,row["project_id"],row["agent_id"],war_room._redact_string(response_body),row["message_id"],current,str(uuid.uuid4())),
                 )
+            attempt = int(row["attempt_count"] or 0) + 1
+            maximum = int(row["max_attempts"] or 3)
+            retryable = status in {"failed", "timed_out"} and attempt < maximum and (row["deadline_at"] is None or int(row["deadline_at"]) > current)
+            stored_status = "queued" if retryable else status
+            next_attempt_at = current + min(60, 2 ** attempt) if retryable else None
+            error_class = "system_error" if status in {"failed", "timed_out"} else None
             con.execute(
-                """UPDATE war_deliveries SET status=?,attempt_count=attempt_count+1,
+                """UPDATE war_deliveries SET status=?,attempt_count=?,retry_count=?,error_class=?,last_error_at=CASE WHEN ?='system_error' THEN ? ELSE last_error_at END,
                    sent_at=COALESCE(sent_at,?),
                    received_at=CASE WHEN ? IN ('received','responded') THEN ? ELSE received_at END,
                    responded_at=CASE WHEN ?='responded' THEN ? ELSE responded_at END,
-                   error_code=?,run_id=COALESCE(?,run_id),response_message_id=?,claim_token=NULL,claim_expires_at=NULL WHERE id=? AND claim_token=?""",
-                (status,current,status,current,status,current,receipt.error_code,receipt.run_id,response_message_id,row["id"],claim_token),
+                   error_code=?,run_id=COALESCE(?,run_id),response_message_id=?,next_attempt_at=?,claim_token=NULL,claim_expires_at=NULL WHERE id=? AND claim_token=?""",
+                (stored_status,attempt,attempt,error_class,error_class,current,current,status,current,status,current,receipt.error_code,receipt.run_id,response_message_id,next_attempt_at,row["id"],claim_token),
             )
             task = con.execute("SELECT id FROM war_tasks WHERE source_message_id=?", (row["message_id"],)).fetchone()
             if task:
@@ -197,8 +209,8 @@ def process_due_deliveries(*, db_path: str | Path, adapter: SessionAdapter, now:
                     pending = con.execute("SELECT COUNT(*) FROM war_deliveries WHERE message_id=? AND status!='responded'", (row["message_id"],)).fetchone()[0]
                     if pending == 0:
                         _apply_collaboration_outcome(con, task["id"], row["project_id"], row["message_id"], current)
-            _audit(con, row["project_id"], "delivery_"+status, row["id"], {"error_code":receipt.error_code})
-            results.append({"delivery_id":row["id"],"status":status})
+            _audit(con, row["project_id"], "delivery_retry_scheduled" if retryable else "delivery_"+status, row["id"], {"error_code":receipt.error_code,"attempt":attempt,"max_attempts":maximum,"next_attempt_at":next_attempt_at})
+            results.append({"delivery_id":row["id"],"status":"retry_scheduled" if retryable else status,"state":"system_error" if error_class else stored_status,"attempt_count":attempt,"next_attempt_at":next_attempt_at})
         con.commit()
     return results
 
@@ -211,9 +223,9 @@ def request_delivery_retry(*, db_path: str | Path, delivery_id: str, now: int | 
         if not row or row["status"] not in {"failed","timed_out"}:
             return False
         max_attempts = int(row["max_attempts"] or 3)
-        if int(row["attempt_count"]) >= max_attempts:
+        if int(row["retry_count"] or row["attempt_count"] or 0) >= max_attempts:
             return False
-        con.execute("UPDATE war_deliveries SET status='queued',next_attempt_at=?,error_code=NULL WHERE id=?", (current,delivery_id))
+        con.execute("UPDATE war_deliveries SET status='queued',next_attempt_at=?,error_code=NULL,error_class=NULL,last_error_at=NULL WHERE id=?", (current,delivery_id))
         project = con.execute("SELECT project_id FROM war_messages WHERE id=?", (row["message_id"],)).fetchone()
         if project:
             _audit(con, project["project_id"], "delivery_retry_requested", delivery_id, {"attempt_count":row["attempt_count"]})
@@ -240,7 +252,7 @@ def recover_received_deliveries(*, db_path: str | Path, gateway: Any, now: int |
             run_binder = getattr(gateway, "bind_run", None)
             if run_binder:
                 if not binding:
-                    con.execute("UPDATE war_deliveries SET status='failed',error_code='explicit_session_binding_missing' WHERE id=?", (row["id"],))
+                    con.execute("UPDATE war_deliveries SET status='failed',error_code='explicit_session_binding_missing',error_class='system_error',last_error_at=? WHERE id=?", (current,row["id"]))
                     results.append({"delivery_id": row["id"], "run_id": row["run_id"], "status": "failed"})
                     continue
                 try:
@@ -248,7 +260,7 @@ def recover_received_deliveries(*, db_path: str | Path, gateway: Any, now: int |
                 except TypeError:
                     run_binder(row["run_id"], session_key=binding["session_key"], session_id=binding["session_id"], purpose=binding["purpose"], disposable=bool(binding["disposable"]))
                 except ValueError:
-                    con.execute("UPDATE war_deliveries SET status='failed',error_code='session_binding_not_disposable_test' WHERE id=?", (row["id"],))
+                    con.execute("UPDATE war_deliveries SET status='failed',error_code='session_binding_not_disposable_test',error_class='system_error',last_error_at=? WHERE id=?", (current,row["id"]))
                     results.append({"delivery_id": row["id"], "run_id": row["run_id"], "status": "failed"})
                     continue
             try:

@@ -221,12 +221,12 @@ class WarRoomControlledApiTests(unittest.TestCase):
         class EmptyAdapter:
             def deliver(self, **kwargs): return DeliveryReceipt(kwargs["delivery_id"], "responded")
         result = process_due_deliveries(db_path=Path(os.environ["PLACHEM_WAR_ROOM_DB"]), adapter=EmptyAdapter())
-        self.assertEqual("failed", result[0]["status"])
+        self.assertEqual("retry_scheduled", result[0]["status"])
         with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
             self.assertEqual("running", con.execute("SELECT status FROM war_tasks WHERE id=?", (prepared["task_id"],)).fetchone()[0])
 
         with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
-            con.execute("UPDATE war_deliveries SET status='queued',attempt_count=0,error_code=NULL WHERE message_id=?", (prepared["message_id"],)); con.commit()
+            con.execute("UPDATE war_deliveries SET status='queued',attempt_count=0,retry_count=0,next_attempt_at=NULL,error_code=NULL WHERE message_id=?", (prepared["message_id"],)); con.commit()
         class BodyAdapter:
             def deliver(self, **kwargs): return DeliveryReceipt(kwargs["delivery_id"], "responded", response_body=json.dumps({
                 "confirmed_worktree":str(Path.cwd()), "confirmed_revision":"baseline-2026-08-23",
@@ -409,7 +409,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
 
         # One immutable instruction can belong to only one task.
         with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
-            con.execute("INSERT INTO war_messages VALUES (?,?,?,?,?,?,?,?,?,?,?)", ("hard-source", war_room.PROJECT_ID, "instruction", "agent", "main", "bound", None, None, int(time.time()), "hard-corr", "clean"))
+            con.execute("INSERT INTO war_messages VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", ("hard-source", war_room.PROJECT_ID, "instruction", "agent", "main", "bound", None, None, int(time.time()), "hard-corr", "clean", None))
             con.commit()
         linked = self.client.post(base + "/tasks", json=self.task_body("linked", source_message_id="hard-source"), headers={**headers,"Idempotency-Key":"linked-1"})
         self.assertEqual(201, linked.status_code, linked.text)
@@ -526,8 +526,8 @@ class WarRoomControlledApiTests(unittest.TestCase):
         with sqlite3.connect(db) as con:
             con.execute("PRAGMA foreign_keys=ON")
             con.execute(
-                "INSERT INTO war_messages VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                ("fixture-retry-message", war_room.PROJECT_ID, "instruction", "agent", "main", "same bytes", None, None, now, "corr-retry", "clean"),
+                "INSERT INTO war_messages VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("fixture-retry-message", war_room.PROJECT_ID, "instruction", "agent", "main", "same bytes", None, None, now, "corr-retry", "clean", None),
             )
             con.execute(
                 "INSERT INTO war_deliveries (id,message_id,agent_id,status,attempt_count,max_attempts,next_attempt_at,deadline_at,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
@@ -536,17 +536,17 @@ class WarRoomControlledApiTests(unittest.TestCase):
             con.commit()
         adapter = ScriptedAdapter()
         first = process_due_deliveries(db_path=db, adapter=adapter, now=now)
-        self.assertEqual("failed", first[0]["status"])
+        self.assertEqual("retry_scheduled", first[0]["status"])
         self.assertEqual(["fixture-retry-delivery"], adapter.calls)
         with sqlite3.connect(db) as con:
             row = con.execute("SELECT status,attempt_count FROM war_deliveries WHERE id='fixture-retry-delivery'").fetchone()
-            self.assertEqual(("failed", 1), row)
-        self.assertTrue(request_delivery_retry(db_path=db, delivery_id="fixture-retry-delivery", now=now + 1))
-        second = process_due_deliveries(db_path=db, adapter=adapter, now=now + 1)
+            self.assertEqual(("queued", 1), row)
+        self.assertFalse(request_delivery_retry(db_path=db, delivery_id="fixture-retry-delivery", now=now + 1))
+        second = process_due_deliveries(db_path=db, adapter=adapter, now=now + 3)
         self.assertEqual("responded", second[0]["status"])
         self.assertEqual(["fixture-retry-delivery", "fixture-retry-delivery"], adapter.calls)
         # A fresh worker instance must not replay a terminal delivery.
-        self.assertEqual([], process_due_deliveries(db_path=db, adapter=adapter, now=now + 2))
+        self.assertEqual([], process_due_deliveries(db_path=db, adapter=adapter, now=now + 4))
         self.assertEqual(2, len(adapter.calls))
 
     def test_R_OTWMNJ_stop_ack_timeout_and_adapter_failure_timers(self) -> None:
@@ -571,7 +571,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
         now = 1_700_000_100
         with sqlite3.connect(db) as con:
             con.execute("PRAGMA foreign_keys=ON")
-            con.execute("INSERT INTO war_messages VALUES (?,?,?,?,?,?,?,?,?,?,?)", ("fixture-stop-message", war_room.PROJECT_ID, "instruction", "agent", "main", "stop bytes", None, None, now, "corr-stop", "clean"))
+            con.execute("INSERT INTO war_messages VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", ("fixture-stop-message", war_room.PROJECT_ID, "instruction", "agent", "main", "stop bytes", None, None, now, "corr-stop", "clean", None))
             con.execute("INSERT INTO war_deliveries (id,message_id,agent_id,status,attempt_count,created_at) VALUES (?,?,?,?,?,?)", ("fixture-ack-delivery", "fixture-stop-message", "ERPcoder", "sent", 1, now))
             con.execute("INSERT INTO war_deliveries (id,message_id,agent_id,status,attempt_count,created_at) VALUES (?,?,?,?,?,?)", ("fixture-timeout-delivery", "fixture-stop-message", "ERPqa", "sent", 1, now))
             con.execute("INSERT INTO war_deliveries (id,message_id,agent_id,status,attempt_count,created_at) VALUES (?,?,?,?,?,?)", ("fixture-failure-delivery", "fixture-stop-message", "main", "sent", 1, now))
@@ -968,7 +968,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
         db=Path(os.environ["PLACHEM_WAR_ROOM_DB"]); now=1_700_000_000
         with sqlite3.connect(db) as con:
             con.execute("INSERT INTO war_project_sessions(project_id,agent_id,session_key,session_id,enabled,purpose,disposable) VALUES (?,?,?,?,1,'test',1)",(war_room.PROJECT_ID,"ERPcoder","agent:erpcoder:war-room-test:runtime","runtime-session"))
-            con.execute("INSERT INTO war_messages VALUES (?,?,?,?,?,?,?,?,?,?,?)",("runtime-message",war_room.PROJECT_ID,"instruction","agent","main","safe",None,None,now,"runtime-corr","clean"))
+            con.execute("INSERT INTO war_messages VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",("runtime-message",war_room.PROJECT_ID,"instruction","agent","main","safe",None,None,now,"runtime-corr","clean",None))
             con.execute("INSERT INTO war_deliveries(id,message_id,agent_id,status,attempt_count,max_attempts,next_attempt_at,deadline_at,created_at) VALUES (?,?,?,?,?,?,?,?,?)",("runtime-delivery","runtime-message","ERPcoder","queued",0,3,now,now+60,now))
             con.commit()
         runtime=WarRoomRuntime(adapter=OwnedAdapter())
@@ -1002,7 +1002,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
         with sqlite3.connect(db) as con:
             con.execute("PRAGMA foreign_keys=ON")
             con.execute("INSERT INTO war_project_sessions(project_id,agent_id,session_key,session_id,enabled,purpose,disposable) VALUES (?,?,?,?,1,'test',1)", (war_room.PROJECT_ID,"ERPcoder","agent:erpcoder:war-room-test:fixture","session-disposable"))
-            con.execute("INSERT INTO war_messages VALUES (?,?,?,?,?,?,?,?,?,?,?)", ("restart-message",war_room.PROJECT_ID,"instruction","agent","main","safe test",None,None,now,"restart-corr","clean"))
+            con.execute("INSERT INTO war_messages VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", ("restart-message",war_room.PROJECT_ID,"instruction","agent","main","safe test",None,None,now,"restart-corr","clean",None))
             con.execute("INSERT INTO war_deliveries (id,message_id,agent_id,status,attempt_count,max_attempts,deadline_at,created_at,run_id) VALUES (?,?,?,?,?,?,?,?,?)", ("restart-delivery","restart-message","ERPcoder","received",1,3,now+30,now,"run-restart"))
             con.commit()
         adapter = FreshAdapter()
@@ -1291,7 +1291,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
         db = Path(os.environ["PLACHEM_WAR_ROOM_DB"])
         now = int(time.time())
         with sqlite3.connect(db) as con:
-            con.execute("INSERT INTO war_messages VALUES (?,?,?,?,?,?,?,?,?,?,?)", ("recovery-message", "plachem-agent-war-room", "instruction", "agent", "main", "recovery body", None, None, now, "recovery-corr", "clean"))
+            con.execute("INSERT INTO war_messages VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", ("recovery-message", "plachem-agent-war-room", "instruction", "agent", "main", "recovery body", None, None, now, "recovery-corr", "clean", None))
             con.execute("INSERT INTO war_deliveries (id,message_id,agent_id,status,attempt_count,run_id,created_at) VALUES (?,?,?,?,?,?,?)", ("recovery-delivery", "recovery-message", "ERPcoder", "received", 1, "run-recover", now))
             con.commit()
         gateway = FakeGatewayAdapter()

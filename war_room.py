@@ -106,7 +106,8 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
             source_message_id TEXT,
             created_at INTEGER NOT NULL,
             correlation_id TEXT,
-            redaction_state TEXT NOT NULL DEFAULT 'clean'
+            redaction_state TEXT NOT NULL DEFAULT 'clean',
+            original_body TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_war_messages_project_created_id
             ON war_messages(project_id, created_at DESC, id DESC);
@@ -168,12 +169,13 @@ def provision_database(path: str | Path | None = None) -> Path:
             """
             INSERT OR IGNORE INTO war_messages
             (id, project_id, message_type, author_type, author_id, body, created_at,
-             correlation_id, redaction_state)
+             correlation_id, redaction_state, original_body)
             VALUES ('baseline-imported', ?, 'decision', 'system', 'manyfast', ?, ?,
-                    'manyfast-baseline', 'clean')
+                    'manyfast-baseline', 'clean', ?)
             """,
             (
                 PROJECT_ID,
+                "ManyFast PRD·요구사항·기능명세·유저플로우 기준선을 연결했습니다. 실제 실행 기능은 비활성 상태입니다.",
                 "ManyFast PRD·요구사항·기능명세·유저플로우 기준선을 연결했습니다. 실제 실행 기능은 비활성 상태입니다.",
                 now,
             ),
@@ -420,7 +422,13 @@ def list_projects(request: Request = None, status: str | None = None, q: str | N
                 """
                 SELECT p.*,
                        (SELECT COUNT(*) FROM war_participants x WHERE x.project_id = p.id AND x.active=1) AS participant_count,
-                       (SELECT MAX(created_at) FROM war_messages m WHERE m.project_id = p.id) AS last_activity
+                       (SELECT MAX(created_at) FROM war_messages m WHERE m.project_id = p.id) AS last_activity,
+                       (SELECT COUNT(*) FROM war_tasks t WHERE t.project_id = p.id) AS task_count,
+                       (SELECT COUNT(*) FROM war_tasks t WHERE t.project_id = p.id AND t.status = 'running') AS running_task_count,
+                       (SELECT COUNT(*) FROM war_tasks t WHERE t.project_id = p.id AND t.status = 'qa') AS qa_task_count,
+                       (SELECT COUNT(*) FROM war_tasks t WHERE t.project_id = p.id AND t.status = 'rework_required') AS rework_task_count,
+                       (SELECT COUNT(*) FROM war_tasks t WHERE t.project_id = p.id AND t.status = 'awaiting_approval') AS approval_task_count,
+                       (SELECT COUNT(*) FROM war_tasks t WHERE t.project_id = p.id AND t.status = 'completed') AS completed_task_count
                 FROM war_projects p JOIN war_participants me ON me.project_id=p.id
                 WHERE me.principal_id=? AND me.can_read=1 AND me.active=1
                 ORDER BY p.updated_at DESC
@@ -432,7 +440,13 @@ def list_projects(request: Request = None, status: str | None = None, q: str | N
             SELECT p.*,
                    (SELECT COUNT(*) FROM war_participants x
                     WHERE x.project_id = p.id AND x.principal_id IN ('main', 'ERPcoder', 'ERPmanager', 'ERPqa')) AS participant_count,
-                   (SELECT MAX(created_at) FROM war_messages m WHERE m.project_id = p.id) AS last_activity
+                   (SELECT MAX(created_at) FROM war_messages m WHERE m.project_id = p.id) AS last_activity,
+                   (SELECT COUNT(*) FROM war_tasks t WHERE t.project_id = p.id) AS task_count,
+                   (SELECT COUNT(*) FROM war_tasks t WHERE t.project_id = p.id AND t.status = 'running') AS running_task_count,
+                   (SELECT COUNT(*) FROM war_tasks t WHERE t.project_id = p.id AND t.status = 'qa') AS qa_task_count,
+                   (SELECT COUNT(*) FROM war_tasks t WHERE t.project_id = p.id AND t.status = 'rework_required') AS rework_task_count,
+                   (SELECT COUNT(*) FROM war_tasks t WHERE t.project_id = p.id AND t.status = 'awaiting_approval') AS approval_task_count,
+                   (SELECT COUNT(*) FROM war_tasks t WHERE t.project_id = p.id AND t.status = 'completed') AS completed_task_count
             FROM war_projects p
             WHERE p.id IN ('plachem-agent-war-room')
             ORDER BY updated_at DESC
@@ -614,11 +628,16 @@ def get_operations(project_id: str) -> dict[str, Any]:
 def get_manyfast_baseline(project_id: str) -> dict[str, Any]:
     with _connect_readonly() as connection:
         project = _project_or_404(connection, project_id)
+        ref = connection.execute("SELECT * FROM war_manyfast_refs WHERE project_id=? ORDER BY created_at DESC LIMIT 1", (project_id,)).fetchone()
+    drift = bool(ref and ref["drift_status"] == "drift")
     return {
         "mode": "readonly",
         "project_id": project_id,
         "manyfast_project_id": project["manyfast_project_id"],
         "version": project["manyfast_version"],
+        "drift": drift,
+        "drift_from": ref["previous_document_version"] if ref and "previous_document_version" in ref.keys() else None,
+        "drift_detected_at": ref["created_at"] if drift else None,
         "counts": {
             "requirements": 9,
             "features": 10,
