@@ -13,6 +13,7 @@
     h1,h2,h3,p { margin-top:0; } h1 { font-size:20px; margin-bottom:3px; } h2 { font-size:15px; }
     .badge { padding:5px 9px; border:1px solid var(--green); border-radius:999px; color:var(--green); font-weight:700; }
     .shell { display:grid; grid-template-columns:260px minmax(0,1fr) 310px; gap:14px; padding:14px; max-width:1600px; margin:auto; }
+    .shell:has(> [data-advanced-section][hidden]) { grid-template-columns:1fr; }
     .shell > * { min-width:0; }
     .panel { background:rgba(17,28,48,.94); border:1px solid var(--line); border-radius:14px; padding:15px; box-shadow:0 14px 35px rgba(0,0,0,.18); }
     .stack { display:grid; gap:10px; }
