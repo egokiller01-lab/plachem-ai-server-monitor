@@ -831,11 +831,68 @@ def service_status(service: str, process_names: list[str]) -> dict[str, str]:
         return {"state": "error", "label": "Error"}
 
 
-def get_services() -> dict[str, dict[str, str]]:
+OPENCONNECTOR_CONTAINER = "openconnector-test"
+OPENCONNECTOR_HEALTH_URL = "http://127.0.0.1:3001/health"
+OPENCONNECTOR_CONSOLE_URL = "https://openclaw.tail8eba4b.ts.net:3001/"
+
+
+def get_openconnector_status() -> dict[str, Any]:
+    started = time.monotonic()
+    api_ok = False
+    http_status: int | None = None
+    try:
+        request = urllib.request.Request(OPENCONNECTOR_HEALTH_URL, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(request, timeout=1.2) as response:
+            http_status = response.status
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+            api_ok = response.status == 200 and payload.get("ok") is True
+    except (OSError, ValueError, urllib.error.URLError):
+        pass
+    response_ms = round((time.monotonic() - started) * 1000, 1)
+
+    details: dict[str, Any] = {
+        "state": "running" if api_ok else "stopped",
+        "label": "Running" if api_ok else "Stopped",
+        "api_ok": api_ok,
+        "http_status": http_status,
+        "response_ms": response_ms,
+        "container": OPENCONNECTOR_CONTAINER,
+        "console_url": OPENCONNECTOR_CONSOLE_URL,
+    }
+    inspected = safe_run(
+        ["docker", "inspect", OPENCONNECTOR_CONTAINER, "--format", "{{json .}}"],
+        timeout=1.5,
+    )
+    if not inspected or inspected.returncode != 0:
+        return details
+    try:
+        container = json.loads(inspected.stdout)
+        state = container.get("State") or {}
+        health = (state.get("Health") or {}).get("Status") or "unknown"
+        details.update({
+            "container_status": state.get("Status") or "unknown",
+            "container_health": health,
+            "started_at": state.get("StartedAt"),
+            "restart_count": container.get("RestartCount", 0),
+            "image": (container.get("Config") or {}).get("Image") or "unknown",
+        })
+        if state.get("Running") and api_ok:
+            details.update({"state": "running", "label": "Running"})
+        elif state.get("Running"):
+            details.update({"state": "unknown", "label": "Degraded"})
+        else:
+            details.update({"state": "stopped", "label": "Stopped"})
+    except (TypeError, ValueError):
+        pass
+    return details
+
+
+def get_services() -> dict[str, dict[str, Any]]:
     return {
         "openclaw": service_status("openclaw", ["openclaw"]),
         "ollama": service_status("ollama", ["ollama"]),
         "tailscale": service_status("tailscaled", ["tailscaled", "tailscale"]),
+        "openconnector": get_openconnector_status(),
     }
 
 
@@ -1113,7 +1170,7 @@ def listening_ports(limit: int = 30) -> list[dict[str, Any]]:
     return sorted(rows, key=lambda row: (row["port"], row["ip"]))[:limit]
 
 
-def extended_services() -> dict[str, dict[str, str]]:
+def extended_services() -> dict[str, dict[str, Any]]:
     services = {
         "openclaw": ("openclaw", ["openclaw"]),
         "ollama": ("ollama", ["ollama"]),
@@ -1123,7 +1180,11 @@ def extended_services() -> dict[str, dict[str, str]]:
         "paperclip": ("paperclip", ["paperclip"]),
         "server_monitor": ("plachem-ai-server-monitor", ["uvicorn", "plachem-ai-server-monitor"]),
     }
-    return {key: service_status(service, names) for key, (service, names) in services.items()}
+    statuses: dict[str, dict[str, Any]] = {
+        key: service_status(service, names) for key, (service, names) in services.items()
+    }
+    statuses["openconnector"] = get_openconnector_status()
+    return statuses
 
 
 def detail_response(name: str, payload: dict[str, Any], status: str = "ok") -> dict[str, Any]:

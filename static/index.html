@@ -687,7 +687,7 @@
     .gpu-grid, .agent-grid { grid-template-columns: 1fr; gap: 8px; }
     .codex-card { padding: 10px 12px; }
     .codex-percent { font-size: 28px; }
-    .services { grid-template-columns: 105px repeat(3, 1fr); min-height: 52px; padding: 10px 14px; gap: 10px; margin-bottom: 8px; }
+    .services { grid-template-columns: 105px repeat(4, 1fr); min-height: 52px; padding: 10px 14px; gap: 10px; margin-bottom: 8px; }
     .service-title { font-size: 18px; gap: 7px; }
     .service-title .icon { font-size: 14px; }
     .service { font-size: 12px; gap: 6px; }
@@ -700,7 +700,7 @@
     @media (max-width: 1350px) {
       .kpis { grid-template-columns: repeat(6, minmax(76px, 1fr)); }
       .main-grid { grid-template-columns: 0.94fr 1.06fr; }
-      .services { grid-template-columns: 105px repeat(3, 1fr); }
+      .services { grid-template-columns: 105px repeat(4, 1fr); }
       .service { border-left: 1px solid rgba(154, 179, 214, 0.26); justify-content: center; }
     }
 
@@ -926,7 +926,7 @@
     .net-value { font-size: 26px; }
     .net-arrow { font-size: 32px; }
     .divider { background: rgba(148,163,184,0.20); height: 96px; }
-    .services { grid-template-columns: 250px repeat(3, 1fr); min-height: 72px; padding: 18px 26px; gap: 22px; margin-bottom: 16px; border-radius: 16px; }
+    .services { grid-template-columns: 250px repeat(4, 1fr); min-height: 72px; padding: 18px 26px; gap: 22px; margin-bottom: 16px; border-radius: 16px; }
     .service-title { font-size: 24px; }
     .service { justify-content: flex-start; gap: 12px; font-size: 18px; border-left-color: rgba(148,163,184,0.18); padding-left: 28px; }
     .pill { width: 12px; height: 12px; }
@@ -1010,7 +1010,7 @@
     .oc-segment span { font-size: 7px; }
     .oc-segment strong { font-size: 9px; }
     .openclaw-control-button { min-height: 24px; padding: 0 8px; border-radius: 7px; font-size: 8px; }
-    .services { grid-template-columns: 110px repeat(3, 1fr); min-height: 32px; padding: 7px 10px; gap: 8px; margin-bottom: 7px; }
+    .services { grid-template-columns: 110px repeat(4, 1fr); min-height: 32px; padding: 7px 10px; gap: 8px; margin-bottom: 7px; }
     .service-title { font-size: 12px; gap: 5px; }
     .service { gap: 5px; font-size: 9px; padding-left: 8px; }
     .pill { width: 6px; height: 6px; }
@@ -1149,6 +1149,7 @@
       <div id="svc-openclaw" class="service unknown"><span class="pill"></span><span>OpenClaw</span><span class="service-state">Unknown</span></div>
       <div id="svc-ollama" class="service unknown"><span class="pill"></span><span>Ollama</span><span class="service-state">Unknown</span></div>
       <div id="svc-tailscale" class="service unknown"><span class="pill"></span><span>Tailscale</span><span class="service-state">Unknown</span></div>
+      <div id="svc-openconnector" class="service unknown"><span class="pill"></span><span>OpenConnector</span><span class="service-state">Unknown</span></div>
     </section>
     </section>
 
@@ -1190,6 +1191,8 @@
   <script>
     const maxPoints = 42;
     const kpiHistory = { cpu: [], ram: [], download: [], upload: [], disk: [], temperature: [] };
+    const gpuLoadHistory = new Map();
+    const gpuPeakWindowMs = 10000;
 
     function ensureKpiSparks() {
       document.querySelectorAll(".kpi").forEach((node, index) => {
@@ -1223,6 +1226,15 @@
       return Math.max(0, Math.min(100, value));
     }
 
+    function recentGpuPeak(index, value) {
+      const now = Date.now();
+      const samples = gpuLoadHistory.get(index) || [];
+      if (Number.isFinite(value)) samples.push({ time: now, value: clampPercent(value) });
+      const recent = samples.filter(sample => now - sample.time <= gpuPeakWindowMs);
+      gpuLoadHistory.set(index, recent);
+      return recent.length ? Math.max(...recent.map(sample => sample.value)) : 0;
+    }
+
     function formatBps(bytes) {
       if (!Number.isFinite(bytes)) return "Unknown";
       if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB/s`;
@@ -1244,14 +1256,14 @@
       const gen = Number.isFinite(gpu.pcie_gen_max) ? `PCIe ${gpu.pcie_gen_max}.0` : "PCIe --";
       const width = Number.isFinite(gpu.pcie_width_current) ? `x${gpu.pcie_width_current}` : "x--";
       const maxWidth = Number.isFinite(gpu.pcie_width_max) ? `x${gpu.pcie_width_max}` : "x--";
-      const load = clampPercent(gpu.usage_percent);
+      const load = recentGpuPeak(index, gpu.usage_percent);
       const powerPercent = Number.isFinite(gpu.power_draw_w) && Number.isFinite(gpu.power_limit_w) && gpu.power_limit_w > 0
         ? Math.round(gpu.power_draw_w / gpu.power_limit_w * 100) : null;
       card.innerHTML = `
         <div class="card-title"><span class="icon">▧</span><span>GPU ${index}</span></div>
         <div class="gpu-unit-name">${escapeHtml(gpu.name || "Unknown")}</div>
         <div class="gpu-dashboard">
-          <div class="gpu-gauge" style="--p:${load}"><div class="gpu-gauge-center"><div class="gpu-gauge-value">${percent(gpu.usage_percent)}</div><div class="gpu-gauge-label">GPU LOAD</div></div></div>
+          <div class="gpu-gauge" style="--p:${load}"><div class="gpu-gauge-center"><div class="gpu-gauge-value">${percent(load)}</div><div class="gpu-gauge-label">GPU LOAD · 10s PEAK</div></div></div>
           <div class="gpu-unit-metrics">
             <div class="gpu-unit-metric vram"><span>VRAM</span><strong>${formatGpuValue(gpu.vram_used_gb)} / ${formatGpuValue(gpu.vram_total_gb)} GB · ${percent(gpu.vram_usage_percent)}</strong></div>
             <div class="gpu-unit-metric temp"><span>Temperature</span><strong>${formatGpuValue(gpu.temperature_c, "°C")}</strong></div>
@@ -1496,6 +1508,7 @@
         setService("svc-openclaw", data.services?.openclaw);
         setService("svc-ollama", data.services?.ollama);
         setService("svc-tailscale", data.services?.tailscale);
+        setService("svc-openconnector", data.services?.openconnector);
 
         document.getElementById("server-name").textContent = data.server?.name || "PLACHEM-AI-01";
         document.getElementById("server-os").textContent = data.server?.os || "Unknown OS";
@@ -1581,7 +1594,16 @@
       }
       if (type === "services") {
         const rows = Object.entries(data.services || {}).map(([name, svc]) => [name.replace(/_/g, " "), svc.label, svc.state]);
-        return card("Service States", table(["Service", "Label", "State"], rows), true);
+        const connector = data.services?.openconnector || {};
+        const connectorDetails = card("OpenConnector", kv([
+          ["API health", connector.api_ok ? "PASS" : "FAIL"],
+          ["Response", connector.response_ms == null ? "Unknown" : `${connector.response_ms} ms`],
+          ["Container", connector.container_status || "unknown"],
+          ["Docker health", connector.container_health || "unknown"],
+          ["Image", connector.image || "unknown"],
+          ["Restarts", connector.restart_count ?? "unknown"],
+        ]) + `<a class="openclaw-control-button" href="${connector.console_url || "https://openclaw.tail8eba4b.ts.net:3001/"}" target="_blank" rel="noopener noreferrer">Open OpenConnector Console →</a>`, true);
+        return card("Service States", table(["Service", "Label", "State"], rows), true) + connectorDetails;
       }
       return card("Unknown", kv([["Type", type]]), true);
     }
