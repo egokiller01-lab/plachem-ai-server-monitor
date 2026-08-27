@@ -834,6 +834,139 @@ def service_status(service: str, process_names: list[str]) -> dict[str, str]:
 OPENCONNECTOR_CONTAINER = "openconnector-test"
 OPENCONNECTOR_HEALTH_URL = "http://127.0.0.1:3001/health"
 OPENCONNECTOR_CONSOLE_URL = "https://openclaw.tail8eba4b.ts.net:3001/"
+OPENCONNECTOR_API_BASE = "http://127.0.0.1:3001"
+OPENCONNECTOR_ENV_FILE = Path("/opt/openconnector/.env")
+OPENCONNECTOR_MANAGED_ACTIONS = {
+    "github": "github.get_current_user",
+    "gmail": "gmail.get_profile",
+    "googledrive": "googledrive.about.get",
+    "google_search_console": "google_search_console.list_sites",
+    "google_analytics": "google_analytics.list_account_summaries",
+    "notion": "notion.search",
+    "supabase": "supabase.list_organizations",
+    "cloudflare_dns": "cloudflare_dns.list_accounts",
+    "cloudflare_worker": "cloudflare_worker.list_accounts",
+    "wordpress": "wordpress.get_current_user",
+    "elevenlabs": "elevenlabs.get_user_info",
+    "gemini": "gemini.list_models",
+    "telegram": "telegram.get_me",
+}
+
+
+def _read_env_value(path: Path, key: str) -> str | None:
+    """Read one plain dotenv value without loading secrets into process env."""
+    try:
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            name, value = line.split("=", 1)
+            if name.strip() == key:
+                return value.strip().strip("'\"") or None
+    except OSError:
+        return None
+    return None
+
+
+def _openconnector_admin_get(path: str, timeout: float = 2.5) -> Any:
+    token = os.environ.get("OOMOL_CONNECT_ADMIN_TOKEN") or _read_env_value(
+        OPENCONNECTOR_ENV_FILE, "OOMOL_CONNECT_ADMIN_TOKEN"
+    )
+    if not token:
+        raise RuntimeError("OpenConnector admin token is unavailable")
+    request = urllib.request.Request(
+        f"{OPENCONNECTOR_API_BASE}{path}",
+        headers={"Accept": "application/json", "Authorization": f"Bearer {token}"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8", errors="replace"))
+
+
+def _parse_iso_timestamp(value: Any) -> float | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def get_openconnector_dashboard() -> dict[str, Any]:
+    """Return a secret-free authentication operations view from real run logs."""
+    now = time.time()
+    connections = _openconnector_admin_get("/api/connections")
+    run_page = _openconnector_admin_get("/api/runs?limit=100")
+    runs = run_page.get("items", []) if isinstance(run_page, dict) else []
+    connection_by_service = {
+        item.get("service"): item
+        for item in connections
+        if isinstance(item, dict) and item.get("service") in OPENCONNECTOR_MANAGED_ACTIONS
+    }
+    recent_by_action: dict[str, dict[str, Any]] = {}
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        action_id = run.get("actionId")
+        if action_id in OPENCONNECTOR_MANAGED_ACTIONS.values() and action_id not in recent_by_action:
+            recent_by_action[action_id] = run
+
+    services: list[dict[str, Any]] = []
+    alerts: list[dict[str, str]] = []
+    for service, action_id in OPENCONNECTOR_MANAGED_ACTIONS.items():
+        connection = connection_by_service.get(service)
+        run = recent_by_action.get(action_id)
+        verified_at = run.get("completedAt") if run else None
+        verified_epoch = _parse_iso_timestamp(verified_at)
+        configured = bool(connection and connection.get("configured"))
+        if run and run.get("ok") is False:
+            state = "error"
+            message = str(run.get("errorCode") or run.get("error") or "Recent READ verification failed")
+            alerts.append({"severity": "error", "service": service, "message": message[:160], "action": "Review connection and retry READ verification"})
+        elif not configured:
+            state = "error"
+            alerts.append({"severity": "error", "service": service, "message": "Connection is not configured", "action": "Restore the central connection"})
+        elif verified_epoch is None:
+            state = "unverified"
+            alerts.append({"severity": "warning", "service": service, "message": "No READ verification run found", "action": "Run the service READ check"})
+        elif now - verified_epoch > 86400:
+            state = "warning"
+            alerts.append({"severity": "warning", "service": service, "message": "READ verification is older than 24 hours", "action": "Run the service READ check"})
+        else:
+            state = "healthy"
+        services.append({
+            "service": service,
+            "manager": "OpenConnector",
+            "state": state,
+            "configured": configured,
+            "verification_action": action_id,
+            "last_verified_at": verified_at,
+            "last_verified_ok": run.get("ok") if run else None,
+            "last_duration_ms": run.get("durationMs") if run else None,
+            "caller": run.get("caller") if run else None,
+            "token_expiry": "Not exposed by provider",
+        })
+
+    day_runs = [run for run in runs if (_parse_iso_timestamp(run.get("completedAt")) or 0) >= now - 86400]
+    success_count = sum(1 for run in day_runs if run.get("ok") is True)
+    success_rate = round(success_count / len(day_runs) * 100, 1) if day_runs else None
+    counts = {key: sum(1 for item in services if item["state"] == key) for key in ("healthy", "warning", "error", "unverified")}
+    recent_activity = [{
+        "service": run.get("service"),
+        "action": run.get("actionId"),
+        "caller": run.get("caller"),
+        "ok": run.get("ok"),
+        "completed_at": run.get("completedAt"),
+        "duration_ms": run.get("durationMs"),
+    } for run in runs[:20] if isinstance(run, dict)]
+    return {
+        "summary": {"managed": len(services), **counts, "runs_24h": len(day_runs), "success_rate_24h": success_rate},
+        "services": services,
+        "alerts": alerts,
+        "recent_activity": recent_activity,
+        "checked_at": int(now),
+        "console_url": OPENCONNECTOR_CONSOLE_URL,
+    }
 
 
 def get_openconnector_status() -> dict[str, Any]:
@@ -1441,9 +1574,27 @@ def api_openclaw_status() -> dict[str, Any]:
 @app.get("/api/detail/services")
 def detail_services() -> dict[str, Any]:
     try:
-        return detail_response("services", {"services": extended_services()})
+        dashboard: dict[str, Any] | None = None
+        dashboard_error: str | None = None
+        try:
+            dashboard = get_openconnector_dashboard()
+        except Exception as exc:
+            dashboard_error = str(exc)
+        return detail_response("services", {
+            "services": extended_services(),
+            "openconnector_dashboard": dashboard,
+            "openconnector_dashboard_error": dashboard_error,
+        })
     except Exception as exc:
         return detail_response("services", {"error": str(exc)}, "error")
+
+
+@app.get("/api/openconnector/dashboard")
+def api_openconnector_dashboard() -> dict[str, Any]:
+    try:
+        return detail_response("openconnector", {"dashboard": get_openconnector_dashboard()})
+    except Exception as exc:
+        return detail_response("openconnector", {"error": str(exc)}, "error")
 
 
 @app.get("/compact")

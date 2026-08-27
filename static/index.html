@@ -1595,7 +1595,8 @@
       if (type === "services") {
         const rows = Object.entries(data.services || {}).map(([name, svc]) => [name.replace(/_/g, " "), svc.label, svc.state]);
         const connector = data.services?.openconnector || {};
-        const connectorDetails = card("OpenConnector", kv([
+        const dashboard = data.openconnector_dashboard;
+        const connectorDetails = card("OpenConnector Runtime", kv([
           ["API health", connector.api_ok ? "PASS" : "FAIL"],
           ["Response", connector.response_ms == null ? "Unknown" : `${connector.response_ms} ms`],
           ["Container", connector.container_status || "unknown"],
@@ -1603,7 +1604,36 @@
           ["Image", connector.image || "unknown"],
           ["Restarts", connector.restart_count ?? "unknown"],
         ]) + `<a class="openclaw-control-button" href="${connector.console_url || "https://openclaw.tail8eba4b.ts.net:3001/"}" target="_blank" rel="noopener noreferrer">Open OpenConnector Console →</a>`, true);
-        return card("Service States", table(["Service", "Label", "State"], rows), true) + connectorDetails;
+        if (!dashboard) {
+          return card("Service States", table(["Service", "Label", "State"], rows), true) + connectorDetails + card("Authentication Control", kv([["Status", data.openconnector_dashboard_error || "Unavailable"]]), true);
+        }
+        const summary = dashboard.summary || {};
+        const summaryCard = card("Authentication Overview", kv([
+          ["Managed services", summary.managed],
+          ["Healthy", summary.healthy, "status-running"],
+          ["Warning", summary.warning, "status-unknown"],
+          ["Error", summary.error, "status-error"],
+          ["Unverified", summary.unverified],
+          ["24h success rate (latest 100)", summary.success_rate_24h == null ? "No runs" : `${summary.success_rate_24h}%`],
+          ["24h sampled runs", summary.runs_24h],
+        ]));
+        const authRows = (dashboard.services || []).map(item => [
+          item.service.replace(/_/g, " "), item.manager, item.state, item.last_verified_at || "Never",
+          item.last_duration_ms == null ? "-" : `${item.last_duration_ms} ms`, item.verification_action,
+        ]);
+        const alertRows = (dashboard.alerts || []).map(item => [item.severity, item.service.replace(/_/g, " "), item.message, item.action]);
+        const activityRows = (dashboard.recent_activity || []).map(item => [
+          item.completed_at || "Unknown", item.service || "Unknown", item.action || "Unknown",
+          item.caller || "Unknown", item.ok ? "PASS" : "FAIL", item.duration_ms == null ? "-" : `${item.duration_ms} ms`,
+        ]);
+        return [
+          card("Service States", table(["Service", "Label", "State"], rows), true),
+          connectorDetails,
+          summaryCard,
+          card("Alerts & Required Actions", alertRows.length ? table(["Level", "Service", "Issue", "Recommended action"], alertRows) : kv([["Status", "No authentication alerts"]]), true),
+          card("Central Connections", table(["Service", "Manager", "State", "Last READ verification", "Duration", "Verification action"], authRows), true),
+          card("Recent Authentication Activity", table(["Completed", "Service", "Action", "Caller", "Result", "Duration"], activityRows), true),
+        ].join("");
       }
       return card("Unknown", kv([["Type", type]]), true);
     }
