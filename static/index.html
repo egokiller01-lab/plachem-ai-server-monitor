@@ -1624,6 +1624,7 @@
       services: "Services Diagnostics"
     };
     let currentDetail = null;
+    let currentAuthView = "overview";
 
     function escapeHtml(value) {
       return String(value ?? "Unknown").replace(/[&<>'"]/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;","\"":"&quot;"}[char]));
@@ -1669,6 +1670,7 @@
     function setAuthView(button, view) {
       const dashboard = button.closest(".auth-dashboard");
       if (!dashboard) return;
+      currentAuthView = view;
       dashboard.querySelectorAll("[data-auth-view]").forEach(node => { node.hidden = node.dataset.authView !== view; });
       dashboard.querySelectorAll("[data-auth-target]").forEach(node => node.classList.toggle("active", node.dataset.authTarget === view));
     }
@@ -1834,6 +1836,10 @@
         const data = await response.json();
         meta.textContent = `Last updated ${data.last_updated || "Unknown"}`;
         content.innerHTML = renderDetail(currentDetail, data);
+        if (currentDetail === "services") {
+          const selected = content.querySelector(`[data-auth-target="${currentAuthView}"]`);
+          if (selected) setAuthView(selected, currentAuthView);
+        }
       } catch (error) {
         meta.textContent = "Error";
         content.innerHTML = card("Error", kv([["Message", "Failed to load detail"]]), true);
