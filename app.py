@@ -921,17 +921,17 @@ def get_openconnector_dashboard() -> dict[str, Any]:
         configured = bool(connection and connection.get("configured"))
         if run and run.get("ok") is False:
             state = "error"
-            message = str(run.get("errorCode") or run.get("error") or "Recent READ verification failed")
-            alerts.append({"severity": "error", "service": service, "message": message[:160], "action": "Review connection and retry READ verification"})
+            message = str(run.get("errorCode") or run.get("error") or "최근 READ 검증 실패")
+            alerts.append({"severity": "error", "service": service, "message": message[:160], "action": "중앙 연결 상태를 확인하고 READ 검증을 다시 실행하세요"})
         elif not configured:
             state = "error"
-            alerts.append({"severity": "error", "service": service, "message": "Connection is not configured", "action": "Restore the central connection"})
+            alerts.append({"severity": "error", "service": service, "message": "연결이 설정되지 않았습니다", "action": "중앙 연결을 복구하세요"})
         elif verified_epoch is None:
             state = "unverified"
-            alerts.append({"severity": "warning", "service": service, "message": "No READ verification run found", "action": "Run the service READ check"})
+            alerts.append({"severity": "warning", "service": service, "message": "READ 검증 기록이 없습니다", "action": "서비스 READ 점검을 실행하세요"})
         elif now - verified_epoch > 86400:
             state = "warning"
-            alerts.append({"severity": "warning", "service": service, "message": "READ verification is older than 24 hours", "action": "Run the service READ check"})
+            alerts.append({"severity": "warning", "service": service, "message": "마지막 READ 검증이 24시간을 초과했습니다", "action": "서비스 READ 점검을 실행하세요"})
         else:
             state = "healthy"
         services.append({
@@ -944,7 +944,7 @@ def get_openconnector_dashboard() -> dict[str, Any]:
             "last_verified_ok": run.get("ok") if run else None,
             "last_duration_ms": run.get("durationMs") if run else None,
             "caller": run.get("caller") if run else None,
-            "token_expiry": "Not exposed by provider",
+            "token_expiry": "Provider 미제공",
         })
 
     day_runs = [run for run in runs if (_parse_iso_timestamp(run.get("completedAt")) or 0) >= now - 86400]
@@ -974,33 +974,33 @@ def get_openconnector_dashboard() -> dict[str, Any]:
 
     service_usage = summarize_runs("service")
     caller_usage = summarize_runs("caller")
-    expiry_known = sum(1 for item in services if item["token_expiry"] != "Not exposed by provider")
+    expiry_known = sum(1 for item in services if item["token_expiry"] != "Provider 미제공")
     operational_insights: list[dict[str, str]] = []
     if counts["error"] == 0 and success_rate is not None and success_rate < 95:
         operational_insights.append({
             "level": "info",
-            "title": "Current health recovered",
-            "message": f"All current connections are healthy, while the 24-hour run success rate is {success_rate}%. Historical recovery failures remain in the sample.",
+            "title": "현재 연결 상태 복구 완료",
+            "message": f"현재 모든 연결은 정상이지만 24시간 실행 성공률은 {success_rate}%입니다. 복구 과정에서 발생한 과거 실패가 표본에 포함되어 있습니다.",
         })
     if service_usage:
         busiest = service_usage[0]
         operational_insights.append({
             "level": "info",
-            "title": "Most used service",
-            "message": f"{busiest['service']} ranks first with {busiest['runs']} of {len(day_runs)} sampled runs in the last 24 hours.",
+            "title": "사용량 1위 서비스",
+            "message": f"최근 24시간 표본 {len(day_runs)}건 중 {busiest['service']}가 {busiest['runs']}건으로 가장 많이 사용됐습니다.",
         })
         risky = max(service_usage, key=lambda item: (item["failures"], item["runs"]))
         if risky["failures"]:
             operational_insights.append({
                 "level": "warning",
-                "title": "Failure concentration",
-                "message": f"{risky['service']} has the highest sampled failure count ({risky['failures']}). Review its recovery history before requesting new authentication.",
+                "title": "실패 집중 서비스",
+                "message": f"{risky['service']}의 표본 실패가 {risky['failures']}건으로 가장 많습니다. 새 인증을 요청하기 전에 기존 연결의 복구 이력을 먼저 확인하세요.",
             })
     if expiry_known < len(services):
         operational_insights.append({
             "level": "warning",
-            "title": "Expiry visibility gap",
-            "message": f"Token expiry is not exposed for {len(services) - expiry_known} of {len(services)} central connections. These are unknown, not confirmed safe.",
+            "title": "유효기간 확인 공백",
+            "message": f"중앙 연결 {len(services)}개 중 {len(services) - expiry_known}개의 토큰 유효기간이 제공되지 않습니다. 이는 정상이 아니라 미확인 상태입니다.",
         })
     recent_activity = [{
         "service": run.get("service"),
