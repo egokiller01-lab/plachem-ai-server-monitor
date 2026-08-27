@@ -850,6 +850,38 @@
     .detail-table th, .detail-table td { padding: 5px 4px; border-bottom: 1px solid rgba(154, 179, 214, 0.14); text-align: left; }
     .detail-table th { color: var(--muted); font-weight: 650; }
     .detail-table td { color: var(--text); }
+
+    .auth-dashboard { grid-column: 1 / -1; display: grid; gap: 10px; }
+    .auth-hero { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; padding: 15px 16px; border: 1px solid rgba(32, 217, 246, .38); border-radius: 10px; background: linear-gradient(135deg, rgba(13, 40, 73, .94), rgba(5, 17, 32, .96)); }
+    .auth-eyebrow { color: var(--cyan); font-size: 9px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase; }
+    .auth-hero h2 { margin: 4px 0 5px; font-size: 19px; }
+    .auth-hero p { margin: 0; max-width: 510px; color: var(--muted); font-size: 10px; line-height: 1.5; }
+    .auth-console-link { flex: 0 0 auto; padding: 8px 11px; border: 1px solid rgba(32, 217, 246, .45); border-radius: 7px; color: var(--cyan); background: rgba(16, 69, 91, .25); font-size: 10px; font-weight: 750; text-decoration: none; }
+    .auth-tabs { display: flex; gap: 5px; overflow-x: auto; padding: 4px; border: 1px solid rgba(75, 148, 210, .23); border-radius: 8px; background: rgba(4, 15, 29, .82); }
+    .auth-tab { padding: 7px 10px; border-radius: 6px; color: var(--muted); font-size: 10px; white-space: nowrap; }
+    .auth-tab.active { color: white; background: linear-gradient(135deg, rgba(43, 119, 245, .7), rgba(20, 185, 210, .42)); box-shadow: 0 0 14px rgba(32, 217, 246, .16); }
+    .auth-kpis { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 7px; }
+    .auth-kpi { min-height: 73px; padding: 10px 11px; border: 1px solid rgba(75, 148, 210, .28); border-radius: 8px; background: linear-gradient(145deg, rgba(12, 31, 56, .92), rgba(5, 15, 29, .92)); }
+    .auth-kpi span { display: block; color: var(--muted); font-size: 9px; }
+    .auth-kpi strong { display: block; margin-top: 8px; font-size: 21px; line-height: 1; }
+    .auth-kpi small { display: block; margin-top: 5px; color: var(--muted); font-size: 8px; }
+    .auth-kpi.good strong { color: var(--green); } .auth-kpi.warn strong { color: var(--amber); } .auth-kpi.bad strong { color: var(--red); } .auth-kpi.info strong { color: var(--cyan); }
+    .auth-panel { overflow: hidden; border: 1px solid rgba(75, 148, 210, .27); border-radius: 9px; background: linear-gradient(145deg, rgba(10, 26, 48, .9), rgba(4, 12, 24, .92)); }
+    .auth-panel-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 11px 13px; border-bottom: 1px solid rgba(75, 148, 210, .18); }
+    .auth-panel-head h3 { margin: 0; font-size: 12px; }
+    .auth-panel-head span { color: var(--muted); font-size: 9px; }
+    .auth-table-wrap { width: 100%; overflow-x: auto; }
+    .auth-table { width: 100%; min-width: 690px; border-collapse: collapse; font-size: 10px; }
+    .auth-table th { padding: 8px 11px; color: #8295b7; background: rgba(3, 13, 26, .55); font-size: 8px; letter-spacing: .07em; text-align: left; text-transform: uppercase; }
+    .auth-table td { padding: 9px 11px; border-top: 1px solid rgba(154, 179, 214, .1); color: #dfe9fb; }
+    .auth-service { font-weight: 750; text-transform: capitalize; }
+    .auth-action { max-width: 210px; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 8px; overflow-wrap: anywhere; }
+    .auth-badge { display: inline-flex; align-items: center; gap: 5px; padding: 3px 7px; border: 1px solid currentColor; border-radius: 999px; font-size: 8px; font-weight: 800; text-transform: uppercase; }
+    .auth-badge::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor; box-shadow: 0 0 8px currentColor; }
+    .auth-badge.healthy, .auth-badge.pass { color: var(--green); } .auth-badge.warning, .auth-badge.unverified { color: var(--amber); } .auth-badge.error, .auth-badge.fail { color: var(--red); }
+    .auth-two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .auth-empty { padding: 18px 13px; color: var(--green); font-size: 10px; }
+    .auth-scope-note { padding: 10px 12px; border-left: 2px solid var(--amber); color: var(--muted); background: rgba(255, 178, 28, .05); font-size: 9px; line-height: 1.5; }
     .wide { grid-column: 1 / -1; }
     .status-normal, .status-running, .status-ok { color: var(--green); }
     .status-warning, .status-unknown, .status-stopped { color: var(--amber); }
@@ -866,6 +898,9 @@
       .detail-header { align-items: flex-start; flex-direction: column; }
       .detail-kv { grid-template-columns: 1fr; }
       .detail-table { font-size: 10px; }
+      .auth-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .auth-two-col { grid-template-columns: 1fr; }
+      .auth-hero { flex-direction: column; }
     }
 
     /* Premium PLACHEM dashboard refresh */
@@ -1554,6 +1589,58 @@
       return `<div class="core-grid">${(values || []).map((value, i) => `<div class="core-tile">Core ${i}<strong style="float:right">${percent(value)}</strong><div class="mini-bar"><span style="width:${clampPercent(value)}%"></span></div></div>`).join("")}</div>`;
     }
 
+    function authDate(value) {
+      if (!value) return "Never";
+      const date = new Date(value);
+      return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString([], { month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+    }
+
+    function authBadge(state, label = null) {
+      const safeState = ["healthy", "warning", "error", "unverified", "pass", "fail"].includes(state) ? state : "unverified";
+      return `<span class="auth-badge ${safeState}">${escapeHtml(label || safeState)}</span>`;
+    }
+
+    function renderAuthDashboard(dashboard, connector, serviceRows) {
+      const summary = dashboard.summary || {};
+      const services = dashboard.services || [];
+      const alerts = dashboard.alerts || [];
+      const activity = dashboard.recent_activity || [];
+      const serviceTable = services.map(item => `<tr>
+        <td class="auth-service">${escapeHtml(item.service.replace(/_/g, " "))}</td>
+        <td>${escapeHtml(item.manager)}</td>
+        <td>${authBadge(item.state)}</td>
+        <td>${escapeHtml(authDate(item.last_verified_at))}</td>
+        <td>${escapeHtml(item.last_duration_ms == null ? "—" : `${item.last_duration_ms} ms`)}</td>
+        <td class="auth-action">${escapeHtml(item.verification_action)}</td>
+      </tr>`).join("");
+      const alertBody = alerts.length ? `<div class="auth-table-wrap"><table class="auth-table"><thead><tr><th>Level</th><th>Service</th><th>Issue</th><th>Required action</th></tr></thead><tbody>${alerts.map(item => `<tr><td>${authBadge(item.severity === "error" ? "error" : "warning", item.severity)}</td><td class="auth-service">${escapeHtml(item.service.replace(/_/g, " "))}</td><td>${escapeHtml(item.message)}</td><td>${escapeHtml(item.action)}</td></tr>`).join("")}</tbody></table></div>` : `<div class="auth-empty">● No active authentication alerts</div>`;
+      const activityTable = activity.map(item => `<tr>
+        <td>${escapeHtml(authDate(item.completed_at))}</td><td class="auth-service">${escapeHtml(item.service || "Unknown")}</td>
+        <td class="auth-action">${escapeHtml(item.action || "Unknown")}</td><td>${escapeHtml(item.caller || "Unknown")}</td>
+        <td>${authBadge(item.ok ? "pass" : "fail", item.ok ? "PASS" : "FAIL")}</td><td>${escapeHtml(item.duration_ms == null ? "—" : `${item.duration_ms} ms`)}</td>
+      </tr>`).join("");
+      const runtimeState = connector.api_ok && connector.container_health === "healthy" ? "healthy" : connector.api_ok ? "warning" : "error";
+      return `<div class="auth-dashboard">
+        <section class="auth-hero"><div><div class="auth-eyebrow">PLACHEM Security Operations</div><h2>Authentication Control Center</h2><p>Centralized connection health, real READ verification results and authentication activity. Secret values and account details are never displayed.</p></div><a class="auth-console-link" href="${escapeHtml(connector.console_url || dashboard.console_url)}" target="_blank" rel="noopener noreferrer">Open Admin Console ↗</a></section>
+        <nav class="auth-tabs" aria-label="Authentication sections"><span class="auth-tab active">Overview</span><span class="auth-tab">Services</span><span class="auth-tab">Connections</span><span class="auth-tab">Alerts</span><span class="auth-tab">Activity</span><span class="auth-tab">Permissions</span><span class="auth-tab">Settings</span></nav>
+        <section class="auth-kpis">
+          <div class="auth-kpi info"><span>Managed connections</span><strong>${escapeHtml(summary.managed ?? 0)}</strong><small>OpenConnector central pool</small></div>
+          <div class="auth-kpi good"><span>Healthy</span><strong>${escapeHtml(summary.healthy ?? 0)}</strong><small>READ verified ≤ 24h</small></div>
+          <div class="auth-kpi warn"><span>Attention</span><strong>${escapeHtml((summary.warning || 0) + (summary.unverified || 0))}</strong><small>Warning + unverified</small></div>
+          <div class="auth-kpi bad"><span>Failures</span><strong>${escapeHtml(summary.error ?? 0)}</strong><small>Connection or READ error</small></div>
+          <div class="auth-kpi info"><span>24h success rate</span><strong>${summary.success_rate_24h == null ? "—" : `${escapeHtml(summary.success_rate_24h)}%`}</strong><small>${escapeHtml(summary.runs_24h ?? 0)} sampled runs</small></div>
+          <div class="auth-kpi ${runtimeState === "healthy" ? "good" : runtimeState === "error" ? "bad" : "warn"}"><span>OpenConnector runtime</span><strong>${authBadge(runtimeState, connector.api_ok ? "ONLINE" : "OFFLINE")}</strong><small>${escapeHtml(connector.response_ms == null ? "No response" : `${connector.response_ms} ms response`)}</small></div>
+        </section>
+        <section class="auth-panel"><div class="auth-panel-head"><h3>Central connections</h3><span>Actual OpenConnector connections · secret-free</span></div><div class="auth-table-wrap"><table class="auth-table"><thead><tr><th>Service</th><th>Manager</th><th>State</th><th>Last READ verification</th><th>Duration</th><th>Verification action</th></tr></thead><tbody>${serviceTable}</tbody></table></div></section>
+        <div class="auth-two-col">
+          <section class="auth-panel"><div class="auth-panel-head"><h3>Alerts & required actions</h3><span>${escapeHtml(alerts.length)} active</span></div>${alertBody}</section>
+          <section class="auth-panel"><div class="auth-panel-head"><h3>Runtime status</h3><span>OpenConnector infrastructure</span></div>${kv([["API health", connector.api_ok ? "PASS" : "FAIL"], ["Container", connector.container_status || "unknown"], ["Docker health", connector.container_health || "unknown"], ["Restarts", connector.restart_count ?? "unknown"], ["Image", connector.image || "unknown"]])}</section>
+        </div>
+        <section class="auth-panel"><div class="auth-panel-head"><h3>Recent authentication activity</h3><span>Latest sampled runs</span></div><div class="auth-table-wrap"><table class="auth-table"><thead><tr><th>Completed</th><th>Service</th><th>Action</th><th>Caller</th><th>Result</th><th>Duration</th></tr></thead><tbody>${activityTable}</tbody></table></div></section>
+        <div class="auth-scope-note">ManyFast, Postiz social channels and Producer YouTube use dedicated authentication managers. They will appear here only after their health checks are connected to a verifiable monitoring API; no assumed status is displayed.</div>
+      </div>`;
+    }
+
     function renderDetail(type, data) {
       if (data.status === "error") return card("Error", kv([["Message", data.error || "Unknown"]]), true);
       if (type === "cpu") {
@@ -1607,33 +1694,7 @@
         if (!dashboard) {
           return card("Service States", table(["Service", "Label", "State"], rows), true) + connectorDetails + card("Authentication Control", kv([["Status", data.openconnector_dashboard_error || "Unavailable"]]), true);
         }
-        const summary = dashboard.summary || {};
-        const summaryCard = card("Authentication Overview", kv([
-          ["Managed services", summary.managed],
-          ["Healthy", summary.healthy, "status-running"],
-          ["Warning", summary.warning, "status-unknown"],
-          ["Error", summary.error, "status-error"],
-          ["Unverified", summary.unverified],
-          ["24h success rate (latest 100)", summary.success_rate_24h == null ? "No runs" : `${summary.success_rate_24h}%`],
-          ["24h sampled runs", summary.runs_24h],
-        ]));
-        const authRows = (dashboard.services || []).map(item => [
-          item.service.replace(/_/g, " "), item.manager, item.state, item.last_verified_at || "Never",
-          item.last_duration_ms == null ? "-" : `${item.last_duration_ms} ms`, item.verification_action,
-        ]);
-        const alertRows = (dashboard.alerts || []).map(item => [item.severity, item.service.replace(/_/g, " "), item.message, item.action]);
-        const activityRows = (dashboard.recent_activity || []).map(item => [
-          item.completed_at || "Unknown", item.service || "Unknown", item.action || "Unknown",
-          item.caller || "Unknown", item.ok ? "PASS" : "FAIL", item.duration_ms == null ? "-" : `${item.duration_ms} ms`,
-        ]);
-        return [
-          card("Service States", table(["Service", "Label", "State"], rows), true),
-          connectorDetails,
-          summaryCard,
-          card("Alerts & Required Actions", alertRows.length ? table(["Level", "Service", "Issue", "Recommended action"], alertRows) : kv([["Status", "No authentication alerts"]]), true),
-          card("Central Connections", table(["Service", "Manager", "State", "Last READ verification", "Duration", "Verification action"], authRows), true),
-          card("Recent Authentication Activity", table(["Completed", "Service", "Action", "Caller", "Result", "Duration"], activityRows), true),
-        ].join("");
+        return renderAuthDashboard(dashboard, connector, rows);
       }
       return card("Unknown", kv([["Type", type]]), true);
     }
