@@ -868,6 +868,33 @@ def _read_env_value(path: Path, key: str) -> str | None:
     return None
 
 
+def get_openconnector_connection_updates() -> dict[str, dict[str, Any]]:
+    """Return per-service connection and OAuth client modification times."""
+    node_script = """const { DatabaseSync } = require("node:sqlite");
+const db = new DatabaseSync("/app/data/connect.sqlite", { readOnly: true });
+const connections = db.prepare("SELECT service, MAX(updated_at) AS updated_at FROM connections GROUP BY service").all();
+const oauth = db.prepare("SELECT service, MAX(updated_at) AS updated_at FROM oauth_client_configs GROUP BY service").all();
+process.stdout.write(JSON.stringify({ connections, oauth }));"""
+    result = subprocess.run(
+        ["docker", "exec", "-i", OPENCONNECTOR_CONTAINER, "node", "-e", node_script],
+        capture_output=True, text=True, timeout=5,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"OpenConnector DB read failed: {result.stderr.strip() or 'unknown error'}")
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"OpenConnector DB returned invalid JSON: {exc}")
+    updates: dict[str, dict[str, Any]] = {}
+    for row in payload.get("connections", []):
+        updates[row["service"]] = {"connection_last_modified_at": row.get("updated_at")}
+    for row in payload.get("oauth", []):
+        updates.setdefault(row["service"], {})[
+            "oauth_client_last_modified_at"
+        ] = row.get("updated_at")
+    return updates
+
+
 def _openconnector_admin_get(path: str, timeout: float = 2.5) -> Any:
     token = os.environ.get("OOMOL_CONNECT_ADMIN_TOKEN") or _read_env_value(
         OPENCONNECTOR_ENV_FILE, "OOMOL_CONNECT_ADMIN_TOKEN"
@@ -904,12 +931,20 @@ def get_openconnector_dashboard() -> dict[str, Any]:
         if isinstance(item, dict) and item.get("service") in OPENCONNECTOR_MANAGED_ACTIONS
     }
     recent_by_action: dict[str, dict[str, Any]] = {}
+    successful_read_by_action: dict[str, dict[str, Any]] = {}
     for run in runs:
         if not isinstance(run, dict):
             continue
         action_id = run.get("actionId")
         if action_id in OPENCONNECTOR_MANAGED_ACTIONS.values() and action_id not in recent_by_action:
             recent_by_action[action_id] = run
+        if action_id in OPENCONNECTOR_MANAGED_ACTIONS.values() and run.get("ok") is True and action_id not in successful_read_by_action:
+            successful_read_by_action[action_id] = run
+
+    try:
+        updates = get_openconnector_connection_updates() or {}
+    except Exception:
+        updates = {}
 
     services: list[dict[str, Any]] = []
     alerts: list[dict[str, str]] = []
@@ -917,6 +952,7 @@ def get_openconnector_dashboard() -> dict[str, Any]:
         connection = connection_by_service.get(service)
         run = recent_by_action.get(action_id)
         verified_at = run.get("completedAt") if run else None
+        updates_for_service = updates.get(service) or {}
         verified_epoch = _parse_iso_timestamp(verified_at)
         configured = bool(connection and connection.get("configured"))
         if run and run.get("ok") is False:
@@ -939,8 +975,12 @@ def get_openconnector_dashboard() -> dict[str, Any]:
             "manager": "OpenConnector",
             "state": state,
             "configured": configured,
+            "auth_type": connection.get("authType") if connection else None,
             "verification_action": action_id,
             "last_verified_at": verified_at,
+            "last_read_at": successful_read_by_action.get(action_id, {}).get("completedAt"),
+            "connection_last_modified_at": updates_for_service.get("connection_last_modified_at"),
+            "oauth_client_last_modified_at": updates_for_service.get("oauth_client_last_modified_at"),
             "last_verified_ok": run.get("ok") if run else None,
             "last_duration_ms": run.get("durationMs") if run else None,
             "caller": run.get("caller") if run else None,
