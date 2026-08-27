@@ -854,7 +854,7 @@
     .auth-dashboard { grid-column: 1 / -1; display: grid; grid-template-columns: 208px minmax(0, 1fr); min-height: 820px; overflow: hidden; border: 1px solid rgba(36, 153, 207, .26); border-radius: 16px; background: rgba(3, 14, 27, .82); box-shadow: 0 22px 70px rgba(0,0,0,.30); }
     .auth-sidebar { display: flex; flex-direction: column; padding: 18px 12px 14px; border-right: 1px solid rgba(36, 153, 207, .19); background: linear-gradient(180deg, rgba(7, 31, 54, .96), rgba(3, 18, 33, .98)); }
     .auth-side-nav { display: grid; gap: 6px; }
-    .auth-side-item { display: flex; align-items: center; gap: 11px; min-height: 42px; padding: 0 12px; border-radius: 8px; color: #c4d2e7; font-size: 12px; font-weight: 650; }
+    .auth-side-item { display: flex; align-items: center; gap: 11px; width: 100%; min-height: 42px; padding: 0 12px; border: 0; border-radius: 8px; color: #c4d2e7; background: transparent; font: inherit; font-size: 12px; font-weight: 650; text-align: left; cursor: pointer; }
     .auth-side-item i { width: 18px; color: #b9c9df; font-size: 15px; font-style: normal; text-align: center; }
     .auth-side-item.active { color: #35d8ff; background: linear-gradient(90deg, rgba(0, 125, 196, .30), rgba(0, 94, 154, .13)); box-shadow: inset 3px 0 #18c7f4; }
     .auth-side-item.active i { color: #35d8ff; }
@@ -915,6 +915,17 @@
     .auth-two-col { display: grid; grid-template-columns: 1.2fr .8fr; gap: 12px; margin-top: 12px; }
     .auth-empty { padding: 18px 13px; color: var(--green); font-size: 10px; }
     .auth-scope-note { margin-top: 12px; padding: 12px 14px; border-left: 2px solid var(--amber); color: var(--muted); background: rgba(255, 178, 28, .05); font-size: 10px; line-height: 1.5; }
+    .auth-view[hidden] { display: none !important; }
+    .auth-view-title { display: flex; align-items: end; justify-content: space-between; gap: 12px; margin: 1px 0 14px; }
+    .auth-view-title h3 { margin: 0; font-size: 18px; }
+    .auth-view-title p { margin: 4px 0 0; color: var(--muted); font-size: 10px; }
+    .auth-insights { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 10px; margin-bottom: 12px; }
+    .auth-insight { padding: 13px 14px; border: 1px solid rgba(75,148,210,.24); border-left: 3px solid var(--insight-color); border-radius: 9px; background: rgba(6,24,42,.78); }
+    .auth-insight strong { display: block; margin-bottom: 5px; color: var(--insight-color); font-size: 11px; }
+    .auth-insight span { color: #b8c8dc; font-size: 9px; line-height: 1.5; }
+    .auth-mobile-tabs { display: none; gap: 6px; overflow-x: auto; margin-bottom: 12px; padding-bottom: 3px; }
+    .auth-mobile-tabs button { flex: 0 0 auto; padding: 7px 10px; border: 1px solid rgba(75,148,210,.25); border-radius: 7px; color: #aebed3; background: rgba(5,23,40,.82); font-size: 9px; }
+    .auth-mobile-tabs button.active { color: var(--cyan); border-color: var(--cyan); }
     body.auth-control-open #detail-view > .detail-header { display: none; }
     .wide { grid-column: 1 / -1; }
     .status-normal, .status-running, .status-ok { color: var(--green); }
@@ -939,6 +950,8 @@
       .auth-dashboard { grid-template-columns: 1fr; }
       .auth-sidebar { display: none; }
       .auth-main { padding: 14px 10px 18px; }
+      .auth-mobile-tabs { display: flex; }
+      .auth-insights { grid-template-columns: 1fr; }
     }
     @media (max-width: 480px) {
       .auth-instruments { grid-template-columns: 1fr; }
@@ -1653,11 +1666,21 @@
       return `<article class="auth-dial-card"><div class="auth-dial-title">${escapeHtml(title)}</div><div class="auth-dial" style="--dial-value:${safeValue};--dial-color:${color}"><div class="auth-dial-center"><span class="auth-dial-value">${shown}</span><span class="auth-dial-state">${escapeHtml(state)}</span></div></div><div class="auth-dial-foot">${escapeHtml(foot)}</div></article>`;
     }
 
+    function setAuthView(button, view) {
+      const dashboard = button.closest(".auth-dashboard");
+      if (!dashboard) return;
+      dashboard.querySelectorAll("[data-auth-view]").forEach(node => { node.hidden = node.dataset.authView !== view; });
+      dashboard.querySelectorAll("[data-auth-target]").forEach(node => node.classList.toggle("active", node.dataset.authTarget === view));
+    }
+
     function renderAuthDashboard(dashboard, connector, serviceRows) {
       const summary = dashboard.summary || {};
       const services = dashboard.services || [];
       const alerts = dashboard.alerts || [];
       const activity = dashboard.recent_activity || [];
+      const serviceUsage = dashboard.service_usage_24h || [];
+      const callerUsage = dashboard.caller_usage_24h || [];
+      const insights = dashboard.operational_insights || [];
       const serviceTable = services.map(item => `<tr>
         <td class="auth-service">${escapeHtml(item.service.replace(/_/g, " "))}</td>
         <td>${escapeHtml(item.manager)}</td>
@@ -1672,6 +1695,10 @@
         <td class="auth-action">${escapeHtml(item.action || "Unknown")}</td><td>${escapeHtml(item.caller || "Unknown")}</td>
         <td>${authBadge(item.ok ? "pass" : "fail", item.ok ? "PASS" : "FAIL")}</td><td>${escapeHtml(item.duration_ms == null ? "—" : `${item.duration_ms} ms`)}</td>
       </tr>`).join("");
+      const usageTable = serviceUsage.map((item, index) => `<tr><td>${index + 1}</td><td class="auth-service">${escapeHtml((item.service || "unknown").replace(/_/g, " "))}</td><td>${escapeHtml(item.runs)}</td><td>${escapeHtml(item.success_rate)}%</td><td>${escapeHtml(item.failures)}</td><td>${item.average_duration_ms == null ? "—" : `${escapeHtml(item.average_duration_ms)} ms`}</td><td>${item.max_duration_ms == null ? "—" : `${escapeHtml(item.max_duration_ms)} ms`}</td></tr>`).join("");
+      const callerTable = callerUsage.map((item, index) => `<tr><td>${index + 1}</td><td>${escapeHtml(item.caller)}</td><td>${escapeHtml(item.runs)}</td><td>${escapeHtml(item.success_rate)}%</td><td>${escapeHtml(item.failures)}</td><td>${item.average_duration_ms == null ? "—" : `${escapeHtml(item.average_duration_ms)} ms`}</td></tr>`).join("");
+      const credentialTable = services.map(item => `<tr><td class="auth-service">${escapeHtml(item.service.replace(/_/g, " "))}</td><td>${authBadge(item.state)}</td><td>${escapeHtml(item.token_expiry)}</td><td>${escapeHtml(authDate(item.last_verified_at))}</td><td>${escapeHtml(item.verification_action)}</td></tr>`).join("");
+      const insightBody = insights.length ? `<div class="auth-insights">${insights.map(item => `<div class="auth-insight" style="--insight-color:${item.level === "warning" ? "var(--amber)" : item.level === "error" ? "var(--red)" : "var(--cyan)"}"><strong>${escapeHtml(item.title)}</strong><span>${escapeHtml(item.message)}</span></div>`).join("")}</div>` : "";
       const runtimeState = connector.api_ok && connector.container_health === "healthy" ? "healthy" : connector.api_ok ? "warning" : "error";
       const managed = Number(summary.managed || 0);
       const healthy = Number(summary.healthy || 0);
@@ -1688,13 +1715,14 @@
       return `<div class="auth-dashboard">
         <aside class="auth-sidebar">
           <nav class="auth-side-nav" aria-label="Authentication control sections">
-            <span class="auth-side-item active"><i>⌂</i>Overview</span>
-            <span class="auth-side-item"><i>⚙</i>Services</span>
-            <span class="auth-side-item"><i>◉</i>Connections</span>
-            <span class="auth-side-item"><i>♧</i>Alerts</span>
-            <span class="auth-side-item"><i>▤</i>Activity</span>
-            <span class="auth-side-item"><i>♢</i>Permissions</span>
-            <span class="auth-side-item"><i>⚙</i>Settings</span>
+            <button class="auth-side-item active" data-auth-target="overview" onclick="setAuthView(this,'overview')"><i>⌂</i>Overview</button>
+            <button class="auth-side-item" data-auth-target="credentials" onclick="setAuthView(this,'credentials')"><i>◉</i>Credentials</button>
+            <button class="auth-side-item" data-auth-target="services" onclick="setAuthView(this,'services')"><i>⚙</i>Services</button>
+            <button class="auth-side-item" data-auth-target="agents" onclick="setAuthView(this,'agents')"><i>◆</i>Agents</button>
+            <button class="auth-side-item" data-auth-target="alerts" onclick="setAuthView(this,'alerts')"><i>♧</i>Alerts</button>
+            <button class="auth-side-item" data-auth-target="activity" onclick="setAuthView(this,'activity')"><i>▤</i>Activity</button>
+            <button class="auth-side-item" data-auth-target="permissions" onclick="setAuthView(this,'permissions')"><i>♢</i>Permissions</button>
+            <button class="auth-side-item" data-auth-target="settings" onclick="setAuthView(this,'settings')"><i>⚙</i>Settings</button>
           </nav>
           <div class="auth-side-foot">
             <div class="auth-manager-pill"><span>◉ OpenConnector</span><b>LIVE</b></div>
@@ -1704,6 +1732,9 @@
         </aside>
         <main class="auth-main">
           <section class="auth-hero"><div><div class="auth-eyebrow">PLACHEM Security Operations</div><h2>Authentication Control Center</h2><p>Real-time monitoring of centralized credentials, connection health and READ verification activity.</p></div><a class="auth-console-link" href="${escapeHtml(connector.console_url || dashboard.console_url)}" target="_blank" rel="noopener noreferrer">Open Admin Console&nbsp; ›</a></section>
+          <nav class="auth-mobile-tabs">${["overview","credentials","services","agents","alerts","activity","permissions","settings"].map((view,index)=>`<button class="${index===0?"active":""}" data-auth-target="${view}" onclick="setAuthView(this,'${view}')">${view[0].toUpperCase()+view.slice(1)}</button>`).join("")}</nav>
+          <div class="auth-view" data-auth-view="overview">
+          ${insightBody}
           <section class="auth-instruments">
             ${authDial("Connection Health", healthRate, errors ? "Critical" : warning || unverified ? "Attention" : "Healthy", `${healthy} of ${managed} connections healthy`, healthColor)}
             ${authDial("24h Run Success", successRate, successRate == null ? "No sample" : successRate >= 95 ? "Stable" : successRate >= 80 ? "Watch" : "Degraded", `${summary.runs_24h || 0} authentication runs sampled`, successColor)}
@@ -1722,6 +1753,14 @@
           </div>
           <section class="auth-panel" style="margin-top:12px"><div class="auth-panel-head"><h3>Recent Authentication Activity</h3><span>Latest sampled runs</span></div><div class="auth-table-wrap"><table class="auth-table"><thead><tr><th>Completed</th><th>Service</th><th>Action</th><th>Caller</th><th>Result</th><th>Duration</th></tr></thead><tbody>${activityTable}</tbody></table></div></section>
           <div class="auth-scope-note">ManyFast, Postiz social channels and Producer YouTube use dedicated authentication managers. They will be added only after verifiable health checks are connected; no assumed status is displayed.</div>
+          </div>
+          <div class="auth-view" data-auth-view="credentials" hidden><div class="auth-view-title"><div><h3>Credential Lifecycle</h3><p>Validity visibility, last verification and renewal readiness</p></div>${authBadge(summary.expiry_unknown ? "warning" : "healthy", `${summary.expiry_unknown || 0} expiry unknown`)}</div><section class="auth-panel"><div class="auth-table-wrap"><table class="auth-table"><thead><tr><th>Service</th><th>Health</th><th>Expiry visibility</th><th>Last verified</th><th>Verification action</th></tr></thead><tbody>${credentialTable}</tbody></table></div></section><div class="auth-scope-note">Unknown expiry is a monitoring gap, not a healthy result. Provider metadata collectors are required before automatic 30/7/3-day expiry alerts can be enabled.</div></div>
+          <div class="auth-view" data-auth-view="services" hidden><div class="auth-view-title"><div><h3>Service Usage Ranking</h3><p>Last 24 hours · up to 100 sampled authentication runs</p></div><span>${serviceUsage.length} active services</span></div><section class="auth-panel"><div class="auth-table-wrap"><table class="auth-table"><thead><tr><th>Rank</th><th>Service</th><th>Runs</th><th>Success</th><th>Failures</th><th>Average</th><th>Maximum</th></tr></thead><tbody>${usageTable}</tbody></table></div></section></div>
+          <div class="auth-view" data-auth-view="agents" hidden><div class="auth-view-title"><div><h3>Agent & Caller Usage</h3><p>Caller attribution from OpenConnector run logs</p></div></div><section class="auth-panel"><div class="auth-table-wrap"><table class="auth-table"><thead><tr><th>Rank</th><th>Caller</th><th>Runs</th><th>Success</th><th>Failures</th><th>Average</th></tr></thead><tbody>${callerTable}</tbody></table></div></section><div class="auth-scope-note">If callers appear only as “http”, agent identity is not yet propagated by the runtime. This screen exposes the attribution gap instead of assigning guessed agent names.</div></div>
+          <div class="auth-view" data-auth-view="alerts" hidden><div class="auth-view-title"><div><h3>Alerts & Required Actions</h3><p>Current failures, stale checks and monitoring gaps</p></div>${authBadge(alerts.length ? "warning" : "healthy", `${alerts.length} active`)}</div>${insightBody}<section class="auth-panel">${alertBody}</section></div>
+          <div class="auth-view" data-auth-view="activity" hidden><div class="auth-view-title"><div><h3>Authentication Activity</h3><p>Latest secret-free run history</p></div></div><section class="auth-panel"><div class="auth-table-wrap"><table class="auth-table"><thead><tr><th>Completed</th><th>Service</th><th>Action</th><th>Caller</th><th>Result</th><th>Duration</th></tr></thead><tbody>${activityTable}</tbody></table></div></section></div>
+          <div class="auth-view" data-auth-view="permissions" hidden><div class="auth-view-title"><div><h3>Permissions</h3><p>Runtime scope and least-privilege visibility</p></div>${authBadge("warning","inventory pending")}</div><section class="auth-panel"><div class="auth-empty" style="color:var(--amber)">Permission-loan events are not yet emitted by OpenConnector. Current Action usage is visible in Activity; WRITE and ADMIN grants will remain unreported until a verifiable audit source is connected.</div></section></div>
+          <div class="auth-view" data-auth-view="settings" hidden><div class="auth-view-title"><div><h3>Monitoring Policy</h3><p>Read-only operational thresholds currently applied</p></div></div><section class="auth-panel" style="padding:15px">${kv([["Fresh verification","Within 24 hours"],["Attention","Older than 24 hours or unverified"],["Critical","Connection missing or latest READ failed"],["Expiry alerts","Pending provider metadata"],["Sample window","Latest 100 runs / 24 hours"],["Secret display","Always disabled"]])}</section></div>
         </main>
       </div>`;
     }

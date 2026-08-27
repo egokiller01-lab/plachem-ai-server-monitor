@@ -951,6 +951,57 @@ def get_openconnector_dashboard() -> dict[str, Any]:
     success_count = sum(1 for run in day_runs if run.get("ok") is True)
     success_rate = round(success_count / len(day_runs) * 100, 1) if day_runs else None
     counts = {key: sum(1 for item in services if item["state"] == key) for key in ("healthy", "warning", "error", "unverified")}
+
+    def summarize_runs(group_key: str) -> list[dict[str, Any]]:
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for run in day_runs:
+            label = str(run.get(group_key) or "unknown")
+            grouped.setdefault(label, []).append(run)
+        result = []
+        for label, items in grouped.items():
+            durations = [float(item["durationMs"]) for item in items if isinstance(item.get("durationMs"), (int, float))]
+            successes = sum(1 for item in items if item.get("ok") is True)
+            result.append({
+                group_key: label,
+                "runs": len(items),
+                "successes": successes,
+                "failures": len(items) - successes,
+                "success_rate": round(successes / len(items) * 100, 1),
+                "average_duration_ms": round(sum(durations) / len(durations), 1) if durations else None,
+                "max_duration_ms": round(max(durations), 1) if durations else None,
+            })
+        return sorted(result, key=lambda item: (-item["runs"], item[group_key]))
+
+    service_usage = summarize_runs("service")
+    caller_usage = summarize_runs("caller")
+    expiry_known = sum(1 for item in services if item["token_expiry"] != "Not exposed by provider")
+    operational_insights: list[dict[str, str]] = []
+    if counts["error"] == 0 and success_rate is not None and success_rate < 95:
+        operational_insights.append({
+            "level": "info",
+            "title": "Current health recovered",
+            "message": f"All current connections are healthy, while the 24-hour run success rate is {success_rate}%. Historical recovery failures remain in the sample.",
+        })
+    if service_usage:
+        busiest = service_usage[0]
+        operational_insights.append({
+            "level": "info",
+            "title": "Most used service",
+            "message": f"{busiest['service']} ranks first with {busiest['runs']} of {len(day_runs)} sampled runs in the last 24 hours.",
+        })
+        risky = max(service_usage, key=lambda item: (item["failures"], item["runs"]))
+        if risky["failures"]:
+            operational_insights.append({
+                "level": "warning",
+                "title": "Failure concentration",
+                "message": f"{risky['service']} has the highest sampled failure count ({risky['failures']}). Review its recovery history before requesting new authentication.",
+            })
+    if expiry_known < len(services):
+        operational_insights.append({
+            "level": "warning",
+            "title": "Expiry visibility gap",
+            "message": f"Token expiry is not exposed for {len(services) - expiry_known} of {len(services)} central connections. These are unknown, not confirmed safe.",
+        })
     recent_activity = [{
         "service": run.get("service"),
         "action": run.get("actionId"),
@@ -960,8 +1011,11 @@ def get_openconnector_dashboard() -> dict[str, Any]:
         "duration_ms": run.get("durationMs"),
     } for run in runs[:20] if isinstance(run, dict)]
     return {
-        "summary": {"managed": len(services), **counts, "runs_24h": len(day_runs), "success_rate_24h": success_rate},
+        "summary": {"managed": len(services), **counts, "runs_24h": len(day_runs), "success_rate_24h": success_rate, "expiry_known": expiry_known, "expiry_unknown": len(services) - expiry_known},
         "services": services,
+        "service_usage_24h": service_usage,
+        "caller_usage_24h": caller_usage,
+        "operational_insights": operational_insights,
         "alerts": alerts,
         "recent_activity": recent_activity,
         "checked_at": int(now),

@@ -31,6 +31,9 @@ class OpenConnectorDashboardTests(unittest.TestCase):
         self.assertEqual(dashboard["summary"]["managed"], 13)
         self.assertEqual(dashboard["summary"]["healthy"], 13)
         self.assertEqual(dashboard["summary"]["success_rate_24h"], 100.0)
+        self.assertEqual(dashboard["summary"]["expiry_unknown"], 13)
+        self.assertEqual(len(dashboard["service_usage_24h"]), 13)
+        self.assertEqual(dashboard["caller_usage_24h"][0]["caller"], "http")
         self.assertNotIn("private account", str(dashboard))
         self.assertNotIn("must not leak", str(dashboard))
 
