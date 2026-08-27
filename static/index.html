@@ -851,37 +851,50 @@
     .detail-table th { color: var(--muted); font-weight: 650; }
     .detail-table td { color: var(--text); }
 
-    .auth-dashboard { grid-column: 1 / -1; display: grid; gap: 10px; }
-    .auth-hero { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; padding: 15px 16px; border: 1px solid rgba(32, 217, 246, .38); border-radius: 10px; background: linear-gradient(135deg, rgba(13, 40, 73, .94), rgba(5, 17, 32, .96)); }
+    .auth-dashboard { grid-column: 1 / -1; display: grid; grid-template-columns: 208px minmax(0, 1fr); min-height: 820px; overflow: hidden; border: 1px solid rgba(36, 153, 207, .26); border-radius: 16px; background: rgba(3, 14, 27, .82); box-shadow: 0 22px 70px rgba(0,0,0,.30); }
+    .auth-sidebar { display: flex; flex-direction: column; padding: 18px 12px 14px; border-right: 1px solid rgba(36, 153, 207, .19); background: linear-gradient(180deg, rgba(7, 31, 54, .96), rgba(3, 18, 33, .98)); }
+    .auth-side-nav { display: grid; gap: 6px; }
+    .auth-side-item { display: flex; align-items: center; gap: 11px; min-height: 42px; padding: 0 12px; border-radius: 8px; color: #c4d2e7; font-size: 12px; font-weight: 650; }
+    .auth-side-item i { width: 18px; color: #b9c9df; font-size: 15px; font-style: normal; text-align: center; }
+    .auth-side-item.active { color: #35d8ff; background: linear-gradient(90deg, rgba(0, 125, 196, .30), rgba(0, 94, 154, .13)); box-shadow: inset 3px 0 #18c7f4; }
+    .auth-side-item.active i { color: #35d8ff; }
+    .auth-side-foot { margin-top: auto; display: grid; gap: 10px; }
+    .auth-manager-pill { display: flex; align-items: center; justify-content: space-between; padding: 11px 12px; border: 1px solid rgba(48, 161, 207, .24); border-radius: 8px; color: #d7e7f8; background: rgba(10, 39, 62, .72); font-size: 11px; }
+    .auth-manager-pill b { color: var(--green); font-size: 9px; }
+    .auth-system-state { display: flex; align-items: center; gap: 7px; color: var(--green); font-size: 10px; }
+    .auth-system-state::before { content:""; width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 9px var(--green); }
+    .auth-main { min-width: 0; padding: 21px 22px 24px; }
+    .auth-hero { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 0 2px 18px; }
     .auth-eyebrow { color: var(--cyan); font-size: 9px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase; }
-    .auth-hero h2 { margin: 4px 0 5px; font-size: 19px; }
-    .auth-hero p { margin: 0; max-width: 510px; color: var(--muted); font-size: 10px; line-height: 1.5; }
-    .auth-console-link { flex: 0 0 auto; padding: 8px 11px; border: 1px solid rgba(32, 217, 246, .45); border-radius: 7px; color: var(--cyan); background: rgba(16, 69, 91, .25); font-size: 10px; font-weight: 750; text-decoration: none; }
-    .auth-tabs { display: flex; gap: 5px; overflow-x: auto; padding: 4px; border: 1px solid rgba(75, 148, 210, .23); border-radius: 8px; background: rgba(4, 15, 29, .82); }
+    .auth-hero h2 { margin: 3px 0 5px; font-size: 23px; }
+    .auth-hero p { margin: 0; max-width: 650px; color: var(--muted); font-size: 11px; line-height: 1.5; }
+    .auth-console-link { flex: 0 0 auto; padding: 10px 14px; border: 1px solid rgba(32, 217, 246, .42); border-radius: 8px; color: #edfaff; background: linear-gradient(135deg, rgba(11, 46, 73, .92), rgba(5, 25, 43, .92)); font-size: 11px; font-weight: 750; text-decoration: none; }
+    .auth-tabs { display: none; }
     .auth-tab { padding: 7px 10px; border-radius: 6px; color: var(--muted); font-size: 10px; white-space: nowrap; }
     .auth-tab.active { color: white; background: linear-gradient(135deg, rgba(43, 119, 245, .7), rgba(20, 185, 210, .42)); box-shadow: 0 0 14px rgba(32, 217, 246, .16); }
-    .auth-kpis { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 7px; }
-    .auth-kpi { min-height: 73px; padding: 10px 11px; border: 1px solid rgba(75, 148, 210, .28); border-radius: 8px; background: linear-gradient(145deg, rgba(12, 31, 56, .92), rgba(5, 15, 29, .92)); }
-    .auth-kpi span { display: block; color: var(--muted); font-size: 9px; }
-    .auth-kpi strong { display: block; margin-top: 8px; font-size: 21px; line-height: 1; }
-    .auth-kpi small { display: block; margin-top: 5px; color: var(--muted); font-size: 8px; }
+    .auth-kpis { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; margin-bottom: 18px; }
+    .auth-kpi { min-height: 112px; padding: 16px 15px; border: 1px solid rgba(75, 148, 210, .28); border-radius: 11px; background: linear-gradient(145deg, rgba(10, 36, 60, .93), rgba(5, 20, 36, .95)); box-shadow: inset 0 0 30px rgba(28, 151, 198, .035); }
+    .auth-kpi span { display: block; color: #b8cae1; font-size: 11px; }
+    .auth-kpi strong { display: block; margin-top: 11px; font-size: 28px; line-height: 1; }
+    .auth-kpi small { display: block; margin-top: 8px; color: var(--muted); font-size: 9px; }
     .auth-kpi.good strong { color: var(--green); } .auth-kpi.warn strong { color: var(--amber); } .auth-kpi.bad strong { color: var(--red); } .auth-kpi.info strong { color: var(--cyan); }
-    .auth-panel { overflow: hidden; border: 1px solid rgba(75, 148, 210, .27); border-radius: 9px; background: linear-gradient(145deg, rgba(10, 26, 48, .9), rgba(4, 12, 24, .92)); }
-    .auth-panel-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 11px 13px; border-bottom: 1px solid rgba(75, 148, 210, .18); }
-    .auth-panel-head h3 { margin: 0; font-size: 12px; }
-    .auth-panel-head span { color: var(--muted); font-size: 9px; }
+    .auth-panel { overflow: hidden; border: 1px solid rgba(75, 148, 210, .27); border-radius: 11px; background: linear-gradient(145deg, rgba(8, 30, 51, .92), rgba(4, 18, 33, .94)); }
+    .auth-panel-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 15px 16px; border-bottom: 1px solid rgba(75, 148, 210, .18); }
+    .auth-panel-head h3 { margin: 0; font-size: 14px; }
+    .auth-panel-head span { color: var(--muted); font-size: 10px; }
     .auth-table-wrap { width: 100%; overflow-x: auto; }
-    .auth-table { width: 100%; min-width: 690px; border-collapse: collapse; font-size: 10px; }
-    .auth-table th { padding: 8px 11px; color: #8295b7; background: rgba(3, 13, 26, .55); font-size: 8px; letter-spacing: .07em; text-align: left; text-transform: uppercase; }
-    .auth-table td { padding: 9px 11px; border-top: 1px solid rgba(154, 179, 214, .1); color: #dfe9fb; }
+    .auth-table { width: 100%; min-width: 760px; border-collapse: collapse; font-size: 11px; }
+    .auth-table th { padding: 11px 14px; color: #8da4c2; background: rgba(8, 35, 56, .66); font-size: 9px; letter-spacing: .04em; text-align: left; text-transform: uppercase; }
+    .auth-table td { padding: 12px 14px; border-top: 1px solid rgba(154, 179, 214, .1); color: #e3edf9; }
     .auth-service { font-weight: 750; text-transform: capitalize; }
     .auth-action { max-width: 210px; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 8px; overflow-wrap: anywhere; }
     .auth-badge { display: inline-flex; align-items: center; gap: 5px; padding: 3px 7px; border: 1px solid currentColor; border-radius: 999px; font-size: 8px; font-weight: 800; text-transform: uppercase; }
     .auth-badge::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor; box-shadow: 0 0 8px currentColor; }
     .auth-badge.healthy, .auth-badge.pass { color: var(--green); } .auth-badge.warning, .auth-badge.unverified { color: var(--amber); } .auth-badge.error, .auth-badge.fail { color: var(--red); }
-    .auth-two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .auth-two-col { display: grid; grid-template-columns: 1.2fr .8fr; gap: 12px; margin-top: 12px; }
     .auth-empty { padding: 18px 13px; color: var(--green); font-size: 10px; }
-    .auth-scope-note { padding: 10px 12px; border-left: 2px solid var(--amber); color: var(--muted); background: rgba(255, 178, 28, .05); font-size: 9px; line-height: 1.5; }
+    .auth-scope-note { margin-top: 12px; padding: 12px 14px; border-left: 2px solid var(--amber); color: var(--muted); background: rgba(255, 178, 28, .05); font-size: 10px; line-height: 1.5; }
+    body.auth-control-open #detail-view > .detail-header { display: none; }
     .wide { grid-column: 1 / -1; }
     .status-normal, .status-running, .status-ok { color: var(--green); }
     .status-warning, .status-unknown, .status-stopped { color: var(--amber); }
@@ -901,6 +914,9 @@
       .auth-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .auth-two-col { grid-template-columns: 1fr; }
       .auth-hero { flex-direction: column; }
+      .auth-dashboard { grid-template-columns: 1fr; }
+      .auth-sidebar { display: none; }
+      .auth-main { padding: 14px 10px 18px; }
     }
 
     /* Premium PLACHEM dashboard refresh */
@@ -1096,6 +1112,10 @@
 
     @media (min-width: 900px) {
       .gpu-grid, .agent-grid, .codex-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    body.auth-control-open .shell { width: min(1400px, calc(100vw - 32px)); max-width: none; }
+    @media (max-width: 720px) {
+      body.auth-control-open .shell { width: calc(100vw - 20px); }
     }
   </style>
 </head>
@@ -1621,23 +1641,39 @@
       </tr>`).join("");
       const runtimeState = connector.api_ok && connector.container_health === "healthy" ? "healthy" : connector.api_ok ? "warning" : "error";
       return `<div class="auth-dashboard">
-        <section class="auth-hero"><div><div class="auth-eyebrow">PLACHEM Security Operations</div><h2>Authentication Control Center</h2><p>Centralized connection health, real READ verification results and authentication activity. Secret values and account details are never displayed.</p></div><a class="auth-console-link" href="${escapeHtml(connector.console_url || dashboard.console_url)}" target="_blank" rel="noopener noreferrer">Open Admin Console ↗</a></section>
-        <nav class="auth-tabs" aria-label="Authentication sections"><span class="auth-tab active">Overview</span><span class="auth-tab">Services</span><span class="auth-tab">Connections</span><span class="auth-tab">Alerts</span><span class="auth-tab">Activity</span><span class="auth-tab">Permissions</span><span class="auth-tab">Settings</span></nav>
-        <section class="auth-kpis">
-          <div class="auth-kpi info"><span>Managed connections</span><strong>${escapeHtml(summary.managed ?? 0)}</strong><small>OpenConnector central pool</small></div>
-          <div class="auth-kpi good"><span>Healthy</span><strong>${escapeHtml(summary.healthy ?? 0)}</strong><small>READ verified ≤ 24h</small></div>
-          <div class="auth-kpi warn"><span>Attention</span><strong>${escapeHtml((summary.warning || 0) + (summary.unverified || 0))}</strong><small>Warning + unverified</small></div>
-          <div class="auth-kpi bad"><span>Failures</span><strong>${escapeHtml(summary.error ?? 0)}</strong><small>Connection or READ error</small></div>
-          <div class="auth-kpi info"><span>24h success rate</span><strong>${summary.success_rate_24h == null ? "—" : `${escapeHtml(summary.success_rate_24h)}%`}</strong><small>${escapeHtml(summary.runs_24h ?? 0)} sampled runs</small></div>
-          <div class="auth-kpi ${runtimeState === "healthy" ? "good" : runtimeState === "error" ? "bad" : "warn"}"><span>OpenConnector runtime</span><strong>${authBadge(runtimeState, connector.api_ok ? "ONLINE" : "OFFLINE")}</strong><small>${escapeHtml(connector.response_ms == null ? "No response" : `${connector.response_ms} ms response`)}</small></div>
-        </section>
-        <section class="auth-panel"><div class="auth-panel-head"><h3>Central connections</h3><span>Actual OpenConnector connections · secret-free</span></div><div class="auth-table-wrap"><table class="auth-table"><thead><tr><th>Service</th><th>Manager</th><th>State</th><th>Last READ verification</th><th>Duration</th><th>Verification action</th></tr></thead><tbody>${serviceTable}</tbody></table></div></section>
-        <div class="auth-two-col">
-          <section class="auth-panel"><div class="auth-panel-head"><h3>Alerts & required actions</h3><span>${escapeHtml(alerts.length)} active</span></div>${alertBody}</section>
-          <section class="auth-panel"><div class="auth-panel-head"><h3>Runtime status</h3><span>OpenConnector infrastructure</span></div>${kv([["API health", connector.api_ok ? "PASS" : "FAIL"], ["Container", connector.container_status || "unknown"], ["Docker health", connector.container_health || "unknown"], ["Restarts", connector.restart_count ?? "unknown"], ["Image", connector.image || "unknown"]])}</section>
-        </div>
-        <section class="auth-panel"><div class="auth-panel-head"><h3>Recent authentication activity</h3><span>Latest sampled runs</span></div><div class="auth-table-wrap"><table class="auth-table"><thead><tr><th>Completed</th><th>Service</th><th>Action</th><th>Caller</th><th>Result</th><th>Duration</th></tr></thead><tbody>${activityTable}</tbody></table></div></section>
-        <div class="auth-scope-note">ManyFast, Postiz social channels and Producer YouTube use dedicated authentication managers. They will appear here only after their health checks are connected to a verifiable monitoring API; no assumed status is displayed.</div>
+        <aside class="auth-sidebar">
+          <nav class="auth-side-nav" aria-label="Authentication control sections">
+            <span class="auth-side-item active"><i>⌂</i>Overview</span>
+            <span class="auth-side-item"><i>⚙</i>Services</span>
+            <span class="auth-side-item"><i>◉</i>Connections</span>
+            <span class="auth-side-item"><i>♧</i>Alerts</span>
+            <span class="auth-side-item"><i>▤</i>Activity</span>
+            <span class="auth-side-item"><i>♢</i>Permissions</span>
+            <span class="auth-side-item"><i>⚙</i>Settings</span>
+          </nav>
+          <div class="auth-side-foot">
+            <div class="auth-manager-pill"><span>◉ OpenConnector</span><b>LIVE</b></div>
+            <div class="auth-system-state">System Normal</div>
+            <small>Last updated ${escapeHtml(authDate(dashboard.generated_at))}</small>
+          </div>
+        </aside>
+        <main class="auth-main">
+          <section class="auth-hero"><div><div class="auth-eyebrow">PLACHEM Security Operations</div><h2>Authentication Control Center</h2><p>Real-time monitoring of centralized credentials, connection health and READ verification activity.</p></div><a class="auth-console-link" href="${escapeHtml(connector.console_url || dashboard.console_url)}" target="_blank" rel="noopener noreferrer">Open Admin Console&nbsp; ›</a></section>
+          <section class="auth-kpis">
+            <div class="auth-kpi info"><span>Total Connections</span><strong>${escapeHtml(summary.managed ?? 0)}</strong><small>OpenConnector central pool</small></div>
+            <div class="auth-kpi good"><span>Healthy</span><strong>${escapeHtml(summary.healthy ?? 0)}</strong><small>READ verified ≤ 24h</small></div>
+            <div class="auth-kpi warn"><span>Attention</span><strong>${escapeHtml((summary.warning || 0) + (summary.unverified || 0))}</strong><small>Warning + unverified</small></div>
+            <div class="auth-kpi bad"><span>Failures</span><strong>${escapeHtml(summary.error ?? 0)}</strong><small>Connection or READ error</small></div>
+            <div class="auth-kpi info"><span>24h Success Rate</span><strong>${summary.success_rate_24h == null ? "—" : `${escapeHtml(summary.success_rate_24h)}%`}</strong><small>${escapeHtml(summary.runs_24h ?? 0)} sampled runs</small></div>
+          </section>
+          <section class="auth-panel"><div class="auth-panel-head"><h3>Connection Inventory</h3><span>Actual connections · secret-free · ${authBadge(runtimeState, connector.api_ok ? "ONLINE" : "OFFLINE")}</span></div><div class="auth-table-wrap"><table class="auth-table"><thead><tr><th>Service</th><th>Manager</th><th>Status</th><th>Last READ Verification</th><th>Duration</th><th>Verification Action</th></tr></thead><tbody>${serviceTable}</tbody></table></div></section>
+          <div class="auth-two-col">
+            <section class="auth-panel"><div class="auth-panel-head"><h3>Alerts & Required Actions</h3><span>${escapeHtml(alerts.length)} active</span></div>${alertBody}</section>
+            <section class="auth-panel"><div class="auth-panel-head"><h3>Runtime Status</h3><span>OpenConnector infrastructure</span></div>${kv([["API health", connector.api_ok ? "PASS" : "FAIL"], ["Response", connector.response_ms == null ? "Unknown" : `${connector.response_ms} ms`], ["Container", connector.container_status || "unknown"], ["Docker health", connector.container_health || "unknown"], ["Restarts", connector.restart_count ?? "unknown"]])}</section>
+          </div>
+          <section class="auth-panel" style="margin-top:12px"><div class="auth-panel-head"><h3>Recent Authentication Activity</h3><span>Latest sampled runs</span></div><div class="auth-table-wrap"><table class="auth-table"><thead><tr><th>Completed</th><th>Service</th><th>Action</th><th>Caller</th><th>Result</th><th>Duration</th></tr></thead><tbody>${activityTable}</tbody></table></div></section>
+          <div class="auth-scope-note">ManyFast, Postiz social channels and Producer YouTube use dedicated authentication managers. They will be added only after verifiable health checks are connected; no assumed status is displayed.</div>
+        </main>
       </div>`;
     }
 
@@ -1799,6 +1835,7 @@
       const hash = pathMode ? "openclaw" : window.location.hash.replace("#", "").replace("/", "");
       currentOpenclaw = hash === "openclaw";
       currentDetail = !currentOpenclaw && ["cpu", "memory", "gpu", "disk", "network", "services"].includes(hash) ? hash : null;
+      document.body.classList.toggle("auth-control-open", currentDetail === "services");
       document.getElementById("main-view").classList.toggle("hidden", Boolean(currentDetail) || currentOpenclaw);
       document.getElementById("detail-view").classList.toggle("hidden", !currentDetail);
       document.getElementById("openclaw-view").classList.toggle("hidden", !currentOpenclaw);
