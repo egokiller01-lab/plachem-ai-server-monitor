@@ -508,7 +508,10 @@ def get_network() -> dict[str, Any]:
 
 VRAM_HEADROOM_THRESHOLD_GB = 2.0
 VRAM_HEADROOM_THRESHOLD_PERCENT = 10.0
-VRAM_CRITICAL_PERCENT = 97.0
+# A resident inference model commonly keeps VRAM above 97%. Treat capacity as
+# critical only when it is effectively exhausted; lower headroom remains a
+# warning unless an actual GPU/OOM error is observed.
+VRAM_CRITICAL_PERCENT = 99.5
 
 
 def _gpu_headroom_state(gpu: dict[str, Any]) -> tuple[str, float | None]:
