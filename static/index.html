@@ -1187,10 +1187,7 @@
       <div class="kpi amber"><span class="icon">🌡</span><span class="label">CPU TEMP</span><span id="kpi-cpu-temp" class="value">--</span></div>
     </section>
 
-    <section class="gpu-grid">
-      <article class="card gpu-unit-card clickable" data-detail="gpu" id="gpu-card-0"></article>
-      <article class="card gpu-unit-card clickable" data-detail="gpu" id="gpu-card-1"></article>
-    </section>
+    <section class="gpu-grid" id="gpu-grid"></section>
 
     <section class="codex-grid">
       <article class="card codex-card" id="codex-weekly-card">
@@ -1342,8 +1339,16 @@
     }
 
     function renderGpuCard(index, gpu) {
-      const card = document.getElementById(`gpu-card-${index}`);
-      if (!card) return;
+      const grid = document.getElementById("gpu-grid");
+      if (!grid) return;
+      let card = document.getElementById(`gpu-card-${index}`);
+      if (!card) {
+        card = document.createElement("article");
+        card.className = "card gpu-unit-card clickable";
+        card.dataset.detail = "gpu";
+        card.id = `gpu-card-${index}`;
+        grid.appendChild(card);
+      }
       if (!gpu) {
         card.innerHTML = `<div class="card-title"><span class="icon">▧</span><span>GPU ${index}</span></div><div class="gpu-unit-name">Unavailable</div>`;
         return;
@@ -1360,11 +1365,11 @@
         <div class="gpu-dashboard">
           <div class="gpu-gauge" style="--p:${load}"><div class="gpu-gauge-center"><div class="gpu-gauge-value">${percent(load)}</div><div class="gpu-gauge-label">GPU LOAD · 10s PEAK</div></div></div>
           <div class="gpu-unit-metrics">
-            <div class="gpu-unit-metric vram"><span>VRAM</span><strong>${formatGpuValue(gpu.vram_used_gb)} / ${formatGpuValue(gpu.vram_total_gb)} GB · ${percent(gpu.vram_usage_percent)}</strong></div>
+            <div class="gpu-unit-metric vram"><span>VRAM / headroom</span><strong>${formatGpuValue(gpu.vram_used_gb)} / ${formatGpuValue(gpu.vram_total_gb)} GB · ${percent(gpu.vram_usage_percent)} · ${formatGpuValue(gpu.vram_headroom_gb, " GB")}</strong></div>
             <div class="gpu-unit-metric temp"><span>Temperature</span><strong>${formatGpuValue(gpu.temperature_c, "°C")}</strong></div>
             <div class="gpu-unit-metric power"><span>Power</span><strong>${formatGpuValue(gpu.power_draw_w)} / ${formatGpuValue(gpu.power_limit_w)} W · ${powerPercent === null ? "--" : powerPercent + "%"}</strong></div>
             <div class="gpu-unit-metric fan"><span>Fan</span><strong>${percent(gpu.fan_speed_percent)}</strong></div>
-            <div class="gpu-unit-pcie">${gen} ${width} · Max ${maxWidth}</div>
+            <div class="gpu-unit-pcie">${gen} ${width} · Max ${maxWidth} · ${escapeHtml(gpu.vram_headroom_state || "unknown")}</div>
           </div>
         </div>`;
     }
@@ -1585,8 +1590,11 @@
         document.getElementById("kpi-disk").textContent = percent(disk.usage_percent);
         document.getElementById("kpi-cpu-temp").textContent = valueOrUnknown(cpu.temperature_c, "°C");
 
-        renderGpuCard(0, gpus[0]);
-        renderGpuCard(1, gpus[1]);
+        const gpuGrid = document.getElementById("gpu-grid");
+        if (gpuGrid) {
+          gpuGrid.querySelectorAll(".gpu-unit-card").forEach(node => { if (!gpus[Number(node.id.replace("gpu-card-", ""))]) node.remove(); });
+          gpus.forEach((item, index) => renderGpuCard(index, item));
+        }
         pushKpi("cpu", cpu.usage_percent);
         pushKpi("ram", mem.usage_percent);
         pushKpi("download", net.download_bps);
@@ -1752,13 +1760,13 @@
               <div class="auth-state-row" style="--state-color:var(--cyan)"><i></i><span>전체 관리</span><strong>${managed}</strong></div>
             </div><div class="auth-verdict" style="--verdict-color:${healthColor}">${escapeHtml(verdict)}</div></article>
           </section>
-          <section class="auth-panel"><div class="auth-panel-head"><h3>연결 목록</h3><span>실제 연결 · 비밀값 미표시 · ${authBadge(runtimeState, connector.api_ok ? "온라인" : "오프라인")}</span></div><div class="auth-table-wrap"><table class="auth-table"><thead><tr><th>서비스</th><th>관리자</th><th>상태</th><th>최근 READ 검증</th><th>소요시간</th><th>검증 작업</th></tr></thead><tbody>${serviceTable}</tbody></table></div></section>
+          <section class="auth-panel"><div class="auth-panel-head"><h3>연결 목록</h3><span>실제 연결 · 비밀값 미표시 · ${authBadge(runtimeState, connector.api_ok ? "온라인" : "오프라인")}</span></div><div class="auth-table-wrap"><table class="auth-table"><thead><tr><th>서비스</th><th>관리자</th><th>연결 가능/configured</th><th>상태</th><th>최근 READ 검증</th><th>최근 READ 성공</th><th>소요시간</th><th>검증 작업</th></tr></thead><tbody>${services.map(item => `<tr><td class="auth-service">${escapeHtml(item.service.replace(/_/g, " "))}</td><td>${escapeHtml(item.manager)}</td><td>${item.configured ? "예" : "아니오"}</td><td>${authBadge(item.state, authStateLabel(item.state))}<br><small>${escapeHtml(authStateReasonLabel(item.state_reason))}</small></td><td>${escapeHtml(authDate(item.last_verified_at))}</td><td>${escapeHtml(authDate(item.last_read_at))}</td><td>${escapeHtml(item.last_duration_ms == null ? "—" : `${item.last_duration_ms} ms`)}</td><td class="auth-action">${escapeHtml(item.verification_action)}</td></tr>`).join("")}</tbody></table></div></section>
           <div class="auth-two-col">
             <section class="auth-panel"><div class="auth-panel-head"><h3>경보 및 필요 조치</h3><span>${escapeHtml(alerts.length)}건 활성</span></div>${alertBody}</section>
             <section class="auth-panel"><div class="auth-panel-head"><h3>실행 환경 상태</h3><span>OpenConnector 인프라</span></div>${kv([["API 상태", connector.api_ok ? "정상" : "실패"], ["응답시간", connector.response_ms == null ? "미확인" : `${connector.response_ms} ms`], ["컨테이너", connector.container_status || "미확인"], ["Docker 상태", connector.container_health || "미확인"], ["재시작 횟수", connector.restart_count ?? "미확인"]])}</section>
           </div>
           <section class="auth-panel" style="margin-top:12px"><div class="auth-panel-head"><h3>최근 인증 활동</h3><span>최근 실행 표본</span></div><div class="auth-table-wrap"><table class="auth-table"><thead><tr><th>완료시각</th><th>서비스</th><th>작업</th><th>호출자</th><th>결과</th><th>소요시간</th></tr></thead><tbody>${activityTable}</tbody></table></div></section>
-          <div class="auth-scope-note">ManyFast, Postiz SNS 채널과 Producer YouTube는 전용 인증 관리자를 사용합니다. 검증 가능한 상태 점검이 연결된 후 추가하며, 확인되지 않은 상태는 임의로 표시하지 않습니다.</div>
+          <div class="auth-scope-note">ManyFast, Postiz SNS 채널과 Producer YouTube는 전용 인증 관리자를 사용합니다. ack/담당자/조치이력 쓰기와 토큰 만료일은 현재 미구현·Provider 미제공이며, 인증 없는 HTTP에 저장하지 않습니다.</div>
           </div>
           <div class="auth-view" data-auth-view="credentials" hidden><div class="auth-view-title"><div><h3>인증 수명주기</h3><p>유효기간 확인, 최근 검증과 갱신 준비 상태</p></div>${authBadge(summary.expiry_unknown ? "warning" : "healthy", `유효기간 미확인 ${summary.expiry_unknown || 0}건`)}</div><section class="auth-panel"><div class="auth-table-wrap"><table class="auth-table"><thead><tr><th>서비스</th><th>인증 유형</th><th>상태</th><th>상태 원인</th><th>유효기간 확인</th><th>마지막 READ</th><th>연결 설정 수정</th><th>OAuth Client 설정 수정</th><th>검증 작업</th></tr></thead><tbody>${credentialTable}</tbody></table></div></section><div class="auth-scope-note">메타데이터 출처: ${authMetadataSourceLabel(services[0] && services[0].metadata_source)} · 수집시각: ${authMetadataCollectedAt(services) ? escapeHtml(authDate(authMetadataCollectedAt(services))) : "미확인"}. 유효기간 미확인은 정상이 아니라 관제 공백입니다.</div></div>
           <div class="auth-view" data-auth-view="services" hidden><div class="auth-view-title"><div><h3>서비스 사용 순위</h3><p>최근 24시간 · 인증 실행 최대 100건 표본</p></div><span>사용 서비스 ${serviceUsage.length}개</span></div><section class="auth-panel"><div class="auth-table-wrap"><table class="auth-table"><thead><tr><th>순위</th><th>서비스</th><th>실행</th><th>성공률</th><th>실패</th><th>평균</th><th>최대</th></tr></thead><tbody>${usageTable}</tbody></table></div></section></div>
@@ -1791,8 +1799,8 @@
       if (type === "gpu") {
         const g = data.summary || {};
         return [
-          card("GPU", kv([["Name", g.name], ["Usage", percent(g.usage_percent)], ["VRAM", `${fmt(g.vram_used_gb)} / ${fmt(g.vram_total_gb)} GB`], ["VRAM usage", percent(g.vram_usage_percent)], ["Temperature", fmt(g.temperature_c, "°C")], ["Source", g.source || "Unknown"]])),
-          card("GPU Processes", table(["PID", "Name", "VRAM MB"], (data.processes || []).map(p => [p.pid, p.name, p.vram_mb])), true),
+          card("GPU", kv([["Name", g.name], ["Usage", percent(g.usage_percent)], ["VRAM", `${fmt(g.vram_used_gb)} / ${fmt(g.vram_total_gb)} GB`], ["VRAM usage", percent(g.vram_usage_percent)], ["Headroom", fmt(g.vram_headroom_gb, " GB")], ["Headroom state", g.vram_headroom_state || "Unknown"], ["Temperature", fmt(g.temperature_c, "°C")], ["Source", g.source || "Unknown"]])),
+          card("GPU Processes / model occupancy", table(["GPU", "PID", "Process / model", "VRAM MB"], (data.processes || []).map(p => [p.gpu_index ?? "Unknown", p.pid, p.name, p.vram_mb])), true),
         ].join("");
       }
       if (type === "disk") {

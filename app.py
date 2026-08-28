@@ -400,18 +400,22 @@ def probe_openclaw_gateway(config: dict[str, Any]) -> dict[str, Any]:
     token = gateway.get("auth", {}).get("token") if isinstance(gateway.get("auth"), dict) else None
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     started = time.time()
-    for path in ("/api/health", "/chat"):
-        try:
-            request = urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers=headers)
-            with urllib.request.urlopen(request, timeout=2.5) as response:
-                response_ms = round((time.time() - started) * 1000)
-                return {"state": "degraded" if response_ms > 1500 else "healthy", "ok": True, "port": port, "response_ms": response_ms, "checked_path": path, "http_status": response.status}
-        except urllib.error.HTTPError as exc:
-            if exc.code < 500:
-                return {"state": "degraded", "ok": True, "port": port, "response_ms": round((time.time() - started) * 1000), "checked_path": path, "http_status": exc.code}
-        except Exception:
-            continue
-    return {"state": "down", "ok": False, "port": port, "response_ms": round((time.time() - started) * 1000)}
+    try:
+        request = urllib.request.Request(f"http://127.0.0.1:{port}/health", headers=headers)
+        with urllib.request.urlopen(request, timeout=2.5) as response:
+            response_ms = round((time.time() - started) * 1000)
+            raw = response.read().decode("utf-8", errors="replace")
+            payload = json.loads(raw)
+            health_ok = response.status == 200 and (payload.get("ok") is True if isinstance(payload, dict) else False)
+            if not health_ok:
+                return {"state": "probe_failed", "ok": False, "port": port, "response_ms": response_ms, "checked_path": "/health", "http_status": response.status, "error": "invalid_health_response"}
+            return {"state": "degraded" if response_ms > 1500 else "healthy", "ok": True, "port": port, "response_ms": response_ms, "checked_path": "/health", "http_status": response.status}
+    except urllib.error.HTTPError as exc:
+        return {"state": "probe_failed" if exc.code < 500 else "down", "ok": False, "port": port, "response_ms": round((time.time() - started) * 1000), "checked_path": "/health", "http_status": exc.code, "error": "health_http_error"}
+    except (ConnectionRefusedError, TimeoutError, urllib.error.URLError, OSError):
+        return {"state": "down", "ok": False, "port": port, "response_ms": round((time.time() - started) * 1000), "checked_path": "/health", "error": "gateway_unreachable"}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {"state": "probe_failed", "ok": False, "port": port, "response_ms": round((time.time() - started) * 1000), "checked_path": "/health", "error": "invalid_health_response"}
 
 
 def collect_openclaw_status() -> dict[str, Any]:
@@ -502,6 +506,44 @@ def get_network() -> dict[str, Any]:
         return {"upload_bps": None, "download_bps": None, "status": "error", "error": str(exc)}
 
 
+VRAM_HEADROOM_THRESHOLD_GB = 2.0
+VRAM_HEADROOM_THRESHOLD_PERCENT = 10.0
+VRAM_CRITICAL_PERCENT = 97.0
+
+
+def _gpu_headroom_state(gpu: dict[str, Any]) -> tuple[str, float | None]:
+    vram_used = gpu.get("vram_used_gb")
+    vram_total = gpu.get("vram_total_gb")
+    vram_pct = gpu.get("vram_usage_percent")
+    if vram_used is None or vram_total is None:
+        return "unknown", None
+    headroom_gb = round(max(0.0, vram_total - vram_used), 2)
+    if vram_pct is not None and vram_pct >= VRAM_CRITICAL_PERCENT:
+        return "critical", headroom_gb
+    if headroom_gb < VRAM_HEADROOM_THRESHOLD_GB or vram_pct is not None and vram_pct >= 100 - VRAM_HEADROOM_THRESHOLD_PERCENT:
+        return "headroom_low", headroom_gb
+    return "ok", headroom_gb
+
+
+def gpu_risk_summary(gpus: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate all adapters; high VRAM is safe when measurable headroom remains."""
+    risks: list[str] = []
+    for item in gpus:
+        if item.get("status") == "error":
+            risks.append("error")
+            continue
+        state = item.get("vram_headroom_state")
+        if not isinstance(state, str):
+            state, _ = _gpu_headroom_state(item)
+        risks.append("error" if state == "critical" else "warning" if state in {"headroom_low", "unknown"} else "ok")
+    if not risks:
+        return {"risk": "warning", "headroom_gb": None, "temperature_c": None, "worst_index": None}
+    priority = {"error": 3, "warning": 2, "ok": 1}
+    worst_index = max(range(len(risks)), key=lambda index: priority[risks[index]])
+    worst = gpus[worst_index]
+    return {"risk": risks[worst_index], "headroom_gb": worst.get("vram_headroom_gb"), "temperature_c": worst.get("temperature_c"), "worst_index": worst_index}
+
+
 def _gpu_metrics_from_nvidia_smi_row(row: list[str], index: int) -> dict[str, Any] | None:
     name, gpu_util, mem_used, mem_total, temp = row[:5]
     uuid = row[5] if len(row) > 5 and row[5] else None
@@ -521,6 +563,9 @@ def _gpu_metrics_from_nvidia_smi_row(row: list[str], index: int) -> dict[str, An
     pcie_gen_max = row[11] if len(row) > 11 and row[11].isdigit() else None
     pcie_width_current = row[12] if len(row) > 12 and row[12].isdigit() else None
     pcie_width_max = row[13] if len(row) > 13 and row[13].isdigit() else None
+    headroom_state, headroom_gb = _gpu_headroom_state({
+        "vram_used_gb": used_gb, "vram_total_gb": total_gb, "vram_usage_percent": vram_percent,
+    })
     return {
         "index": index,
         "uuid": uuid,
@@ -529,6 +574,8 @@ def _gpu_metrics_from_nvidia_smi_row(row: list[str], index: int) -> dict[str, An
         "vram_used_gb": used_gb,
         "vram_total_gb": total_gb,
         "vram_usage_percent": vram_percent,
+        "vram_headroom_gb": headroom_gb,
+        "vram_headroom_state": headroom_state,
         "temperature_c": pct(temp),
         "power_draw_w": power_draw,
         "power_limit_w": power_limit,
@@ -704,6 +751,7 @@ def get_gpus_from_pynvml() -> list[dict[str, Any]]:
             "vram_used_gb": bytes_to_gb(mem_used),
             "vram_total_gb": bytes_to_gb(mem_total),
             "vram_usage_percent": pct((mem_used / mem_total) * 100 if mem_total else None),
+            "vram_headroom_gb": round(max(0.0, bytes_to_gb(mem_total) - bytes_to_gb(mem_used)), 2) if mem_used is not None and mem_total is not None else None,
             "temperature_c": temp,
             "power_draw_w": power_draw_w,
             "power_limit_w": power_limit_w,
@@ -716,6 +764,7 @@ def get_gpus_from_pynvml() -> list[dict[str, Any]]:
             "status": "ok",
             "source": "pynvml",
         })
+        out[-1]["vram_headroom_state"], _ = _gpu_headroom_state(out[-1])
     try:
         pynvml.nvmlShutdown()
     except Exception:
@@ -1764,13 +1813,33 @@ def api_status() -> dict[str, Any]:
         "source": "none",
     }
     services = get_services()
+    openclaw = collect_openclaw_status()
+    openconnector_error = None
+    try:
+        openconnector = get_openconnector_dashboard()
+    except Exception as exc:
+        openconnector_error = _sanitize_error(exc)
+        openconnector = {"summary": {"managed": 0, "healthy": 0, "warning": 0, "error": 0, "unverified": 0}}
 
     service_states = [item["state"] for item in services.values()]
+    gateway_state = openclaw.get("summary", {}).get("gateway", "unknown")
+    oc_summary = openconnector.get("summary", {})
+    oc_healthy = oc_summary.get("healthy", 0)
+    oc_total = oc_summary.get("managed", 0)
+    oc_unverified = oc_summary.get("unverified", 0)
+
+    gpu_summary = gpu_risk_summary(gpus)
+    gpu_risk = gpu_summary["risk"]
+    gpu_headroom_gb = gpu_summary["headroom_gb"]
+    gpu_temp_c = gpu_summary["temperature_c"]
+
     has_error = any(
-        item.get("status") == "error" for item in [cpu, memory, disk, network, gpu]
-    ) or "error" in service_states
-    has_warning = any(item.get("status") in {"unknown", "warming"} for item in [network, gpu]) or any(
+        item.get("status") == "error" for item in [cpu, memory, disk, network]
+    ) or "error" in service_states or gateway_state in {"down", "probe_failed"} or gpu_risk == "error"
+    has_warning = any(item.get("status") in {"unknown", "warming"} for item in [network]) or any(
         state in {"stopped", "unknown"} for state in service_states
+    ) or gateway_state == "degraded" or gpu_risk == "warning" or openconnector_error is not None or (
+        oc_total > 0 and oc_unverified > 0
     )
 
     overall = "error" if has_error else "warning" if has_warning else "normal"
@@ -1784,13 +1853,30 @@ def api_status() -> dict[str, Any]:
             "uptime": get_uptime(),
         },
         "overall": overall,
+        "overall_breakdown": {
+            "cpu": cpu.get("status"),
+            "memory": memory.get("status"),
+            "disk": disk.get("status"),
+            "network": network.get("status"),
+            "gpu": gpu_risk,
+            "services": {k: v.get("state") for k, v in services.items()},
+            "gateway": gateway_state,
+            "openconnector": {"healthy": oc_healthy, "total": oc_total, "unverified": oc_unverified, "state": "unavailable" if openconnector_error else "available"},
+        },
         "cpu": cpu,
         "memory": memory,
         "disk": disk,
         "network": network,
         "gpu": gpu,
         "gpus": gpus,
+        "gpu_risk": gpu_risk,
+        "gpu_headroom_gb": gpu_headroom_gb,
+        "gpu_temperature_c": gpu_temp_c,
         "services": services,
+        "gateway": openclaw.get("gateway"),
+        "openconnector_summary": oc_summary,
+        "openconnector_error": openconnector_error,
+        "gpu_risk_detail": gpu_summary,
     }
 
 
