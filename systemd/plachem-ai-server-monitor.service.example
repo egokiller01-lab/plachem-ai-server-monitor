@@ -10,7 +10,7 @@ WorkingDirectory=/opt/plachem-ai-server-monitor
 Environment=PLACHEM_MONITOR_SERVER_NAME=PLACHEM-AI-01
 Environment=PLACHEM_MONITOR_FOLDERS=/tmp
 Environment=PYTHONPATH=/opt/plachem-ai-server-monitor/.deps
-ExecStart=/usr/bin/python3 -m uvicorn app:app --host 0.0.0.0 --port 8088
+ExecStart=/usr/bin/python3 -m uvicorn app:app --host 127.0.0.1 --port 8088
 Restart=always
 RestartSec=3
 

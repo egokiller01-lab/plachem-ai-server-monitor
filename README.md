@@ -35,14 +35,12 @@ GPU data is collected from `nvidia-smi` first. If that fails, the app attempts `
 ```bash
 cd plachem-ai-server-monitor
 python3 -m pip install --target .deps -r requirements.txt
-PYTHONPATH=.deps python3 -m uvicorn app:app --host 0.0.0.0 --port 8088
+PYTHONPATH=.deps python3 -m uvicorn app:app --host 127.0.0.1 --port 8088
 ```
 
-Open:
-
-```text
-http://SERVER_IP:8088
-```
+Expose the loopback listener through an authenticated private reverse proxy
+(for example, Tailscale Serve) and use that HTTPS URL. Do not expose port 8088
+directly on the LAN or internet.
 
 ## API
 
