@@ -13,6 +13,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
+from datetime import datetime, timezone
 
 import psutil
 from fastapi import FastAPI, Request
@@ -922,6 +923,7 @@ def _parse_iso_timestamp(value: Any) -> float | None:
 def get_openconnector_dashboard() -> dict[str, Any]:
     """Return a secret-free authentication operations view from real run logs."""
     now = time.time()
+    metadata_collected_at = datetime.fromtimestamp(now, tz=timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
     connections = _openconnector_admin_get("/api/connections")
     run_page = _openconnector_admin_get("/api/runs?limit=100")
     runs = run_page.get("items", []) if isinstance(run_page, dict) else []
@@ -955,27 +957,47 @@ def get_openconnector_dashboard() -> dict[str, Any]:
         updates_for_service = updates.get(service) or {}
         verified_epoch = _parse_iso_timestamp(verified_at)
         configured = bool(connection and connection.get("configured"))
+        state: str
+        state_reason: str
         if run and run.get("ok") is False:
             state = "error"
+            state_reason = "recent_read_failed"
             message = str(run.get("errorCode") or run.get("error") or "최근 READ 검증 실패")
             alerts.append({"severity": "error", "service": service, "message": message[:160], "action": "중앙 연결 상태를 확인하고 READ 검증을 다시 실행하세요"})
         elif not configured:
             state = "error"
+            state_reason = "not_configured"
             alerts.append({"severity": "error", "service": service, "message": "연결이 설정되지 않았습니다", "action": "중앙 연결을 복구하세요"})
         elif verified_epoch is None:
             state = "unverified"
+            state_reason = "no_run_record"
             alerts.append({"severity": "warning", "service": service, "message": "READ 검증 기록이 없습니다", "action": "서비스 READ 점검을 실행하세요"})
         elif now - verified_epoch > 86400:
             state = "warning"
+            state_reason = "stale_verification"
             alerts.append({"severity": "warning", "service": service, "message": "마지막 READ 검증이 24시간을 초과했습니다", "action": "서비스 READ 점검을 실행하세요"})
         else:
             state = "healthy"
+            state_reason = "recent_read_ok"
+
+        auth_type_value = connection.get("authType") if connection else None
+        auth_type_provided = auth_type_value not in (None, "")
+        # Token expiry is only considered "known" when the Provider actually
+        # exposes an expiry timestamp. API-key style credentials have no
+        # refreshable expiry, but that still counts as "Provider 미제공" for
+        # the monitoring gap until the Provider starts publishing it.
+        token_expiry = "Provider 미제공"
+
         services.append({
             "service": service,
             "manager": "OpenConnector",
+            "metadata_source": "openconnector_admin_api+local_read_only_db",
+            "metadata_collected_at": metadata_collected_at,
             "state": state,
+            "state_reason": state_reason,
             "configured": configured,
-            "auth_type": connection.get("authType") if connection else None,
+            "auth_type": auth_type_value,
+            "auth_type_provided": auth_type_provided,
             "verification_action": action_id,
             "last_verified_at": verified_at,
             "last_read_at": successful_read_by_action.get(action_id, {}).get("completedAt"),
@@ -984,7 +1006,7 @@ def get_openconnector_dashboard() -> dict[str, Any]:
             "last_verified_ok": run.get("ok") if run else None,
             "last_duration_ms": run.get("durationMs") if run else None,
             "caller": run.get("caller") if run else None,
-            "token_expiry": "Provider 미제공",
+            "token_expiry": token_expiry,
         })
 
     day_runs = [run for run in runs if (_parse_iso_timestamp(run.get("completedAt")) or 0) >= now - 86400]
