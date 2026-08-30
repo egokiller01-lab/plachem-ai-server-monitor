@@ -1,0 +1,30 @@
+{
+  "default_permission_package": [
+    "task.read",
+    "result.write_structured"
+  ],
+  "allowed_permissions": [
+    "task.read",
+    "result.write_structured",
+    "artifact.create",
+    "artifact.read",
+    "artifact.write",
+    "local.static_test",
+    "delegation-demo.create",
+    "delegation-demo.write"
+  ],
+  "max_steps": 12,
+  "max_retries": 2,
+  "max_files": 4,
+  "timeout_seconds": 180,
+  "max_response_bytes": 1048576,
+  "deny": [
+    "production",
+    "merge",
+    "deploy",
+    "destructive_delete",
+    "permission_change",
+    "secrets_export",
+    "direct_odyssey_to_achilles"
+  ]
+}

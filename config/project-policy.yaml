@@ -1,0 +1,21 @@
+default: deny
+runtime_root: C:/Users/egomine2/PLACHEM-Agent-Control/runtime
+mandatory_denials:
+  - production
+  - merge
+  - deploy
+  - secrets_export
+critical_denials:
+  - destructive_delete
+  - permission_change
+v1:
+  worker: achilles
+  risk: low
+  environment: local
+  execution: bounded
+  permissions: [repo_read]
+resource_policy:
+  gpu: RTX 3090
+  minimum_free_vram_mib: 512
+  block_when_comfyui_busy: true
+  lock_path: C:/ProgramData/PLACHEM-Agent-Control/rtx3090.lock

@@ -1,0 +1,17 @@
+{
+  "task_id": "negative-files-005",
+  "objective": "Create five simple text files.",
+  "scope": {
+    "include": [
+      "delegation-demo/test1.txt",
+      "delegation-demo/test2.txt",
+      "delegation-demo/test3.txt",
+      "delegation-demo/test4.txt",
+      "delegation-demo/test5.txt"
+    ],
+    "exclude": []
+  },
+  "permission_package": ["delegation-demo.create", "delegation-demo.write"],
+  "max_files": 4,
+  "completion": ["Return all five files"]
+}

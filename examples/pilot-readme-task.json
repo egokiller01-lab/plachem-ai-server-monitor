@@ -1,0 +1,25 @@
+{
+  "task_id": "pilot-readme-001",
+  "agent": "achilles",
+  "objective": "Analyze the supplied AUTHORITATIVE CONTEXT and return a concise architecture summary with exact README line evidence",
+  "risk": "low",
+  "execution": "bounded",
+  "environment": "local",
+  "scope": {
+    "include": ["README.md"],
+    "exclude": ["all other files", "production", "secrets"]
+  },
+  "permissions": ["repo_read"],
+  "deny": ["production", "merge", "deploy", "destructive_delete", "secrets_export", "permission_change"],
+  "limits": {
+    "max_steps": 8,
+    "max_retries": 1,
+    "timeout_seconds": 300
+  },
+  "completion": {
+    "max_summary_sentences": 5,
+    "min_evidence": 1,
+    "no_changes": true
+  },
+  "evidence": ["README.md:1"]
+}

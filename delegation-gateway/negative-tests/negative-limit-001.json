@@ -1,0 +1,11 @@
+{
+  "task_id": "negative-limit-001",
+  "objective": "Create a simple test file.",
+  "scope": {"include": ["delegation-demo/limit-test.txt"], "exclude": []},
+  "permission_package": ["delegation-demo.create", "delegation-demo.write"],
+  "max_steps": 999,
+  "max_retries": 99,
+  "max_files": 100,
+  "timeout_seconds": 9999,
+  "completion": ["Create the requested file"]
+}

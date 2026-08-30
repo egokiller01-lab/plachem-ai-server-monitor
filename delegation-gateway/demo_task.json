@@ -1,0 +1,85 @@
+{
+  "task_id": "delegation-demo-web-001",
+  "objective": "Create a self-contained static web dashboard named Hermes Agent Monitor with Odyssey and Achilles status cards, system status, and working Start Demo, Complete Task, and Reset buttons.",
+  "scope": {
+    "include": [
+      "delegation-demo/index.html",
+      "delegation-demo/style.css",
+      "delegation-demo/app.js",
+      "delegation-demo/README.md"
+    ],
+    "exclude": [
+      "all other project files",
+      ".git",
+      "system settings",
+      "external APIs and servers"
+    ]
+  },
+  "permission_package": [
+    "artifact.create",
+    "artifact.read",
+    "artifact.write",
+    "local.static_test"
+  ],
+  "max_steps": 12,
+  "max_retries": 2,
+  "max_files": 4,
+  "timeout_seconds": 180,
+  "deny": [
+    "modify_other_project_files",
+    "delete_existing_files",
+    "git_push",
+    "github_pr",
+    "system_config_change",
+    "global_package_install",
+    "external_code_copy",
+    "scope_expansion",
+    "production"
+  ],
+  "work_sequence": [
+    "Confirm requirements",
+    "Inspect declared delegation-demo scope",
+    "Create HTML artifact",
+    "Create CSS artifact",
+    "Create JavaScript artifact",
+    "Self-check page behavior",
+    "Check artifact paths",
+    "Create README artifact",
+    "Check completion criteria",
+    "Return structured result"
+  ],
+  "stopping_conditions": [
+    "Stop after three failures",
+    "Stop when the same approach makes no progress",
+    "Stop and report if work requires scope expansion",
+    "Stop when max_steps is reached"
+  ],
+  "validation": {
+    "required_text": [
+      "Hermes Agent Monitor",
+      "Odyssey",
+      "Achilles",
+      "Gateway",
+      "ACTIVE",
+      "LIMITED",
+      "DENIED",
+      "Start Demo",
+      "Complete Task",
+      "Reset"
+    ],
+    "forbidden_text": [
+      "http://",
+      "https://"
+    ]
+  },
+  "completion": [
+    "Exactly four requested files are returned",
+    "Page title is Hermes Agent Monitor",
+    "Odyssey and Achilles cards show name, role, status, current task, and task step",
+    "System Status shows Gateway ACTIVE, Task RUNNING or COMPLETE, Permission LIMITED, and Production Access DENIED",
+    "Start Demo, Complete Task, and Reset update visible state",
+    "No external API or server is used",
+    "No artifact is outside delegation-demo",
+    "No forbidden operation is attempted"
+  ]
+}

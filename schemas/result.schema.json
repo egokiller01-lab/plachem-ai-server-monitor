@@ -1,0 +1,97 @@
+{
+  "$defs": {
+    "ResultStatus": {
+      "enum": [
+        "completed",
+        "blocked",
+        "failed",
+        "partial"
+      ],
+      "title": "ResultStatus",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "task_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "title": "Task Id",
+      "type": "string"
+    },
+    "status": {
+      "$ref": "#/$defs/ResultStatus"
+    },
+    "summary": {
+      "maxLength": 16384,
+      "minLength": 1,
+      "title": "Summary",
+      "type": "string"
+    },
+    "changes": {
+      "items": {
+              "maxLength": 4096,
+              "type": "string"
+            },
+            "maxItems": 100,
+      "title": "Changes",
+      "type": "array"
+    },
+    "checks": {
+      "items": {
+              "maxLength": 4096,
+              "type": "string"
+            },
+            "maxItems": 100,
+      "title": "Checks",
+      "type": "array"
+    },
+    "evidence": {
+      "items": {
+              "maxLength": 4096,
+              "type": "string"
+            },
+            "maxItems": 100,
+      "title": "Evidence",
+      "type": "array"
+    },
+    "permission_use": {
+      "items": {
+              "maxLength": 4096,
+              "type": "string"
+            },
+            "maxItems": 100,
+      "title": "Permission Use",
+      "type": "array"
+    },
+    "production_changes": {
+      "default": 0,
+      "minimum": 0,
+      "title": "Production Changes",
+      "type": "integer"
+    },
+    "remaining_risks": {
+      "items": {
+              "maxLength": 4096,
+              "type": "string"
+            },
+            "maxItems": 100,
+      "title": "Remaining Risks",
+      "type": "array"
+    },
+    "next_action": {
+      "default": "review",
+      "maxLength": 16384,
+      "title": "Next Action",
+      "type": "string"
+    }
+  },
+  "required": [
+    "task_id",
+    "status",
+    "summary"
+  ],
+  "title": "WorkerResult",
+  "type": "object"
+}

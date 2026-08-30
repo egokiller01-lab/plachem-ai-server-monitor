@@ -1,0 +1,206 @@
+{
+  "$defs": {
+    "CompletionRules": {
+      "additionalProperties": false,
+      "properties": {
+        "max_summary_sentences": {
+          "maximum": 10,
+          "minimum": 1,
+          "title": "Max Summary Sentences",
+          "type": "integer"
+        },
+        "min_evidence": {
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Min Evidence",
+          "type": "integer"
+        },
+        "no_changes": {
+          "title": "No Changes",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "max_summary_sentences",
+        "min_evidence",
+        "no_changes"
+      ],
+      "title": "CompletionRules",
+      "type": "object"
+    },
+    "Environment": {
+      "enum": [
+        "local",
+        "development",
+        "staging",
+        "production"
+      ],
+      "title": "Environment",
+      "type": "string"
+    },
+    "ExecutionMode": {
+      "enum": [
+        "autonomous",
+        "bounded",
+        "supervised",
+        "approval_required"
+      ],
+      "title": "ExecutionMode",
+      "type": "string"
+    },
+    "Limits": {
+      "additionalProperties": false,
+      "properties": {
+        "max_steps": {
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Max Steps",
+          "type": "integer"
+        },
+        "max_retries": {
+          "maximum": 10,
+          "minimum": 0,
+          "title": "Max Retries",
+          "type": "integer"
+        },
+        "timeout_seconds": {
+          "maximum": 86400,
+          "minimum": 30,
+          "title": "Timeout Seconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "max_steps",
+        "max_retries",
+        "timeout_seconds"
+      ],
+      "title": "Limits",
+      "type": "object"
+    },
+    "RiskLevel": {
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "critical"
+      ],
+      "title": "RiskLevel",
+      "type": "string"
+    },
+    "Scope": {
+      "additionalProperties": false,
+      "properties": {
+        "include": {
+          "items": {
+                  "maxLength": 4096,
+                  "type": "string"
+                },
+                "maxItems": 100,
+          "minItems": 1,
+          "title": "Include",
+          "type": "array"
+        },
+        "exclude": {
+          "items": {
+                  "maxLength": 4096,
+                  "type": "string"
+                },
+                "maxItems": 100,
+          "title": "Exclude",
+          "type": "array"
+        }
+      },
+      "required": [
+        "include"
+      ],
+      "title": "Scope",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "task_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "title": "Task Id",
+      "type": "string"
+    },
+    "agent": {
+      "maxLength": 16384,
+      "minLength": 1,
+      "title": "Agent",
+      "type": "string"
+    },
+    "objective": {
+      "maxLength": 16384,
+      "minLength": 1,
+      "title": "Objective",
+      "type": "string"
+    },
+    "risk": {
+      "$ref": "#/$defs/RiskLevel"
+    },
+    "execution": {
+      "$ref": "#/$defs/ExecutionMode"
+    },
+    "environment": {
+      "$ref": "#/$defs/Environment"
+    },
+    "scope": {
+      "$ref": "#/$defs/Scope"
+    },
+    "permissions": {
+      "items": {
+              "maxLength": 4096,
+              "type": "string"
+            },
+            "maxItems": 100,
+      "title": "Permissions",
+      "type": "array"
+    },
+    "deny": {
+      "items": {
+              "maxLength": 4096,
+              "type": "string"
+            },
+            "maxItems": 100,
+      "minItems": 1,
+      "title": "Deny",
+      "type": "array"
+    },
+    "limits": {
+      "$ref": "#/$defs/Limits"
+    },
+    "completion": {
+      "$ref": "#/$defs/CompletionRules"
+    },
+    "evidence": {
+      "items": {
+              "maxLength": 4096,
+              "pattern": "^[^:|]+:[1-9][0-9]*$",
+              "type": "string"
+            },
+            "maxItems": 100,
+      "minItems": 1,
+      "title": "Evidence",
+      "type": "array"
+    }
+  },
+  "required": [
+    "task_id",
+    "agent",
+    "objective",
+    "risk",
+    "execution",
+    "environment",
+    "scope",
+    "deny",
+    "limits",
+    "completion",
+    "evidence"
+  ],
+  "title": "TaskSpec",
+  "type": "object"
+}

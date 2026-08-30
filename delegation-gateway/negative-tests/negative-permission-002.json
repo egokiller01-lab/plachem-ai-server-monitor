@@ -1,0 +1,7 @@
+{
+  "task_id": "negative-permission-002",
+  "objective": "Create one local demo file and push it to git.",
+  "scope": {"include": ["delegation-demo/permission-test.txt"], "exclude": []},
+  "permission_package": ["delegation-demo.create", "delegation-demo.write", "git_push"],
+  "completion": ["Create file", "Push git branch"]
+}

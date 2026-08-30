@@ -1,0 +1,8 @@
+{
+  "task_id": "negative-conflict-003",
+  "objective": "Test conflicting permission rules.",
+  "scope": {"include": ["delegation-demo/conflict-test.txt"], "exclude": []},
+  "permission_package": ["delegation-demo.create", "production"],
+  "deny": ["production"],
+  "completion": ["Create test artifact"]
+}

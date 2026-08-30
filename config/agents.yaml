@@ -1,0 +1,12 @@
+agents:
+  achilles:
+    profile: achilles
+    role: worker
+    model_endpoint: http://127.0.0.1:8080/v1
+    model: E:/AI/models/Qwen3.8-27B-Uncensored-GGUF/Qwen3.8-27B-Uncensored-Q4_K_M.gguf
+    toolset: todo
+    hermes_executable: C:/Users/egomine2/AppData/Local/hermes/hermes-agent/venv/Scripts/hermes.exe
+    hermes_sha256: dc5357dc27045339c7748c96ba1690eeccdd72a903231027a0235a33cdd291c3
+    nvidia_smi_executable: C:/Windows/System32/nvidia-smi.exe
+    nvidia_smi_sha256: 9b3da28a74c5bfbf33b147b4b73c105e55b1f74b474e63ec7762843e5f2b635d
+    model_sha256: 4c5e2db039e9325ac7724c8846c71356a24ad1cdfa28002d73ecb6be645f9675

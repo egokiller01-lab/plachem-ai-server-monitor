@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Hermes Agent Monitor</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>Hermes Agent Monitor</h1>
+  </header>
+  <main>
+    <section class="cards">
+      <div class="card" id="odyssey-card">
+        <h2>Odyssey</h2>
+        <p><strong>Role:</strong> Delegator</p>
+        <p><strong>Status:</strong> <span id="odyssey-status">IDLE</span></p>
+        <p><strong>Current Task:</strong> <span id="odyssey-task">None</span></p>
+        <p><strong>Task Step:</strong> <span id="odyssey-step">0/0</span></p>
+        <p><strong>Last Update:</strong> <span id="odyssey-last-update">00:00:00</span></p>
+      </div>
+      <div class="card" id="achilles-card">
+        <h2>Achilles</h2>
+        <p><strong>Role:</strong> Worker</p>
+        <p><strong>Status:</strong> <span id="achilles-status">IDLE</span></p>
+        <p><strong>Current Task:</strong> <span id="achilles-task">None</span></p>
+        <p><strong>Task Step:</strong> <span id="achilles-step">0/0</span></p>
+        <p><strong>Last Update:</strong> <span id="achilles-last-update">00:00:00</span></p>
+      </div>
+    </section>
+    <section class="system-status">
+      <h2>System Status</h2>
+      <ul>
+        <li>Gateway: <span id="gateway-status">ACTIVE</span></li>
+        <li>Task: <span id="task-status">RUNNING</span></li>
+        <li>Permission: <span id="permission-status">LIMITED</span></li>
+        <li>Production Access: <span id="production-status">DENIED</span></li>
+      </ul>
+    </section>
+    <section class="controls">
+      <button id="start-demo">Start Demo</button>
+      <button id="complete-task">Complete Task</button>
+      <button id="reset">Reset</button>
+    </section>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>

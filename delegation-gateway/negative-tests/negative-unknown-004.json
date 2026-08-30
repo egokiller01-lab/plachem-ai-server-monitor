@@ -1,0 +1,7 @@
+{
+  "task_id": "negative-unknown-004",
+  "objective": "Test unknown permission rejection.",
+  "scope": {"include": ["delegation-demo/unknown-test.txt"], "exclude": []},
+  "permission_package": ["delegation-demo.create", "quantum_admin_root_access"],
+  "completion": ["Create test artifact"]
+}
