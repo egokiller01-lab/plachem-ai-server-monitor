@@ -4,3 +4,7 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 runtime/
+plachem_fast_gateway/runs.jsonl
+plachem_fast_gateway/mock_auth_test*.json
+plachem_fast_gateway/*.secret.json
+plachem_fast_gateway/*.local.json

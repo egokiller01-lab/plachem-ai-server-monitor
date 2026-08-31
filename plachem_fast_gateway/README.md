@@ -1,0 +1,57 @@
+# PLACHEM Fast Delegation Gateway
+
+목표는 단순합니다.
+
+**Odyssey는 `agent + 작업문 + workspace`만 전달합니다.**
+TaskSpec, permission 문서, validation 계획서를 Odyssey가 매번 만들지 않습니다.
+
+## 가장 간단한 사용법
+
+PowerShell:
+
+```powershell
+.\delegate.ps1 `
+  -Workspace "delegation-demo" `
+  -Task "Hermes Agent Monitor의 System Status에 Last Gateway Run을 추가해. 초기값 NONE, Start Demo는 RUNNING, Complete Task는 VERIFIED, Reset은 NONE으로 복원. 기존 기능은 유지해."
+```
+
+또는 Python:
+
+```powershell
+python fast_gateway.py --workspace delegation-demo --agent achilles --task "작업 내용"
+```
+
+JSON 요청도 가능하지만 필수 필드는 3개뿐입니다.
+
+```json
+{
+  "agent": "achilles",
+  "workspace": "delegation-demo",
+  "task": "작업 내용"
+}
+```
+
+## Gateway가 자동으로 하는 일
+
+1. workspace 범위를 확정
+2. workspace의 최신 텍스트 파일을 자동으로 Context Pack으로 수집
+3. 공통 정책/timeout/retry 자동 적용
+4. Achilles 호출
+5. Worker JSON을 엄격 검증
+6. workspace 밖 artifact 차단
+7. staging 후 atomic replace
+8. 실패 시 rollback
+9. PASS / FAIL / BLOCKED 반환
+10. runs.jsonl에는 코드 전체가 아니라 SHA/경로/결과만 기록
+
+## 의도적으로 뺀 것
+
+이 버전은 위임 마찰을 줄이기 위한 Fast Lane입니다.
+
+- Task마다 별도 Permission Package 작성 안 함
+- Task마다 별도 Validation 프로그램 작성 안 함
+- Git/PR/Merge/Deploy 자동화 안 함
+- 승인 workflow 안 함
+- Odyssey가 Gateway 기능을 테스트 도중 수정하지 않음
+
+Git/Production처럼 위험한 작업은 별도 Controlled Lane으로 나중에 분리하는 것이 맞습니다.

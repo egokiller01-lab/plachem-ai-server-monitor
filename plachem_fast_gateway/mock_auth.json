@@ -1,0 +1,22 @@
+{
+  "tasks": {
+    "test10-authorized": {
+      "allow": ["workspace_modify", "git_commit", "git_push"],
+      "deny": ["production_deploy", "production_migration", "business_data_change"],
+      "git_push_target": "runtime/mock-remotes/test10.git",
+      "git_push_ref": "refs/heads/test10-authorized"
+    },
+    "test10-production": {
+      "allow": ["workspace_modify", "git_commit", "git_push"],
+      "deny": ["production_deploy", "production_migration", "business_data_change"],
+      "git_push_target": "runtime/mock-remotes/test10.git",
+      "git_push_ref": "refs/heads/test10-production"
+    },
+    "test10-scope": {
+      "allow": ["workspace_modify", "git_commit", "git_push"],
+      "deny": ["production_deploy", "production_migration", "business_data_change"],
+      "git_push_target": "runtime/mock-remotes/test10.git",
+      "git_push_ref": "refs/heads/test10-scope"
+    }
+  }
+}

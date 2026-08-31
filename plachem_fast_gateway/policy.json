@@ -1,0 +1,13 @@
+{
+  "max_context_files": 20,
+  "max_context_bytes": 250000,
+  "max_artifacts": 8,
+  "max_file_bytes": 250000,
+  "max_total_artifact_bytes": 1000000,
+  "max_retries": 1,
+  "timeout_seconds": 300,
+  "total_timeout_seconds": 420,
+  "exclude_dirs": [".git", ".venv", "venv", "node_modules", "__pycache__", "runtime", "logs"],
+  "exclude_suffixes": [".png", ".jpg", ".jpeg", ".gif", ".webp", ".zip", ".7z", ".exe", ".dll", ".bin", ".gguf"],
+  "blocked_actions": ["git push", "github pr", "merge", "deploy", "production", "remote modify", "reset --hard", "git clean"]
+}

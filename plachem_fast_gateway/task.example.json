@@ -1,0 +1,6 @@
+{
+  "task_id": "demo-last-gateway-run-001",
+  "agent": "achilles",
+  "workspace": "delegation-demo",
+  "task": "Hermes Agent Monitor의 System Status에 Last Gateway Run을 추가해. 초기값 NONE, Start Demo는 RUNNING, Complete Task는 VERIFIED, Reset은 NONE으로 복원. 기존 기능은 모두 유지해."
+}
