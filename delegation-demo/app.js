@@ -146,6 +146,9 @@ document.addEventListener('DOMContentLoaded', function() {
       taskStatus.textContent = 'RUNNING';
       pauseBtn.textContent = 'Pause Task';
       isPaused = false;
+      if (progress < 100) {
+        startProgress();
+      }
       addEvent('RESUME');
     } else {
       odysseyStatus.textContent = 'PAUSED';
