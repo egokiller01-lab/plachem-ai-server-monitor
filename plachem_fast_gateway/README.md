@@ -55,3 +55,16 @@ JSON 요청도 가능하지만 필수 필드는 3개뿐입니다.
 - Odyssey가 Gateway 기능을 테스트 도중 수정하지 않음
 
 Git/Production처럼 위험한 작업은 별도 Controlled Lane으로 나중에 분리하는 것이 맞습니다.
+
+## Task Auth Broker v2
+
+`mock_auth_broker.py`는 다음 두 계층을 분리합니다.
+
+- `AuthorizationBackend`: 인증 저장소가 구현해야 하는 교체 가능한 인터페이스
+- `TaskAuthBroker`: Task/Worker/Action 검증, 만료·취소·서명·재사용 방지와 감사 기록을 담당하는 핵심 로직
+
+현재 개발·테스트 Backend는 JSON 기반 `LocalTestStore`입니다. 향후 OpenClaw 통합 인증관리는 `AuthorizationBackend`를 구현하여 교체하며, Gateway의 집행 로직이나 Worker 계약은 변경하지 않습니다.
+
+서명된 v2 인증은 Task ID, Worker, ALLOW/DENY, 만료시각, 취소 상태, Git 테스트 제약을 함께 검증합니다. 성공적으로 사용된 인증 ID는 다시 사용할 수 없습니다. 발급·거부·사용 결과는 JSONL 감사 로그로 남습니다. 서명키·서비스 비밀번호·API Key는 WorkerResult나 Worker prompt에 전달하지 않습니다.
+
+기존 `tasks` 형식 Mock 인증 데이터는 호환성을 위해 계속 읽을 수 있습니다. 새 v2 인증은 `schema_version: 2` Local Test Store를 사용합니다.

@@ -2,12 +2,14 @@ import json
 import subprocess
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import fast_gateway as g
+from mock_auth_broker import LocalTestStore, TaskAuthBroker
 
 
 class FastGatewayTests(unittest.TestCase):
@@ -242,6 +244,51 @@ class FastGatewayTests(unittest.TestCase):
             self.assertTrue(record["git"]["commit"])
             self.assertTrue(record["git"]["push"])
             self.assertEqual((workspace / "app.js").read_text(encoding="utf-8"), "new\n")
+
+    def test_run_uses_signed_task_and_worker_bound_authorization(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            workspace = root / "delegation-demo"
+            workspace.mkdir()
+            (workspace / "app.js").write_text("old\n", encoding="utf-8")
+            auth_path = root / "auth-v2.json"
+            broker = TaskAuthBroker(
+                LocalTestStore(auth_path, signing_key="gateway-test-key"),
+                root / "auth-audit.jsonl",
+            )
+            broker.issue(
+                task_id="signed-task-001",
+                worker="achilles",
+                allow=["workspace_modify"],
+                deny=["production_deploy"],
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+            )
+            worker_result = {
+                "status": "completed",
+                "summary": "updated",
+                "reason": "",
+                "artifacts": [{"path": "app.js", "content": "new\n"}],
+            }
+
+            with mock.patch.object(g, "call_worker", return_value=worker_result) as called:
+                record = g.run(
+                    {
+                        "task_id": "signed-task-001",
+                        "agent": "achilles",
+                        "workspace": "delegation-demo",
+                        "task": "app.js를 수정해",
+                    },
+                    {"achilles": {"base_url": "unused", "model": "unused"}},
+                    dict(g.DEFAULT_POLICY),
+                    root,
+                    root / "runs.jsonl",
+                    auth_path,
+                )
+
+            self.assertEqual(called.call_count, 1)
+            self.assertEqual(record["status"], "PASS")
+            self.assertEqual(record["auth"]["worker"], "achilles")
+            self.assertTrue(record["auth"]["authorization_id"])
 
 
 if __name__ == "__main__":

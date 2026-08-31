@@ -91,8 +91,13 @@ def detect_explicit_blocked_action(task: str, blocked: list[str]) -> str | None:
     return None
 
 
-def load_mock_authorization(config_path: Path, task_id: str) -> dict[str, Any]:
-    return load_task_authorization(config_path, task_id)
+def load_mock_authorization(
+    config_path: Path,
+    task_id: str,
+    worker: str | None = None,
+    requested_actions: list[str] | None = None,
+) -> dict[str, Any]:
+    return load_task_authorization(config_path, task_id, worker, requested_actions)
 
 
 def _affirmative_phrase(task: str, phrase: str) -> bool:
@@ -471,6 +476,8 @@ def run(
                 "allow": list((auth or {}).get("allow", [])),
                 "deny": list((auth or {}).get("deny", [])),
                 "requested": requested,
+                "authorization_id": str((auth or {}).get("authorization_id") or ""),
+                "worker": str((auth or {}).get("worker") or ""),
             },
             "attempts": [],
             "result": {"status": "blocked", "reason": reason, "changes": []},
@@ -487,9 +494,15 @@ def run(
         return blocked_record("UNKNOWN_AGENT", None, [])
 
     authorization: dict[str, Any] | None = None
+    detected_actions = detect_requested_actions(task)
     if auth_broker_path is not None:
         try:
-            authorization = load_mock_authorization(auth_broker_path, task_id)
+            authorization = load_mock_authorization(
+                auth_broker_path,
+                task_id,
+                agent_name,
+                detected_actions,
+            )
         except Exception as exc:
             return blocked_record(f"AUTH_FAILED:{type(exc).__name__}:{str(exc)[:160]}", None, [])
 
@@ -594,6 +607,8 @@ def run(
             "allow": list((authorization or {}).get("allow", [])),
             "deny": list((authorization or {}).get("deny", [])),
             "requested": requested_actions,
+            "authorization_id": str((authorization or {}).get("authorization_id") or ""),
+            "worker": str((authorization or {}).get("worker") or ""),
         },
         "context_files": [{"path": x["path"], "sha256": x["sha256"]} for x in context],
         "attempts": attempts,
