@@ -20,6 +20,7 @@ document.addEventListener('DOMContentLoaded', function() {
 
   const progressBar = document.getElementById('progress-bar');
   const progressText = document.getElementById('progress-text');
+  const etaText = document.getElementById('eta-text');
 
   const speedNormalBtn = document.getElementById('speed-normal');
   const speedFastBtn = document.getElementById('speed-fast');
@@ -72,6 +73,21 @@ document.addEventListener('DOMContentLoaded', function() {
   function updateProgressDisplay() {
     progressBar.style.width = progress + '%';
     progressText.textContent = progress + '%';
+    updateETA();
+  }
+
+  function updateETA() {
+    if (progress >= 100) {
+      etaText.textContent = 'Complete';
+    } else if (isPaused) {
+      etaText.textContent = 'Paused';
+    } else {
+      const remaining = 100 - progress;
+      const msPerStep = SPEEDS[currentSpeed];
+      const totalMs = remaining * msPerStep;
+      const seconds = Math.ceil(totalMs / 1000);
+      etaText.textContent = seconds + 's';
+    }
   }
 
   function updateSpeedButtons() {
@@ -91,6 +107,7 @@ document.addEventListener('DOMContentLoaded', function() {
     if (!isPaused && progress < 100) {
       startProgress();
     }
+    updateETA();
     addEvent('SPEED_' + speed);
   }
 
@@ -149,6 +166,7 @@ document.addEventListener('DOMContentLoaded', function() {
       if (progress < 100) {
         startProgress();
       }
+      updateETA();
       addEvent('RESUME');
     } else {
       odysseyStatus.textContent = 'PAUSED';
@@ -156,6 +174,7 @@ document.addEventListener('DOMContentLoaded', function() {
       taskStatus.textContent = 'PAUSED';
       pauseBtn.textContent = 'Resume Task';
       isPaused = true;
+      updateETA();
       addEvent('PAUSE');
     }
     updateLastUpdate();
