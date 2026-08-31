@@ -1,6 +1,7 @@
 document.addEventListener('DOMContentLoaded', function() {
   const startBtn = document.getElementById('start-demo');
   const pauseBtn = document.getElementById('pause-task');
+  const cancelBtn = document.getElementById('cancel-task');
   const completeBtn = document.getElementById('complete-task');
   const resetBtn = document.getElementById('reset');
 
@@ -29,6 +30,7 @@ document.addEventListener('DOMContentLoaded', function() {
   const INITIAL_LAST_UPDATE = '00:00:00';
   let isPaused = false;
   let isRunning = false;
+  let isCancelled = false;
   let progress = 0;
   let progressInterval = null;
   const recentEvents = [];
@@ -80,6 +82,8 @@ document.addEventListener('DOMContentLoaded', function() {
   function updateETA() {
     if (progress >= 100) {
       etaText.textContent = 'Complete';
+    } else if (isCancelled) {
+      etaText.textContent = 'Cancelled';
     } else if (isPaused) {
       etaText.textContent = 'Paused';
     } else if (!isRunning) {
@@ -107,7 +111,7 @@ document.addEventListener('DOMContentLoaded', function() {
       clearInterval(progressInterval);
       progressInterval = null;
     }
-    if (!isPaused && progress < 100 && isRunning) {
+    if (!isPaused && !isCancelled && progress < 100 && isRunning) {
       startProgress();
     }
     updateETA();
@@ -120,7 +124,7 @@ document.addEventListener('DOMContentLoaded', function() {
     }
     const intervalMs = SPEEDS[currentSpeed];
     progressInterval = setInterval(function() {
-      if (!isPaused && progress < 100) {
+      if (!isPaused && !isCancelled && progress < 100) {
         progress += 1;
         if (progress > 100) progress = 100;
         updateProgressDisplay();
@@ -133,6 +137,10 @@ document.addEventListener('DOMContentLoaded', function() {
       clearInterval(progressInterval);
       progressInterval = null;
     }
+  }
+
+  function updateCancelButton() {
+    cancelBtn.disabled = !(isRunning && !isCancelled);
   }
 
   startBtn.addEventListener('click', function() {
@@ -149,8 +157,10 @@ document.addEventListener('DOMContentLoaded', function() {
 
     isPaused = false;
     isRunning = true;
+    isCancelled = false;
     pauseBtn.disabled = false;
     pauseBtn.textContent = 'Pause Task';
+    updateCancelButton();
 
     progress = 0;
     updateProgressDisplay();
@@ -184,6 +194,26 @@ document.addEventListener('DOMContentLoaded', function() {
     updateLastUpdate();
   });
 
+  cancelBtn.addEventListener('click', function() {
+    if (!isRunning || isCancelled) return;
+
+    odysseyStatus.textContent = 'CANCELLED';
+    achillesStatus.textContent = 'CANCELLED';
+    taskStatus.textContent = 'CANCELLED';
+    lastGatewayRun.textContent = 'CANCELLED';
+
+    isCancelled = true;
+    isPaused = false;
+    pauseBtn.textContent = 'Pause Task';
+    updateCancelButton();
+
+    stopProgress();
+    updateProgressDisplay();
+
+    updateLastUpdate();
+    addEvent('CANCEL');
+  });
+
   completeBtn.addEventListener('click', function() {
     odysseyStatus.textContent = 'COMPLETE';
     odysseyTask.textContent = 'Authorized Task';
@@ -200,6 +230,8 @@ document.addEventListener('DOMContentLoaded', function() {
     pauseBtn.textContent = 'Pause Task';
     isPaused = false;
     isRunning = false;
+    isCancelled = false;
+    updateCancelButton();
 
     progress = 100;
     updateProgressDisplay();
@@ -228,6 +260,8 @@ document.addEventListener('DOMContentLoaded', function() {
     pauseBtn.textContent = 'Pause Task';
     isPaused = false;
     isRunning = false;
+    isCancelled = false;
+    updateCancelButton();
 
     progress = 0;
     updateProgressDisplay();
