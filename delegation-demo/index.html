@@ -36,12 +36,25 @@
         <li>Task: <span id="task-status">RUNNING</span></li>
         <li>Permission: <span id="permission-status">LIMITED</span></li>
         <li>Production Access: <span id="production-status">DENIED</span></li>
+        <li>Last Gateway Run: <span id="last-gateway-run">NONE</span></li>
       </ul>
+    </section>
+    <section class="progress-section">
+      <h2>Task Progress</h2>
+      <div class="progress-container">
+        <div class="progress-bar" id="progress-bar"></div>
+      </div>
+      <p class="progress-text">Current Progress: <span id="progress-text">0%</span></p>
     </section>
     <section class="controls">
       <button id="start-demo">Start Demo</button>
+      <button id="pause-task" disabled>Pause Task</button>
       <button id="complete-task">Complete Task</button>
       <button id="reset">Reset</button>
+    </section>
+    <section class="recent-events">
+      <h2>Recent Events</h2>
+      <ul id="recent-events-list"></ul>
     </section>
   </main>
   <script src="app.js"></script>

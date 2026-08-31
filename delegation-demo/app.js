@@ -18,8 +18,13 @@ document.addEventListener('DOMContentLoaded', function() {
   const lastGatewayRun = document.getElementById('last-gateway-run');
   const recentEventsList = document.getElementById('recent-events-list');
 
+  const progressBar = document.getElementById('progress-bar');
+  const progressText = document.getElementById('progress-text');
+
   const INITIAL_LAST_UPDATE = '00:00:00';
   let isPaused = false;
+  let progress = 0;
+  let progressInterval = null;
   const recentEvents = [];
 
   function formatLocalTime(date) {
@@ -53,6 +58,31 @@ document.addEventListener('DOMContentLoaded', function() {
     });
   }
 
+  function updateProgressDisplay() {
+    progressBar.style.width = progress + '%';
+    progressText.textContent = progress + '%';
+  }
+
+  function startProgress() {
+    if (progressInterval) {
+      clearInterval(progressInterval);
+    }
+    progressInterval = setInterval(function() {
+      if (!isPaused && progress < 100) {
+        progress += 1;
+        if (progress > 100) progress = 100;
+        updateProgressDisplay();
+      }
+    }, 100);
+  }
+
+  function stopProgress() {
+    if (progressInterval) {
+      clearInterval(progressInterval);
+      progressInterval = null;
+    }
+  }
+
   startBtn.addEventListener('click', function() {
     odysseyStatus.textContent = 'DELEGATING';
     odysseyTask.textContent = 'Authorized Task';
@@ -68,6 +98,10 @@ document.addEventListener('DOMContentLoaded', function() {
     isPaused = false;
     pauseBtn.disabled = false;
     pauseBtn.textContent = 'Pause Task';
+
+    progress = 0;
+    updateProgressDisplay();
+    startProgress();
 
     updateLastUpdate();
     addEvent('START');
@@ -108,6 +142,10 @@ document.addEventListener('DOMContentLoaded', function() {
     pauseBtn.textContent = 'Pause Task';
     isPaused = false;
 
+    progress = 100;
+    updateProgressDisplay();
+    stopProgress();
+
     updateLastUpdate();
     addEvent('COMPLETE');
   });
@@ -130,6 +168,10 @@ document.addEventListener('DOMContentLoaded', function() {
     pauseBtn.disabled = true;
     pauseBtn.textContent = 'Pause Task';
     isPaused = false;
+
+    progress = 0;
+    updateProgressDisplay();
+    stopProgress();
 
     addEvent('RESET');
   });
