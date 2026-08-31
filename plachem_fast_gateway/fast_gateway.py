@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from mock_auth_broker import load_task_authorization
+from mock_auth_broker import consume_task_authorization, load_task_authorization
 
 ROOT = Path(__file__).resolve().parent
 
@@ -97,7 +97,13 @@ def load_mock_authorization(
     worker: str | None = None,
     requested_actions: list[str] | None = None,
 ) -> dict[str, Any]:
-    return load_task_authorization(config_path, task_id, worker, requested_actions)
+    return load_task_authorization(
+        config_path,
+        task_id,
+        worker,
+        requested_actions,
+        consume=False,
+    )
 
 
 def _affirmative_phrase(task: str, phrase: str) -> bool:
@@ -120,6 +126,16 @@ def _affirmative_phrase(task: str, phrase: str) -> bool:
 
 def detect_requested_actions(task: str) -> list[str]:
     patterns = [
+        (
+            "read_only_review",
+            (
+                "read-only review",
+                "read-only code review",
+                "read_only_review",
+                "code_review",
+                "읽기 전용 검토",
+            ),
+        ),
         ("git_commit", ("git commit",)),
         ("git_push", ("git push",)),
         ("production_migration", ("production migration", "production 마이그레이션")),
@@ -140,6 +156,12 @@ def authorize_requested_actions(
 ) -> dict[str, Any]:
     requested = detect_requested_actions(task)
     if authorization is None:
+        if "read_only_review" in requested:
+            return {
+                "allowed": False,
+                "reason": "AUTH_REQUIRED_ACTION:read_only_review",
+                "requested": requested,
+            }
         blocked = detect_explicit_blocked_action(task, blocked_actions)
         if blocked:
             return {"allowed": False, "reason": f"BLOCKED_ACTION:{blocked}", "requested": requested}
@@ -173,29 +195,14 @@ def execute_authorized_git_actions(
     authorization: dict[str, Any],
 ) -> dict[str, Any]:
     result: dict[str, Any] = {"commit": False, "push": False, "commit_sha": "", "push_ref": ""}
-    if "git_commit" not in requested_actions and "git_push" not in requested_actions:
+    wants_commit = "git_commit" in requested_actions
+    wants_push = "git_push" in requested_actions
+    if not wants_commit and not wants_push:
         return result
-    if "git_commit" not in authorization.get("allow", []):
-        raise ValueError("git_commit is not authorized")
-    if not changes:
-        raise ValueError("git actions require applied changes")
 
-    workspace = normalize_workspace(project_root, workspace_value)
-    paths: list[str] = []
-    for change in changes:
-        rel = Path(str(change["path"]))
-        target = (workspace / rel).resolve()
-        if not target.is_relative_to(workspace):
-            raise ValueError("git path escapes workspace")
-        paths.append(target.relative_to(project_root).as_posix())
-
-    _run_git(["add", "--", *paths], project_root)
-    safe_task_id = re.sub(r"[^A-Za-z0-9._-]", "-", task_id)[:128]
-    _run_git(["commit", "-m", f"test: {safe_task_id}", "--", *paths], project_root)
-    result["commit"] = True
-    result["commit_sha"] = _run_git(["rev-parse", "HEAD"], project_root).stdout.strip()
-
-    if "git_push" in requested_actions:
+    push_target: Path | None = None
+    push_ref = ""
+    if wants_push:
         if "git_push" not in authorization.get("allow", []):
             raise ValueError("git_push is not authorized")
         target_value = authorization.get("git_push_target")
@@ -203,15 +210,46 @@ def execute_authorized_git_actions(
         if not isinstance(target_value, str) or not target_value:
             raise ValueError("authorized local git push target is required")
         if "://" in target_value or target_value.startswith("git@"):
-            raise ValueError("mock broker permits local git push targets only")
-        target = Path(target_value)
-        if not target.is_absolute():
-            target = (project_root / target).resolve()
-        if not target.is_dir() or not (target / "HEAD").is_file():
+            raise ValueError("auth broker permits local git push targets only")
+        push_target = Path(target_value)
+        if not push_target.is_absolute():
+            push_target = (project_root / push_target).resolve()
+        if not push_target.is_dir() or not (push_target / "HEAD").is_file():
             raise ValueError("authorized local git push target is not a bare repository")
         if not push_ref.startswith("refs/heads/test10-"):
-            raise ValueError("mock git push ref must use refs/heads/test10-")
-        _run_git(["push", str(target), f"HEAD:{push_ref}"], project_root)
+            raise ValueError("authorized git push ref must use refs/heads/test10-")
+
+    if wants_commit:
+        if "git_commit" not in authorization.get("allow", []):
+            raise ValueError("git_commit is not authorized")
+        if not changes:
+            raise ValueError("git commit requires applied changes")
+        workspace = normalize_workspace(project_root, workspace_value)
+        paths: list[str] = []
+        for change in changes:
+            rel = Path(str(change["path"]))
+            target = (workspace / rel).resolve()
+            if not target.is_relative_to(workspace):
+                raise ValueError("git path escapes workspace")
+            paths.append(target.relative_to(project_root).as_posix())
+        _run_git(["add", "--", *paths], project_root)
+        safe_task_id = re.sub(r"[^A-Za-z0-9._-]", "-", task_id)[:128]
+        _run_git(["commit", "-m", f"test: {safe_task_id}", "--", *paths], project_root)
+        result["commit"] = True
+        result["commit_sha"] = _run_git(["rev-parse", "HEAD"], project_root).stdout.strip()
+    elif wants_push:
+        if changes:
+            raise ValueError("push-only action cannot include artifacts")
+        commit_sha = str(authorization.get("git_push_commit") or "")
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", commit_sha):
+            raise ValueError("push-only action requires an authorized 40-character commit SHA")
+        _run_git(["cat-file", "-e", f"{commit_sha}^{{commit}}"], project_root)
+        result["commit_sha"] = commit_sha.lower()
+
+    if wants_push:
+        if push_target is None:
+            raise ValueError("authorized local git push target is required")
+        _run_git(["push", str(push_target), f"{result['commit_sha']}:{push_ref}"], project_root)
         result["push"] = True
         result["push_ref"] = push_ref
     return result
@@ -267,10 +305,13 @@ def build_worker_prompt(
     requested_actions: list[str] | None = None,
 ) -> str:
     contract = {
+        "result_type": "artifact|action_only|read_only",
         "status": "completed|blocked|failed",
         "summary": "short factual summary",
         "artifacts": [{"path": "path relative to workspace", "content": "complete file content"}],
         "reason": "empty when completed; concise reason otherwise",
+        "review_result": "PASS|FAIL; required only for completed read_only results",
+        "findings": ["finding strings; required only for completed read_only results"],
     }
     authorized_gateway_actions = sorted(
         set(requested_actions or []) & set((authorization or {}).get("allow", []))
@@ -333,6 +374,9 @@ def call_worker(agent: dict[str, Any], prompt: str, timeout_seconds: int) -> dic
 
 def validate_result(workspace: Path, result: dict[str, Any], policy: dict[str, Any]) -> tuple[bool, list[str], list[dict[str, Any]]]:
     failures: list[str] = []
+    result_type = result.get("result_type", "artifact")
+    if result_type not in {"artifact", "action_only", "read_only"}:
+        failures.append("invalid_result_type")
     status = result.get("status")
     if status not in {"completed", "blocked", "failed"}:
         failures.append("invalid_status")
@@ -381,8 +425,23 @@ def validate_result(workspace: Path, result: dict[str, Any], policy: dict[str, A
         seen.add(rel)
         normalized.append({"path": rel, "content": content, "sha256": sha256_bytes(data), "bytes": len(data)})
 
-    if status == "completed" and not normalized:
+    if result_type == "artifact" and status == "completed" and not normalized:
         failures.append("completed_without_artifacts")
+    if result_type == "action_only" and normalized:
+        failures.append("action_only_with_artifacts")
+    if result_type == "read_only":
+        if normalized:
+            failures.append("read_only_with_artifacts")
+        if status == "completed":
+            if result.get("review_result") not in {"PASS", "FAIL"}:
+                failures.append("invalid_review_result")
+            findings = result.get("findings")
+            if (
+                not isinstance(findings, list)
+                or len(findings) > 64
+                or not all(isinstance(item, str) and len(item) <= 2000 for item in findings)
+            ):
+                failures.append("invalid_review_findings")
     if status in {"blocked", "failed"} and normalized:
         failures.append("noncompleted_with_artifacts")
     return not failures, sorted(set(failures)), normalized
@@ -551,24 +610,47 @@ def run(
                 previous_error = error_fp
                 continue
 
+            result_type = raw.get("result_type", "artifact")
+            if "read_only_review" in requested_actions and result_type != "read_only":
+                raise ValueError("read-only review cannot return artifacts or executable actions")
+            if result_type == "read_only" and set(requested_actions) != {"read_only_review"}:
+                raise ValueError("read-only result requires only the authorized read_only_review action")
+            if result_type == "action_only":
+                implemented_actions = {"git_commit", "git_push"}
+                if not requested_actions or not set(requested_actions).issubset(implemented_actions):
+                    raise ValueError("action-only result requires an implemented authorized action")
+
             if raw["status"] == "completed":
-                changes = atomic_apply(workspace, normalized)
+                changes = [] if result_type == "read_only" else atomic_apply(workspace, normalized)
                 result = {
                     "status": "completed",
                     "summary": str(raw.get("summary") or "completed"),
                     "reason": "",
                     "changes": changes,
                 }
+                if result_type == "read_only":
+                    result["review_result"] = str(raw["review_result"])
+                    result["findings"] = list(raw["findings"])
                 if requested_actions:
                     if authorization is None:
                         raise ValueError("authorization required for requested actions")
-                    git_result = execute_authorized_git_actions(
-                        project_root,
-                        workspace_value,
-                        changes,
-                        task_id,
-                        requested_actions,
-                        authorization,
+                    if result_type != "read_only":
+                        git_result = execute_authorized_git_actions(
+                            project_root,
+                            workspace_value,
+                            changes,
+                            task_id,
+                            requested_actions,
+                            authorization,
+                        )
+                authorization_id = str((authorization or {}).get("authorization_id") or "")
+                if auth_broker_path is not None and authorization_id:
+                    consume_task_authorization(
+                        auth_broker_path,
+                        authorization_id=authorization_id,
+                        task_id=task_id,
+                        worker=agent_name,
+                        requested_actions=requested_actions,
                     )
             else:
                 result = {

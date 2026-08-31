@@ -103,6 +103,7 @@ class TaskAuthBroker:
         expires_at: datetime,
         git_push_target: str | None = None,
         git_push_ref: str | None = None,
+        git_push_commit: str | None = None,
     ) -> str:
         authorization_id = secrets.token_hex(16)
         record = {
@@ -115,6 +116,7 @@ class TaskAuthBroker:
             "revoked": False,
             "git_push_target": git_push_target,
             "git_push_ref": git_push_ref,
+            "git_push_commit": git_push_commit,
         }
         record["signature"] = self._signature(record)
         self.store.put_authorization(authorization_id, record)
@@ -151,6 +153,7 @@ class TaskAuthBroker:
         worker: str,
         requested_actions: list[str],
         now: datetime | None = None,
+        consume: bool = True,
     ) -> dict[str, Any]:
         self._audit(
             "authorization_requested",
@@ -166,6 +169,7 @@ class TaskAuthBroker:
                 worker=worker,
                 requested_actions=requested_actions,
                 now=now,
+                consume=consume,
             )
         except Exception as exc:
             self._audit(
@@ -179,7 +183,7 @@ class TaskAuthBroker:
             )
             raise
         self._audit(
-            "authorization_used",
+            "authorization_used" if consume else "authorization_validated",
             authorization_id=authorization_id,
             task_id=task_id,
             worker=worker,
@@ -197,6 +201,7 @@ class TaskAuthBroker:
         worker: str,
         requested_actions: list[str],
         now: datetime | None = None,
+        consume: bool = True,
     ) -> dict[str, Any]:
         raw = self.store.get_authorization(authorization_id)
         if raw is None:
@@ -222,7 +227,8 @@ class TaskAuthBroker:
                 raise ValueError(f"action not authorized: {action}")
         if self.store.is_used(authorization_id):
             raise ValueError("authorization already used")
-        self.store.mark_used(authorization_id)
+        if consume:
+            self.store.mark_used(authorization_id)
         return {
             "broker_called": True,
             "authorization_id": authorization_id,
@@ -233,7 +239,33 @@ class TaskAuthBroker:
             "expires_at": record["expires_at"],
             "git_push_target": record.get("git_push_target"),
             "git_push_ref": record.get("git_push_ref"),
+            "git_push_commit": record.get("git_push_commit"),
         }
+
+    def consume(
+        self,
+        *,
+        authorization_id: str,
+        task_id: str,
+        worker: str,
+        requested_actions: list[str],
+    ) -> None:
+        self._authorize(
+            authorization_id=authorization_id,
+            task_id=task_id,
+            worker=worker,
+            requested_actions=requested_actions,
+            consume=True,
+        )
+        self._audit(
+            "authorization_used",
+            authorization_id=authorization_id,
+            task_id=task_id,
+            worker=worker,
+            requested_actions=requested_actions,
+            result="ALLOW",
+            reason="",
+        )
 
 
 def load_task_authorization(
@@ -242,6 +274,7 @@ def load_task_authorization(
     worker: str | None = None,
     requested_actions: list[str] | None = None,
     audit_path: Path | None = None,
+    consume: bool = True,
 ) -> dict[str, Any]:
     data = json.loads(config_path.read_text(encoding="utf-8"))
     if data.get("schema_version") == 2:
@@ -265,6 +298,7 @@ def load_task_authorization(
             task_id=task_id,
             worker=worker,
             requested_actions=list(requested_actions or []),
+            consume=consume,
         )
 
     tasks = data.get("tasks")
@@ -289,3 +323,27 @@ def load_task_authorization(
         "git_push_target": raw.get("git_push_target"),
         "git_push_ref": raw.get("git_push_ref"),
     }
+
+
+def consume_task_authorization(
+    config_path: Path,
+    *,
+    authorization_id: str,
+    task_id: str,
+    worker: str,
+    requested_actions: list[str],
+    audit_path: Path | None = None,
+) -> None:
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    if data.get("schema_version") != 2:
+        return
+    broker = TaskAuthBroker(
+        LocalTestStore(config_path),
+        audit_path or config_path.with_name(config_path.stem + ".audit.jsonl"),
+    )
+    broker.consume(
+        authorization_id=authorization_id,
+        task_id=task_id,
+        worker=worker,
+        requested_actions=requested_actions,
+    )

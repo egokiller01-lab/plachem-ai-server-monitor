@@ -68,3 +68,17 @@ Git/Production처럼 위험한 작업은 별도 Controlled Lane으로 나중에 
 서명된 v2 인증은 Task ID, Worker, ALLOW/DENY, 만료시각, 취소 상태, Git 테스트 제약을 함께 검증합니다. 성공적으로 사용된 인증 ID는 다시 사용할 수 없습니다. 발급·거부·사용 결과는 JSONL 감사 로그로 남습니다. 서명키·서비스 비밀번호·API Key는 WorkerResult나 Worker prompt에 전달하지 않습니다.
 
 기존 `tasks` 형식 Mock 인증 데이터는 호환성을 위해 계속 읽을 수 있습니다. 새 v2 인증은 `schema_version: 2` Local Test Store를 사용합니다.
+
+## Action-only execution
+
+WorkerResult는 `result_type`으로 `artifact`와 `action_only`를 구분합니다. 기존 응답은 기본적으로 `artifact`로 처리되어 종전 Artifact 검증, Scope Guard, 원자적 적용 절차를 그대로 거칩니다. `action_only`는 Artifact가 없어야 하며, Task에서 명시적으로 감지되고 Broker가 허용한 Action만 Gateway가 집행합니다.
+
+Push-only 실행은 새 파일이나 Commit을 만들지 않습니다. 서명된 v2 Authorization의 `git_push_target`, `git_push_ref`, `git_push_commit`에 고정된 로컬 Mock Remote·테스트 Ref·Commit만 Push하며, 기존 Production 차단 및 `refs/heads/test10-` 제한을 유지합니다.
+
+Gateway는 서명된 Authorization을 Worker 실행 전에 검증만 하고, Artifact 적용과 승인 Action이 모두 성공한 뒤 소비합니다. 실행 전 WorkerResult 검증 실패나 Action 실행 실패는 `authorization_validated`로 기록되지만 소비되지 않으며, 성공한 실행만 `authorization_used`로 기록되어 재사용이 차단됩니다.
+
+## Read-only review results
+
+파일을 수정하지 않는 검토는 서명된 Authorization이 `read_only_review` Action을 명시적으로 허용할 때만 실행됩니다. Worker는 `result_type: "read_only"`, 빈 `artifacts`, `review_result: "PASS" | "FAIL"`, 문자열 배열 `findings`를 반환합니다. Gateway는 결과와 Findings를 기록하되 Artifact 적용이나 버전관리 작업은 실행하지 않습니다.
+
+인증 없는 검토, 다른 Action과 결합된 검토, Artifact를 포함한 read-only 결과는 모두 차단됩니다. 기존 `artifact` 및 `action_only` 검증 규칙은 그대로 유지됩니다.

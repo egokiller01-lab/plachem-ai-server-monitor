@@ -290,6 +290,340 @@ class FastGatewayTests(unittest.TestCase):
             self.assertEqual(record["auth"]["worker"], "achilles")
             self.assertTrue(record["auth"]["authorization_id"])
 
+    def test_authorized_read_only_review_accepts_zero_artifacts_and_findings(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            workspace = root / "delegation-demo"
+            workspace.mkdir()
+            source = workspace / "app.js"
+            source.write_text("unchanged\n", encoding="utf-8")
+            auth_path = root / "auth-v2.json"
+            broker = TaskAuthBroker(
+                LocalTestStore(auth_path, signing_key="gateway-test-key"),
+                root / "auth-audit.jsonl",
+            )
+            auth_id = broker.issue(
+                task_id="read-only-review-001",
+                worker="achilles",
+                allow=["read_only_review"],
+                deny=["workspace_modify", "git_commit", "git_push", "production_deploy"],
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+            )
+            review_result = {
+                "result_type": "read_only",
+                "status": "completed",
+                "summary": "review completed",
+                "reason": "",
+                "review_result": "PASS",
+                "findings": ["No blocking findings"],
+                "artifacts": [],
+            }
+
+            with mock.patch.object(g, "call_worker", return_value=review_result) as called:
+                record = g.run(
+                    {
+                        "task_id": "read-only-review-001",
+                        "agent": "achilles",
+                        "workspace": "delegation-demo",
+                        "task": "READ-ONLY code review를 수행해",
+                    },
+                    {"achilles": {"base_url": "unused", "model": "unused"}},
+                    dict(g.DEFAULT_POLICY),
+                    root,
+                    root / "runs.jsonl",
+                    auth_path,
+                )
+
+            self.assertEqual(called.call_count, 1)
+            self.assertEqual(record["status"], "PASS")
+            self.assertEqual(record["auth"]["requested"], ["read_only_review"])
+            self.assertEqual(record["result"]["review_result"], "PASS")
+            self.assertEqual(record["result"]["findings"], ["No blocking findings"])
+            self.assertEqual(record["result"]["changes"], [])
+            self.assertEqual(source.read_text(encoding="utf-8"), "unchanged\n")
+            self.assertFalse(record["git"]["commit"])
+            self.assertFalse(record["git"]["push"])
+            self.assertTrue(LocalTestStore(auth_path).is_used(auth_id))
+
+    def test_read_only_review_without_authorization_is_blocked_before_worker(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            workspace = root / "delegation-demo"
+            workspace.mkdir()
+            (workspace / "app.js").write_text("unchanged\n", encoding="utf-8")
+
+            with mock.patch.object(g, "call_worker") as called:
+                record = g.run(
+                    {
+                        "task_id": "unauthorized-review-001",
+                        "agent": "achilles",
+                        "workspace": "delegation-demo",
+                        "task": "READ-ONLY code review를 수행해",
+                    },
+                    {"achilles": {"base_url": "unused", "model": "unused"}},
+                    dict(g.DEFAULT_POLICY),
+                    root,
+                    root / "runs.jsonl",
+                )
+
+            self.assertEqual(called.call_count, 0)
+            self.assertEqual(record["status"], "BLOCKED")
+            self.assertEqual(record["result"]["reason"], "AUTH_REQUIRED_ACTION:read_only_review")
+
+    def test_read_only_review_rejects_worker_artifacts_without_applying_them(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            workspace = root / "delegation-demo"
+            workspace.mkdir()
+            source = workspace / "app.js"
+            source.write_text("unchanged\n", encoding="utf-8")
+            auth_path = root / "auth-v2.json"
+            broker = TaskAuthBroker(
+                LocalTestStore(auth_path, signing_key="gateway-test-key"),
+                root / "auth-audit.jsonl",
+            )
+            auth_id = broker.issue(
+                task_id="review-write-attempt-001",
+                worker="achilles",
+                allow=["read_only_review"],
+                deny=["workspace_modify", "git_commit", "git_push"],
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+            )
+            invalid_result = {
+                "result_type": "read_only",
+                "status": "completed",
+                "summary": "attempted write",
+                "reason": "",
+                "review_result": "PASS",
+                "findings": [],
+                "artifacts": [{"path": "app.js", "content": "modified\n"}],
+            }
+
+            with mock.patch.object(g, "call_worker", return_value=invalid_result):
+                record = g.run(
+                    {
+                        "task_id": "review-write-attempt-001",
+                        "agent": "achilles",
+                        "workspace": "delegation-demo",
+                        "task": "READ-ONLY code review를 수행해",
+                    },
+                    {"achilles": {"base_url": "unused", "model": "unused"}},
+                    dict(g.DEFAULT_POLICY),
+                    root,
+                    root / "runs.jsonl",
+                    auth_path,
+                )
+
+            self.assertEqual(record["status"], "FAIL")
+            self.assertEqual(source.read_text(encoding="utf-8"), "unchanged\n")
+            self.assertFalse(LocalTestStore(auth_path).is_used(auth_id))
+            self.assertIn("read_only_with_artifacts", record["attempts"][0]["failures"])
+
+    def test_read_only_review_commit_and_push_request_is_blocked_before_worker(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            workspace = root / "delegation-demo"
+            workspace.mkdir()
+            (workspace / "app.js").write_text("unchanged\n", encoding="utf-8")
+            auth_path = root / "auth-v2.json"
+            broker = TaskAuthBroker(
+                LocalTestStore(auth_path, signing_key="gateway-test-key"),
+                root / "auth-audit.jsonl",
+            )
+            auth_id = broker.issue(
+                task_id="review-git-attempt-001",
+                worker="achilles",
+                allow=["read_only_review"],
+                deny=["workspace_modify", "git_commit", "git_push"],
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+            )
+
+            with mock.patch.object(g, "call_worker") as called:
+                record = g.run(
+                    {
+                        "task_id": "review-git-attempt-001",
+                        "agent": "achilles",
+                        "workspace": "delegation-demo",
+                        "task": "READ-ONLY code review 후 git commit하고 git push해",
+                    },
+                    {"achilles": {"base_url": "unused", "model": "unused"}},
+                    dict(g.DEFAULT_POLICY),
+                    root,
+                    root / "runs.jsonl",
+                    auth_path,
+                )
+
+            self.assertEqual(called.call_count, 0)
+            self.assertEqual(record["status"], "BLOCKED")
+            self.assertIn("action not authorized: git_commit", record["result"]["reason"])
+            self.assertFalse(LocalTestStore(auth_path).is_used(auth_id))
+
+    def test_push_only_action_pushes_authorized_commit_without_artifacts_or_new_commit(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "repo"
+            remote = Path(td) / "remote.git"
+            root.mkdir()
+            subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+            subprocess.run(["git", "init", str(root)], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(root), "config", "user.name", "Test"], check=True)
+            subprocess.run(["git", "-C", str(root), "config", "user.email", "test@example.invalid"], check=True)
+            workspace = root / "delegation-demo"
+            workspace.mkdir()
+            (workspace / "app.js").write_text("ready\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(root), "add", "delegation-demo/app.js"], check=True)
+            subprocess.run(["git", "-C", str(root), "commit", "-m", "target"], check=True, capture_output=True)
+            target_commit = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            auth_path = root / "auth-v2.json"
+            broker = TaskAuthBroker(
+                LocalTestStore(auth_path, signing_key="gateway-test-key"),
+                root / "auth-audit.jsonl",
+            )
+            auth_id = broker.issue(
+                task_id="push-only-001",
+                worker="achilles",
+                allow=["git_push"],
+                deny=["workspace_modify", "git_commit", "production_deploy"],
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+                git_push_target=str(remote),
+                git_push_ref="refs/heads/test10-push-only",
+                git_push_commit=target_commit,
+            )
+            action_result = {
+                "result_type": "action_only",
+                "status": "completed",
+                "summary": "ready to push",
+                "reason": "",
+                "artifacts": [],
+            }
+
+            with mock.patch.object(g, "call_worker", return_value=action_result) as called:
+                record = g.run(
+                    {
+                        "task_id": "push-only-001",
+                        "agent": "achilles",
+                        "workspace": "delegation-demo",
+                        "task": "지정 commit을 git push해",
+                    },
+                    {"achilles": {"base_url": "unused", "model": "unused"}},
+                    dict(g.DEFAULT_POLICY),
+                    root,
+                    root / "runs.jsonl",
+                    auth_path,
+                )
+
+            self.assertEqual(called.call_count, 1)
+            self.assertEqual(record["status"], "PASS")
+            self.assertEqual(record["result"]["changes"], [])
+            self.assertFalse(record["git"]["commit"])
+            self.assertTrue(record["git"]["push"])
+            self.assertEqual(record["git"]["commit_sha"], target_commit)
+            self.assertEqual(
+                subprocess.run(
+                    ["git", f"--git-dir={remote}", "rev-parse", "refs/heads/test10-push-only"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip(),
+                target_commit,
+            )
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "-C", str(root), "rev-parse", "HEAD"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip(),
+                target_commit,
+            )
+            self.assertTrue(LocalTestStore(auth_path).is_used(auth_id))
+
+    def test_signed_authorization_is_not_consumed_when_worker_validation_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            workspace = root / "delegation-demo"
+            workspace.mkdir()
+            (workspace / "app.js").write_text("old\n", encoding="utf-8")
+            auth_path = root / "auth-v2.json"
+            broker = TaskAuthBroker(
+                LocalTestStore(auth_path, signing_key="gateway-test-key"),
+                root / "auth-audit.jsonl",
+            )
+            auth_id = broker.issue(
+                task_id="validation-failure-001",
+                worker="achilles",
+                allow=["workspace_modify"],
+                deny=["production_deploy"],
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+            )
+            invalid_result = {
+                "status": "completed",
+                "summary": "invalid empty artifact result",
+                "reason": "",
+                "artifacts": [],
+            }
+
+            with mock.patch.object(g, "call_worker", return_value=invalid_result):
+                record = g.run(
+                    {
+                        "task_id": "validation-failure-001",
+                        "agent": "achilles",
+                        "workspace": "delegation-demo",
+                        "task": "app.js를 수정해",
+                    },
+                    {"achilles": {"base_url": "unused", "model": "unused"}},
+                    dict(g.DEFAULT_POLICY),
+                    root,
+                    root / "runs.jsonl",
+                    auth_path,
+                )
+
+            self.assertEqual(record["status"], "FAIL")
+            self.assertFalse(LocalTestStore(auth_path).is_used(auth_id))
+
+    def test_action_only_result_requires_an_authorized_requested_action(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            workspace = root / "delegation-demo"
+            workspace.mkdir()
+            (workspace / "app.js").write_text("old\n", encoding="utf-8")
+            action_result = {
+                "result_type": "action_only",
+                "status": "completed",
+                "summary": "nothing to execute",
+                "reason": "",
+                "artifacts": [],
+            }
+
+            with mock.patch.object(g, "call_worker", return_value=action_result):
+                record = g.run(
+                    {
+                        "task_id": "empty-action-only-001",
+                        "agent": "achilles",
+                        "workspace": "delegation-demo",
+                        "task": "현재 상태를 확인해",
+                    },
+                    {"achilles": {"base_url": "unused", "model": "unused"}},
+                    dict(g.DEFAULT_POLICY),
+                    root,
+                    root / "runs.jsonl",
+                )
+
+            self.assertEqual(record["status"], "FAIL")
+            failure_text = "|".join(
+                failure
+                for attempt in record["attempts"]
+                for failure in attempt["failures"]
+            )
+            self.assertIn(
+                "action-only result requires an implemented authorized action",
+                failure_text,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
