@@ -11,6 +11,7 @@ if str(_GATEWAY_DIR) not in sys.path:
     sys.path.insert(0, str(_GATEWAY_DIR))
 
 import fast_gateway
+from agent_registry import AgentRegistry
 from mock_auth_broker import load_task_authorization
 
 
@@ -49,7 +50,7 @@ def validate_task_package(package: dict[str, Any]) -> None:
 def run_gateway(
     package: dict[str, Any],
     auth_path: Path,
-    agents_path: Path,
+    agents: dict[str, Any],
     policy_path: Path,
     project_root: Path,
     log_path: Path,
@@ -61,7 +62,6 @@ def run_gateway(
         "workspace": package.get("workspace", "."),
         "requested_actions": list(package["requested_actions"]),
     }
-    agents = fast_gateway.load_json(agents_path)
     policy = fast_gateway.merge_policy(policy_path)
     return fast_gateway.run(
         request,
@@ -84,6 +84,8 @@ def dispatch(
     task_id = package.get("task_id", "") if isinstance(package, dict) else ""
     try:
         validate_task_package(package)
+        registry = AgentRegistry.load(Path(agents_path))
+        registry.resolve(package["requested_worker"])
         auth = load_task_authorization(
             Path(auth_path),
             package["task_id"],
@@ -96,7 +98,7 @@ def dispatch(
         return run_gateway(
             package,
             Path(auth_path),
-            Path(agents_path),
+            registry.gateway_agents(),
             Path(policy_path),
             Path(project_root),
             Path(log_path),
