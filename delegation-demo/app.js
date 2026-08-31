@@ -55,11 +55,11 @@ document.addEventListener('DOMContentLoaded', function() {
 
   startBtn.addEventListener('click', function() {
     odysseyStatus.textContent = 'DELEGATING';
-    odysseyTask.textContent = 'Task A Authorized';
+    odysseyTask.textContent = 'Task A Bound';
     odysseyStep.textContent = '1/3';
 
     achillesStatus.textContent = 'WORKING';
-    achillesTask.textContent = 'Task A Authorized';
+    achillesTask.textContent = 'Task A Bound';
     achillesStep.textContent = '1/3';
 
     taskStatus.textContent = 'RUNNING';
@@ -94,11 +94,11 @@ document.addEventListener('DOMContentLoaded', function() {
 
   completeBtn.addEventListener('click', function() {
     odysseyStatus.textContent = 'COMPLETE';
-    odysseyTask.textContent = 'Task A Authorized';
+    odysseyTask.textContent = 'Task A Bound';
     odysseyStep.textContent = '3/3';
 
     achillesStatus.textContent = 'COMPLETE';
-    achillesTask.textContent = 'Task A Authorized';
+    achillesTask.textContent = 'Task A Bound';
     achillesStep.textContent = '3/3';
 
     taskStatus.textContent = 'COMPLETE';
