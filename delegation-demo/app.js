@@ -21,11 +21,22 @@ document.addEventListener('DOMContentLoaded', function() {
   const progressBar = document.getElementById('progress-bar');
   const progressText = document.getElementById('progress-text');
 
+  const speedNormalBtn = document.getElementById('speed-normal');
+  const speedFastBtn = document.getElementById('speed-fast');
+  const speedSlowBtn = document.getElementById('speed-slow');
+
   const INITIAL_LAST_UPDATE = '00:00:00';
   let isPaused = false;
   let progress = 0;
   let progressInterval = null;
   const recentEvents = [];
+
+  const SPEEDS = {
+    NORMAL: 100,
+    FAST: 50,
+    SLOW: 200
+  };
+  let currentSpeed = 'NORMAL';
 
   function formatLocalTime(date) {
     const h = String(date.getHours()).padStart(2, '0');
@@ -63,17 +74,38 @@ document.addEventListener('DOMContentLoaded', function() {
     progressText.textContent = progress + '%';
   }
 
+  function updateSpeedButtons() {
+    speedNormalBtn.classList.toggle('active', currentSpeed === 'NORMAL');
+    speedFastBtn.classList.toggle('active', currentSpeed === 'FAST');
+    speedSlowBtn.classList.toggle('active', currentSpeed === 'SLOW');
+  }
+
+  function setSpeed(speed) {
+    if (currentSpeed === speed) return;
+    currentSpeed = speed;
+    updateSpeedButtons();
+    if (progressInterval) {
+      clearInterval(progressInterval);
+      progressInterval = null;
+    }
+    if (!isPaused && progress < 100) {
+      startProgress();
+    }
+    addEvent('SPEED_' + speed);
+  }
+
   function startProgress() {
     if (progressInterval) {
       clearInterval(progressInterval);
     }
+    const intervalMs = SPEEDS[currentSpeed];
     progressInterval = setInterval(function() {
       if (!isPaused && progress < 100) {
         progress += 1;
         if (progress > 100) progress = 100;
         updateProgressDisplay();
       }
-    }, 100);
+    }, intervalMs);
   }
 
   function stopProgress() {
@@ -173,6 +205,21 @@ document.addEventListener('DOMContentLoaded', function() {
     updateProgressDisplay();
     stopProgress();
 
+    currentSpeed = 'NORMAL';
+    updateSpeedButtons();
+
     addEvent('RESET');
+  });
+
+  speedNormalBtn.addEventListener('click', function() {
+    setSpeed('NORMAL');
+  });
+
+  speedFastBtn.addEventListener('click', function() {
+    setSpeed('FAST');
+  });
+
+  speedSlowBtn.addEventListener('click', function() {
+    setSpeed('SLOW');
   });
 });

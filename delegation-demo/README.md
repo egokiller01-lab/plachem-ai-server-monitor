@@ -6,6 +6,7 @@ A self-contained static web dashboard for monitoring Odyssey and Achilles agent 
 - Odyssey and Achilles status cards
 - System status indicators
 - Interactive buttons: Start Demo, Complete Task, Reset
+- Execution speed control: NORMAL, FAST, SLOW
 
 ## Usage
 Open `index.html` in a web browser.
