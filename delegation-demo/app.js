@@ -28,6 +28,7 @@ document.addEventListener('DOMContentLoaded', function() {
 
   const INITIAL_LAST_UPDATE = '00:00:00';
   let isPaused = false;
+  let isRunning = false;
   let progress = 0;
   let progressInterval = null;
   const recentEvents = [];
@@ -81,6 +82,8 @@ document.addEventListener('DOMContentLoaded', function() {
       etaText.textContent = 'Complete';
     } else if (isPaused) {
       etaText.textContent = 'Paused';
+    } else if (!isRunning) {
+      etaText.textContent = '--';
     } else {
       const remaining = 100 - progress;
       const msPerStep = SPEEDS[currentSpeed];
@@ -104,7 +107,7 @@ document.addEventListener('DOMContentLoaded', function() {
       clearInterval(progressInterval);
       progressInterval = null;
     }
-    if (!isPaused && progress < 100) {
+    if (!isPaused && progress < 100 && isRunning) {
       startProgress();
     }
     updateETA();
@@ -145,6 +148,7 @@ document.addEventListener('DOMContentLoaded', function() {
     lastGatewayRun.textContent = 'RUNNING';
 
     isPaused = false;
+    isRunning = true;
     pauseBtn.disabled = false;
     pauseBtn.textContent = 'Pause Task';
 
@@ -195,6 +199,7 @@ document.addEventListener('DOMContentLoaded', function() {
     pauseBtn.disabled = true;
     pauseBtn.textContent = 'Pause Task';
     isPaused = false;
+    isRunning = false;
 
     progress = 100;
     updateProgressDisplay();
@@ -222,6 +227,7 @@ document.addEventListener('DOMContentLoaded', function() {
     pauseBtn.disabled = true;
     pauseBtn.textContent = 'Pause Task';
     isPaused = false;
+    isRunning = false;
 
     progress = 0;
     updateProgressDisplay();
