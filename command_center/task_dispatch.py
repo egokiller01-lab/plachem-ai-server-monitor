@@ -1,0 +1,110 @@
+from __future__ import annotations
+
+import hashlib
+import sys
+from pathlib import Path
+from typing import Any
+
+_ROOT = Path(__file__).resolve().parents[1]
+_GATEWAY_DIR = _ROOT / "plachem_fast_gateway"
+if str(_GATEWAY_DIR) not in sys.path:
+    sys.path.insert(0, str(_GATEWAY_DIR))
+
+import fast_gateway
+from mock_auth_broker import load_task_authorization
+
+
+_REQUIRED_FIELDS = {
+    "task_id",
+    "original_instruction",
+    "instruction_sha256",
+    "requested_worker",
+    "requested_actions",
+    "created_at",
+    "status",
+}
+
+
+def validate_task_package(package: dict[str, Any]) -> None:
+    if not isinstance(package, dict) or not _REQUIRED_FIELDS.issubset(package):
+        raise ValueError("invalid task package")
+    instruction = package["original_instruction"]
+    if not isinstance(instruction, str):
+        raise ValueError("original_instruction must be a string")
+    expected = hashlib.sha256(instruction.encode("utf-8")).hexdigest()
+    if package["instruction_sha256"] != expected:
+        raise ValueError("INSTRUCTION_SHA256_MISMATCH")
+    if not isinstance(package["task_id"], str) or not package["task_id"]:
+        raise ValueError("task_id is required")
+    if not isinstance(package["requested_worker"], str) or not package["requested_worker"]:
+        raise ValueError("requested_worker is required")
+    if not isinstance(package["requested_actions"], list) or not all(
+        isinstance(action, str) for action in package["requested_actions"]
+    ):
+        raise ValueError("requested_actions must be a list of strings")
+    if package["status"] != "CREATED":
+        raise ValueError("task package is not CREATED")
+
+
+def run_gateway(
+    package: dict[str, Any],
+    auth_path: Path,
+    agents_path: Path,
+    policy_path: Path,
+    project_root: Path,
+    log_path: Path,
+) -> dict[str, Any]:
+    request = {
+        "task_id": package["task_id"],
+        "agent": package["requested_worker"],
+        "task": package["original_instruction"],
+        "workspace": package.get("workspace", "."),
+        "requested_actions": list(package["requested_actions"]),
+    }
+    agents = fast_gateway.load_json(agents_path)
+    policy = fast_gateway.merge_policy(policy_path)
+    return fast_gateway.run(
+        request,
+        agents,
+        policy,
+        project_root.resolve(),
+        log_path,
+        auth_path.resolve(),
+    )
+
+
+def dispatch(
+    package: dict[str, Any],
+    auth_path: str | Path,
+    agents_path: str | Path,
+    policy_path: str | Path,
+    project_root: str | Path,
+    log_path: str | Path,
+) -> dict[str, Any]:
+    task_id = package.get("task_id", "") if isinstance(package, dict) else ""
+    try:
+        validate_task_package(package)
+        auth = load_task_authorization(
+            Path(auth_path),
+            package["task_id"],
+            package["requested_worker"],
+            list(package["requested_actions"]),
+            consume=False,
+        )
+        if not auth.get("broker_called"):
+            raise ValueError("authorization broker was not called")
+        return run_gateway(
+            package,
+            Path(auth_path),
+            Path(agents_path),
+            Path(policy_path),
+            Path(project_root),
+            Path(log_path),
+        )
+    except (OSError, TypeError, ValueError, KeyError) as exc:
+        return {
+            "task_id": task_id,
+            "status": "BLOCKED",
+            "reason": str(exc),
+            "worker_calls": 0,
+        }

@@ -627,3 +627,46 @@ class FastGatewayTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_explicit_read_only_action_survives_when_task_detection_is_empty(self):
+        self.assertEqual(
+            g.resolve_requested_actions("Read the supplied context only.", ["read_only_review"]),
+            ["read_only_review"],
+        )
+
+    def test_missing_explicit_actions_uses_legacy_task_detection(self):
+        self.assertEqual(
+            g.resolve_requested_actions("파일을 수정하고 git push를 실행해", None),
+            ["git_push"],
+        )
+
+    def test_detected_risk_action_is_added_to_explicit_actions(self):
+        self.assertEqual(
+            g.resolve_requested_actions(
+                "Read-only review and then git push를 실행해",
+                ["read_only_review"],
+            ),
+            ["read_only_review", "git_push"],
+        )
+
+    def test_authorize_uses_resolved_actions_for_validator_contract(self):
+        auth = {"allow": ["read_only_review"], "deny": []}
+        decision = g.authorize_requested_actions(
+            "Read the supplied context only.",
+            list(g.DEFAULT_POLICY["blocked_actions"]),
+            auth,
+            ["read_only_review"],
+        )
+        self.assertTrue(decision["allowed"])
+        self.assertEqual(decision["requested"], ["read_only_review"])
+
+    def test_authorize_keeps_resolved_risk_actions(self):
+        auth = {"allow": ["read_only_review", "git_push"], "deny": []}
+        decision = g.authorize_requested_actions(
+            "Read the supplied context only.",
+            list(g.DEFAULT_POLICY["blocked_actions"]),
+            auth,
+            ["read_only_review", "git_push"],
+        )
+        self.assertTrue(decision["allowed"])
+        self.assertEqual(decision["requested"], ["read_only_review", "git_push"])

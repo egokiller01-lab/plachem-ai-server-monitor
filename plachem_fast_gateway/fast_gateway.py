@@ -149,12 +149,20 @@ def detect_requested_actions(task: str) -> list[str]:
     return requested
 
 
+def resolve_requested_actions(task: str, explicit_actions: list[str] | None) -> list[str]:
+    detected_actions = detect_requested_actions(task)
+    if not explicit_actions:
+        return detected_actions
+    return list(dict.fromkeys([*explicit_actions, *detected_actions]))
+
+
 def authorize_requested_actions(
     task: str,
     blocked_actions: list[str],
     authorization: dict[str, Any] | None,
+    resolved_actions: list[str] | None = None,
 ) -> dict[str, Any]:
-    requested = detect_requested_actions(task)
+    requested = list(resolved_actions) if resolved_actions is not None else detect_requested_actions(task)
     if authorization is None:
         if "read_only_review" in requested:
             return {
@@ -565,7 +573,12 @@ def run(
         except Exception as exc:
             return blocked_record(f"AUTH_FAILED:{type(exc).__name__}:{str(exc)[:160]}", None, [])
 
-    decision = authorize_requested_actions(task, list(policy["blocked_actions"]), authorization)
+    decision = authorize_requested_actions(
+        task,
+        list(policy["blocked_actions"]),
+        authorization,
+        detected_actions,
+    )
     requested_actions = list(decision["requested"])
     if not decision["allowed"]:
         return blocked_record(str(decision["reason"]), authorization, requested_actions)
@@ -587,6 +600,8 @@ def run(
     max_attempts = int(policy["max_retries"]) + 1
     previous_error: str | None = None
     result: dict[str, Any] | None = None
+    worker_result_type: str | None = None
+    execution_evidence: dict[str, Any] | None = None
     git_result: dict[str, Any] = {"commit": False, "push": False, "commit_sha": "", "push_ref": ""}
 
     for attempt_no in range(1, max_attempts + 1):
@@ -595,13 +610,21 @@ def run(
         astart = time.monotonic()
         try:
             raw = call_worker(agents[agent_name], prompt, int(policy["timeout_seconds"]))
+            current_evidence = getattr(raw, "execution_evidence", None)
+            if current_evidence is not None:
+                if not isinstance(current_evidence, dict):
+                    raise RuntimeError("invalid worker execution evidence")
+                execution_evidence = dict(current_evidence)
             valid, failures, normalized = validate_result(workspace, raw, policy)
-            attempts.append({
+            attempt_record = {
                 "attempt": attempt_no,
                 "elapsed_seconds": round(time.monotonic() - astart, 3),
                 "valid": valid,
                 "failures": failures,
-            })
+            }
+            if current_evidence is not None:
+                attempt_record["execution_evidence"] = dict(current_evidence)
+            attempts.append(attempt_record)
             if not valid:
                 error_fp = "|".join(failures) or "VALIDATION_FAILED"
                 if previous_error == error_fp:
@@ -611,6 +634,7 @@ def run(
                 continue
 
             result_type = raw.get("result_type", "artifact")
+            worker_result_type = result_type
             if "read_only_review" in requested_actions and result_type != "read_only":
                 raise ValueError("read-only review cannot return artifacts or executable actions")
             if result_type == "read_only" and set(requested_actions) != {"read_only_review"}:
@@ -695,10 +719,13 @@ def run(
         "context_files": [{"path": x["path"], "sha256": x["sha256"]} for x in context],
         "attempts": attempts,
         "result": result,
+        "result_type": worker_result_type,
         "git": git_result,
         "elapsed_seconds": round(time.monotonic() - started, 3),
         "status": final_status,
     }
+    if execution_evidence is not None:
+        record["execution_evidence"] = execution_evidence
     save_jsonl(log_path, record)
     return record
 
