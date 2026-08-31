@@ -1,5 +1,6 @@
 document.addEventListener('DOMContentLoaded', function() {
   const startBtn = document.getElementById('start-demo');
+  const pauseBtn = document.getElementById('pause-task');
   const completeBtn = document.getElementById('complete-task');
   const resetBtn = document.getElementById('reset');
 
@@ -14,8 +15,12 @@ document.addEventListener('DOMContentLoaded', function() {
   const achillesLastUpdate = document.getElementById('achilles-last-update');
 
   const taskStatus = document.getElementById('task-status');
+  const lastGatewayRun = document.getElementById('last-gateway-run');
+  const recentEventsList = document.getElementById('recent-events-list');
 
   const INITIAL_LAST_UPDATE = '00:00:00';
+  let isPaused = false;
+  const recentEvents = [];
 
   function formatLocalTime(date) {
     const h = String(date.getHours()).padStart(2, '0');
@@ -30,32 +35,81 @@ document.addEventListener('DOMContentLoaded', function() {
     achillesLastUpdate.textContent = now;
   }
 
+  function addEvent(type) {
+    const now = formatLocalTime(new Date());
+    recentEvents.unshift({ type: type, time: now });
+    if (recentEvents.length > 5) {
+      recentEvents.pop();
+    }
+    renderEvents();
+  }
+
+  function renderEvents() {
+    recentEventsList.innerHTML = '';
+    recentEvents.forEach(function(event) {
+      const li = document.createElement('li');
+      li.textContent = event.type + ' - ' + event.time;
+      recentEventsList.appendChild(li);
+    });
+  }
+
   startBtn.addEventListener('click', function() {
     odysseyStatus.textContent = 'DELEGATING';
-    odysseyTask.textContent = 'Demo Task';
+    odysseyTask.textContent = 'Authorized Task';
     odysseyStep.textContent = '1/3';
 
     achillesStatus.textContent = 'WORKING';
-    achillesTask.textContent = 'Demo Task';
+    achillesTask.textContent = 'Authorized Task';
     achillesStep.textContent = '1/3';
 
     taskStatus.textContent = 'RUNNING';
+    lastGatewayRun.textContent = 'RUNNING';
 
+    isPaused = false;
+    pauseBtn.disabled = false;
+    pauseBtn.textContent = 'Pause Task';
+
+    updateLastUpdate();
+    addEvent('START');
+  });
+
+  pauseBtn.addEventListener('click', function() {
+    if (isPaused) {
+      odysseyStatus.textContent = 'DELEGATING';
+      achillesStatus.textContent = 'WORKING';
+      taskStatus.textContent = 'RUNNING';
+      pauseBtn.textContent = 'Pause Task';
+      isPaused = false;
+      addEvent('RESUME');
+    } else {
+      odysseyStatus.textContent = 'PAUSED';
+      achillesStatus.textContent = 'PAUSED';
+      taskStatus.textContent = 'PAUSED';
+      pauseBtn.textContent = 'Resume Task';
+      isPaused = true;
+      addEvent('PAUSE');
+    }
     updateLastUpdate();
   });
 
   completeBtn.addEventListener('click', function() {
     odysseyStatus.textContent = 'COMPLETE';
-    odysseyTask.textContent = 'Demo Task';
+    odysseyTask.textContent = 'Authorized Task';
     odysseyStep.textContent = '3/3';
 
     achillesStatus.textContent = 'COMPLETE';
-    achillesTask.textContent = 'Demo Task';
+    achillesTask.textContent = 'Authorized Task';
     achillesStep.textContent = '3/3';
 
     taskStatus.textContent = 'COMPLETE';
+    lastGatewayRun.textContent = 'VERIFIED';
+
+    pauseBtn.disabled = true;
+    pauseBtn.textContent = 'Pause Task';
+    isPaused = false;
 
     updateLastUpdate();
+    addEvent('COMPLETE');
   });
 
   resetBtn.addEventListener('click', function() {
@@ -67,9 +121,16 @@ document.addEventListener('DOMContentLoaded', function() {
     achillesTask.textContent = 'None';
     achillesStep.textContent = '0/0';
 
-    taskStatus.textContent = 'RUNNING';
+    taskStatus.textContent = 'IDLE';
+    lastGatewayRun.textContent = 'NONE';
 
     odysseyLastUpdate.textContent = INITIAL_LAST_UPDATE;
     achillesLastUpdate.textContent = INITIAL_LAST_UPDATE;
+
+    pauseBtn.disabled = true;
+    pauseBtn.textContent = 'Pause Task';
+    isPaused = false;
+
+    addEvent('RESET');
   });
 });
