@@ -13,6 +13,10 @@ if str(_GATEWAY_DIR) not in sys.path:
 import fast_gateway
 from agent_registry import AgentRegistry
 from mock_auth_broker import load_task_authorization
+from workspace_registry import WorkspaceRegistry
+
+
+_WORKSPACE_REGISTRY_PATH = Path(__file__).resolve().with_name("workspaces.json")
 
 
 _REQUIRED_FIELDS = {
@@ -84,6 +88,11 @@ def dispatch(
     task_id = package.get("task_id", "") if isinstance(package, dict) else ""
     try:
         validate_task_package(package)
+        workspace_registry = WorkspaceRegistry.load(_WORKSPACE_REGISTRY_PATH)
+        workspace = workspace_registry.validate(
+            package.get("project_id", ""),
+            project_root,
+        )
         registry = AgentRegistry.load(Path(agents_path))
         registry.resolve(package["requested_worker"])
         auth = load_task_authorization(
@@ -100,7 +109,7 @@ def dispatch(
             Path(auth_path),
             registry.gateway_agents(),
             Path(policy_path),
-            Path(project_root),
+            workspace.canonical_root,
             Path(log_path),
         )
     except (OSError, TypeError, ValueError, KeyError) as exc:

@@ -1,0 +1,9 @@
+{
+  "workspaces": {
+    "plachem-agent-control": {
+      "root": "E:\\PLACHEM-Agent-Control\\repo",
+      "branch": "phase2-worker-identity",
+      "status": "ACTIVE"
+    }
+  }
+}

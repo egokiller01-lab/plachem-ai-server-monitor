@@ -8,17 +8,50 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import task_dispatch
+import workspace_registry
+
+
+PROJECT_ID = "plachem-agent-control"
+BRANCH = "phase2-worker-identity"
 
 
 class TaskDispatchTests(unittest.TestCase):
     def setUp(self):
         self._temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self._temp_dir.cleanup)
-        self.agents_path = self.write_agents(Path(self._temp_dir.name))
+        self.temp_root = Path(self._temp_dir.name)
+        self.project_root = self.temp_root / "project"
+        self.project_root.mkdir()
+        self.agents_path = self.write_agents(self.temp_root)
+        self.workspace_registry_path = self.write_workspaces(
+            self.temp_root,
+            self.project_root,
+        )
+        registry_patcher = mock.patch.object(
+            task_dispatch,
+            "_WORKSPACE_REGISTRY_PATH",
+            self.workspace_registry_path,
+        )
+        registry_patcher.start()
+        self.addCleanup(registry_patcher.stop)
+        branch_patcher = mock.patch.object(
+            workspace_registry,
+            "current_git_branch",
+            return_value=BRANCH,
+        )
+        branch_patcher.start()
+        self.addCleanup(branch_patcher.stop)
 
-    def package(self, instruction="읽기 전용 검토를 수행해", worker="athena", actions=None):
+    def package(
+        self,
+        instruction="읽기 전용 검토를 수행해",
+        worker="athena",
+        actions=None,
+        project_id=PROJECT_ID,
+    ):
         return {
             "task_id": "dispatch-001",
+            "project_id": project_id,
             "original_instruction": instruction,
             "instruction_sha256": hashlib.sha256(instruction.encode("utf-8")).hexdigest(),
             "requested_worker": worker,
@@ -45,6 +78,34 @@ class TaskDispatchTests(unittest.TestCase):
         )
         return path
 
+    def write_workspaces(self, root: Path, project_root: Path) -> Path:
+        path = root / "workspaces.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "workspaces": {
+                        PROJECT_ID: {
+                            "root": str(project_root),
+                            "branch": BRANCH,
+                            "status": "ACTIVE",
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    def dispatch(self, package, *, project_root=None):
+        return task_dispatch.dispatch(
+            package,
+            "auth.json",
+            self.agents_path,
+            "policy.json",
+            project_root if project_root is not None else self.project_root,
+            Path("runs.jsonl"),
+        )
+
     def test_unknown_agent_blocks_before_broker_and_gateway(self):
         package = self.package(worker="missing")
         with tempfile.TemporaryDirectory() as td:
@@ -58,7 +119,7 @@ class TaskDispatchTests(unittest.TestCase):
                     "auth.json",
                     agents_path,
                     "policy.json",
-                    Path("."),
+                    self.project_root,
                     Path("runs.jsonl"),
                 )
 
@@ -67,7 +128,7 @@ class TaskDispatchTests(unittest.TestCase):
         broker.assert_not_called()
         gateway.assert_not_called()
 
-    def test_valid_package_checks_auth_and_hands_off_to_gateway(self):
+    def test_valid_package_checks_workspace_auth_and_hands_off_to_gateway(self):
         package = self.package()
         auth = {"broker_called": True, "allow": ["read_only_review"], "worker": "athena"}
         gateway_result = {"status": "PASS", "task_id": "dispatch-001"}
@@ -77,7 +138,7 @@ class TaskDispatchTests(unittest.TestCase):
         ):
             gateway.merge_policy.return_value = {}
             gateway.run.return_value = gateway_result
-            result = task_dispatch.dispatch(package, "auth.json", self.agents_path, "policy.json", Path("."), Path("runs.jsonl"))
+            result = self.dispatch(package)
         self.assertEqual(result, gateway_result)
         broker.assert_called_once_with(Path("auth.json"), "dispatch-001", "athena", ["read_only_review"], consume=False)
         gateway.run.assert_called_once()
@@ -88,6 +149,7 @@ class TaskDispatchTests(unittest.TestCase):
             gateway.run.call_args.args[1],
             json.loads(self.agents_path.read_text(encoding="utf-8")),
         )
+        self.assertEqual(gateway.run.call_args.args[3], self.project_root.resolve())
         gateway.load_json.assert_not_called()
 
     def test_missing_or_rejected_auth_blocks_before_gateway(self):
@@ -96,7 +158,7 @@ class TaskDispatchTests(unittest.TestCase):
             mock.patch.object(task_dispatch, "load_task_authorization", side_effect=ValueError("authorization not found")),
             mock.patch.object(task_dispatch, "run_gateway") as gateway,
         ):
-            result = task_dispatch.dispatch(package, "auth.json", self.agents_path, "policy.json", Path("."), Path("runs.jsonl"))
+            result = self.dispatch(package)
         self.assertEqual(result["status"], "BLOCKED")
         self.assertIn("authorization not found", result["reason"])
         gateway.assert_not_called()
@@ -108,7 +170,7 @@ class TaskDispatchTests(unittest.TestCase):
             mock.patch.object(task_dispatch, "load_task_authorization") as broker,
             mock.patch.object(task_dispatch, "run_gateway") as gateway,
         ):
-            result = task_dispatch.dispatch(package, "auth.json", self.agents_path, "policy.json", Path("."), Path("runs.jsonl"))
+            result = self.dispatch(package)
         self.assertEqual(result["status"], "BLOCKED")
         self.assertEqual(result["reason"], "INSTRUCTION_SHA256_MISMATCH")
         broker.assert_not_called()
@@ -120,9 +182,62 @@ class TaskDispatchTests(unittest.TestCase):
             mock.patch.object(task_dispatch, "load_task_authorization", side_effect=ValueError("action not authorized")),
             mock.patch.object(task_dispatch, "run_gateway") as gateway,
         ):
-            result = task_dispatch.dispatch(package, "auth.json", self.agents_path, "policy.json", Path("."), Path("runs.jsonl"))
+            result = self.dispatch(package)
         self.assertEqual(result["status"], "BLOCKED")
         self.assertIn("action not authorized", result["reason"])
+        gateway.assert_not_called()
+
+    def test_old_c_repo_blocks_before_broker_and_gateway(self):
+        with (
+            mock.patch.object(task_dispatch, "load_task_authorization") as broker,
+            mock.patch.object(task_dispatch, "run_gateway") as gateway,
+        ):
+            result = self.dispatch(
+                self.package(),
+                project_root=Path(r"C:\Users\egomine2\PLACHEM-Agent-Control"),
+            )
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertIn("WORKSPACE_PATH_MISMATCH", result["reason"])
+        broker.assert_not_called()
+        gateway.assert_not_called()
+
+    def test_appdata_temp_worktree_blocks_before_broker_and_gateway(self):
+        with (
+            mock.patch.object(task_dispatch, "load_task_authorization") as broker,
+            mock.patch.object(task_dispatch, "run_gateway") as gateway,
+        ):
+            result = self.dispatch(
+                self.package(),
+                project_root=Path(
+                    r"C:\Users\egomine2\AppData\Local\Temp\PLACHEM-CORE4-Agent-Registry"
+                ),
+            )
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertIn("WORKSPACE_PATH_MISMATCH", result["reason"])
+        broker.assert_not_called()
+        gateway.assert_not_called()
+
+    def test_wrong_branch_blocks_before_broker_and_gateway(self):
+        with (
+            mock.patch.object(workspace_registry, "current_git_branch", return_value="wrong-branch"),
+            mock.patch.object(task_dispatch, "load_task_authorization") as broker,
+            mock.patch.object(task_dispatch, "run_gateway") as gateway,
+        ):
+            result = self.dispatch(self.package())
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertIn("WORKSPACE_BRANCH_MISMATCH", result["reason"])
+        broker.assert_not_called()
+        gateway.assert_not_called()
+
+    def test_unknown_workspace_blocks_before_broker_and_gateway(self):
+        with (
+            mock.patch.object(task_dispatch, "load_task_authorization") as broker,
+            mock.patch.object(task_dispatch, "run_gateway") as gateway,
+        ):
+            result = self.dispatch(self.package(project_id="missing"))
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertEqual(result["reason"], "UNKNOWN_WORKSPACE:missing")
+        broker.assert_not_called()
         gateway.assert_not_called()
 
 
