@@ -899,9 +899,6 @@ class FastGatewayTests(unittest.TestCase):
             )
 
 
-if __name__ == "__main__":
-    unittest.main()
-
     def test_explicit_read_only_action_survives_when_task_detection_is_empty(self):
         self.assertEqual(
             g.resolve_requested_actions("Read the supplied context only.", ["read_only_review"]),
@@ -944,3 +941,7 @@ if __name__ == "__main__":
         )
         self.assertTrue(decision["allowed"])
         self.assertEqual(decision["requested"], ["read_only_review", "git_push"])
+
+
+if __name__ == "__main__":
+    unittest.main()

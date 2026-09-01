@@ -730,7 +730,8 @@ def run(
         return blocked_record("UNKNOWN_AGENT", None, [])
 
     authorization: dict[str, Any] | None = None
-    detected_actions = detect_requested_actions(task)
+    explicit_actions = task_request.get("requested_actions")
+    detected_actions = resolve_requested_actions(task, explicit_actions)
     if auth_broker_path is not None:
         try:
             authorization = load_mock_authorization(
