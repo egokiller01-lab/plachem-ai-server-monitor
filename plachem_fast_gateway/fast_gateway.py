@@ -14,7 +14,7 @@ import time
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from mock_auth_broker import consume_task_authorization, load_task_authorization
 
@@ -309,8 +309,10 @@ def build_worker_prompt(
     workspace_name: str,
     context: list[dict[str, Any]],
     policy: dict[str, Any],
-    authorization: dict[str, Any] | None = None,
+    authorization: Mapping[str, Any] | None = None,
     requested_actions: list[str] | None = None,
+    *,
+    worker_id: str,
 ) -> str:
     contract = {
         "result_type": "artifact|action_only|read_only",
@@ -344,7 +346,7 @@ def build_worker_prompt(
     }
     return (
         "/no_think\n"
-        "You are Achilles, a bounded implementation worker. The Gateway already handled policy. "
+        f"You are {worker_id}, a bounded implementation worker. The Gateway already handled policy. "
         "Do the requested work using only the supplied context. Do not use tools, filesystem, git, network, "
         "or external code. Return exactly one JSON object and nothing else. "
         "For every file you change or create, return its COMPLETE contents in artifacts. "
@@ -595,6 +597,7 @@ def run(
         policy,
         authorization,
         requested_actions,
+        worker_id=agent_name,
     )
     attempts: list[dict[str, Any]] = []
     max_attempts = int(policy["max_retries"]) + 1

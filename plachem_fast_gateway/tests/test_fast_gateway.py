@@ -108,6 +108,20 @@ class FastGatewayTests(unittest.TestCase):
             items = g.collect_context(ws, policy)
             self.assertEqual(len(items), 2)
 
+    def test_worker_prompt_uses_current_request_agent_identity(self):
+        policy = dict(g.DEFAULT_POLICY)
+
+        for worker_id in ("worker-a", "worker-b", "achilles"):
+            with self.subTest(worker_id=worker_id):
+                prompt = g.build_worker_prompt(
+                    task="Perform a bounded review",
+                    workspace_name="command_center",
+                    context=[],
+                    policy=policy,
+                    worker_id=worker_id,
+                )
+                self.assertIn(f"You are {worker_id}, a bounded implementation worker.", prompt)
+
     def test_mock_broker_authorizes_only_matching_task_actions(self):
         with tempfile.TemporaryDirectory() as td:
             broker_path = Path(td) / "broker.json"
