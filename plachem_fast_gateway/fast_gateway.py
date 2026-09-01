@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -356,7 +357,177 @@ def build_worker_prompt(
     )
 
 
+class WorkerResponse(dict):
+    execution_evidence: dict[str, Any]
+
+
+def resolve_hermes_profile_state_db(profile: str) -> Path:
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if not local_app_data:
+        raise RuntimeError("LOCALAPPDATA is required for Hermes profile evidence")
+    return Path(local_app_data) / "hermes" / "profiles" / profile / "state.db"
+
+
+def load_hermes_session_evidence(
+    state_db: Path,
+    session_id: str,
+    *,
+    expected_profile: str,
+    expected_model: str,
+    expected_provider: str,
+) -> dict[str, Any]:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", session_id):
+        raise RuntimeError("invalid Hermes session id")
+    if not state_db.is_file():
+        raise RuntimeError("Hermes profile state database not found")
+    uri = state_db.resolve().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=2)
+    try:
+        row = conn.execute(
+            """SELECT model, billing_provider, profile_name, ended_at, end_reason,
+                      api_call_count, tool_call_count, input_tokens, output_tokens
+               FROM sessions WHERE id = ?""",
+            (session_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        raise RuntimeError("Hermes session evidence not found")
+    model, provider, profile, ended_at, end_reason, api_calls, tool_calls, input_tokens, output_tokens = row
+    if model != expected_model or provider != expected_provider or profile != expected_profile:
+        raise RuntimeError("Hermes session model/provider/profile mismatch")
+    if ended_at is None or not end_reason or int(api_calls or 0) < 1:
+        raise RuntimeError("Hermes session evidence is incomplete")
+    if int(tool_calls or 0) != 0:
+        raise RuntimeError("Hermes profile worker used tools")
+    return {
+        "source": "hermes_state_db",
+        "session_id": session_id,
+        "profile": profile,
+        "model": model,
+        "provider": provider,
+        "api_calls": int(api_calls or 0),
+        "tool_calls": int(tool_calls or 0),
+        "input_tokens": int(input_tokens or 0),
+        "output_tokens": int(output_tokens or 0),
+        "completed": True,
+    }
+
+
+def _parse_worker_result(content: str) -> dict[str, Any]:
+    if len(content.encode("utf-8")) > 1_000_000:
+        raise ValueError("worker result exceeds output limit")
+    result = json.loads(content.strip())
+    if not isinstance(result, dict):
+        raise ValueError("worker result must be one JSON object")
+    return result
+
+
+def _call_hermes_profile_worker(
+    agent: dict[str, Any], prompt: str, timeout_seconds: int
+) -> dict[str, Any]:
+    profile = str(agent.get("profile") or "")
+    model = str(agent.get("model") or "")
+    inference_provider = str(agent.get("inference_provider") or "")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", profile):
+        raise ValueError("invalid Hermes profile name")
+    if not model or not inference_provider:
+        raise ValueError("Hermes profile adapter requires model and inference_provider")
+
+    child_env_keys = {
+        "APPDATA",
+        "COMSPEC",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "LOCALAPPDATA",
+        "PATH",
+        "PATHEXT",
+        "SYSTEMDRIVE",
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
+        "WINDIR",
+    }
+    child_env = {
+        key: value for key, value in os.environ.items() if key.upper() in child_env_keys
+    }
+    child_env.setdefault(
+        "SystemDrive",
+        os.environ.get("HOMEDRIVE") or Path(os.environ.get("SYSTEMROOT", "C:\\Windows")).drive or "C:",
+    )
+    child_env["NO_COLOR"] = "1"
+    child_env["PYTHONIOENCODING"] = "utf-8"
+
+    with tempfile.TemporaryDirectory(prefix="fast-gateway-athena-") as td:
+        query_path = Path(td) / "query.txt"
+        query_path.write_text(prompt, encoding="utf-8")
+        command = [
+            "hermes",
+            "-p",
+            profile,
+            "--model",
+            model,
+            "--provider",
+            inference_provider,
+            "--ignore-user-config",
+            "--ignore-rules",
+            "chat",
+            "--toolsets",
+            "context_engine",
+            "--query-file",
+            str(query_path),
+            "-Q",
+            "--source",
+            "tool",
+        ]
+        stdout_path = Path(td) / "stdout.txt"
+        stderr_path = Path(td) / "stderr.txt"
+        with (
+            stdout_path.open("w", encoding="utf-8", newline="") as stdout_handle,
+            stderr_path.open("w", encoding="utf-8", newline="") as stderr_handle,
+        ):
+            completed = subprocess.run(
+                command,
+                check=False,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_handle,
+                stderr=stderr_handle,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout_seconds,
+                env=child_env,
+            )
+        stdout_text = stdout_path.read_text(encoding="utf-8")
+        stderr_text = stderr_path.read_text(encoding="utf-8")
+        if not stdout_text and not stderr_text:
+            raise RuntimeError("Hermes profile worker returned no output")
+        if completed.returncode != 0:
+            detail = (stderr_text or stdout_text).strip().replace("\n", " ")[:300]
+            raise RuntimeError(f"Hermes profile worker failed: {detail}")
+        session_ids = re.findall(
+            r"(?m)^session_id:\s*([A-Za-z0-9][A-Za-z0-9_-]{0,127})\s*$",
+            stderr_text,
+        )
+        if len(session_ids) != 1:
+            raise RuntimeError("Hermes profile worker did not provide one session id")
+        evidence = load_hermes_session_evidence(
+            resolve_hermes_profile_state_db(profile),
+            session_ids[0],
+            expected_profile=profile,
+            expected_model=model,
+            expected_provider=inference_provider,
+        )
+        response = WorkerResponse(_parse_worker_result(stdout_text))
+        response.execution_evidence = evidence
+        return response
+
+
 def call_worker(agent: dict[str, Any], prompt: str, timeout_seconds: int) -> dict[str, Any]:
+    if agent.get("provider") == "hermes-profile":
+        return _call_hermes_profile_worker(agent, prompt, timeout_seconds)
+
     payload = {
         "model": agent["model"],
         "messages": [{"role": "user", "content": prompt}],
@@ -374,12 +545,8 @@ def call_worker(agent: dict[str, Any], prompt: str, timeout_seconds: int) -> dic
     )
     with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
         body = json.loads(response.read().decode("utf-8"))
-    content = body["choices"][0]["message"]["content"].strip()
-    # Strict: whole response must be exactly one JSON object.
-    result = json.loads(content)
-    if not isinstance(result, dict):
-        raise ValueError("worker result must be one JSON object")
-    return result
+    content = body["choices"][0]["message"]["content"]
+    return _parse_worker_result(content)
 
 
 def validate_result(workspace: Path, result: dict[str, Any], policy: dict[str, Any]) -> tuple[bool, list[str], list[dict[str, Any]]]:

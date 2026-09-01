@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -107,6 +108,180 @@ class FastGatewayTests(unittest.TestCase):
             policy["max_context_files"] = 2
             items = g.collect_context(ws, policy)
             self.assertEqual(len(items), 2)
+
+    def test_agents_registry_contains_athena_hermes_profile(self):
+        agents = g.load_json(g.ROOT / "agents.json")
+        self.assertEqual(
+            agents["athena"],
+            {
+                "provider": "hermes-profile",
+                "profile": "athena",
+                "inference_provider": "openai-codex",
+                "model": "gpt-5.6-luna",
+                "max_tokens": 8000,
+            },
+        )
+
+    def test_load_hermes_session_evidence_verifies_actual_model_and_provider(self):
+        with tempfile.TemporaryDirectory() as td:
+            state_db = Path(td) / "state.db"
+            conn = sqlite3.connect(state_db)
+            try:
+                conn.execute(
+                    """CREATE TABLE sessions (
+                        id TEXT PRIMARY KEY,
+                        model TEXT,
+                        billing_provider TEXT,
+                        profile_name TEXT,
+                        ended_at REAL,
+                        end_reason TEXT,
+                        api_call_count INTEGER,
+                        tool_call_count INTEGER,
+                        input_tokens INTEGER,
+                        output_tokens INTEGER
+                    )"""
+                )
+                conn.execute(
+                    "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        "session-123",
+                        "gpt-5.6-luna",
+                        "openai-codex",
+                        "athena",
+                        123.0,
+                        "cli_close",
+                        1,
+                        0,
+                        100,
+                        20,
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            evidence = g.load_hermes_session_evidence(
+                state_db,
+                "session-123",
+                expected_profile="athena",
+                expected_model="gpt-5.6-luna",
+                expected_provider="openai-codex",
+            )
+
+            self.assertEqual(evidence["source"], "hermes_state_db")
+            self.assertEqual(evidence["session_id"], "session-123")
+            self.assertEqual(evidence["model"], "gpt-5.6-luna")
+            self.assertEqual(evidence["provider"], "openai-codex")
+            self.assertEqual(evidence["profile"], "athena")
+            self.assertEqual(evidence["api_calls"], 1)
+            self.assertEqual(evidence["tool_calls"], 0)
+            self.assertEqual(evidence["input_tokens"], 100)
+            self.assertEqual(evidence["output_tokens"], 20)
+            self.assertTrue(evidence["completed"])
+
+    def test_call_worker_uses_hermes_profile_adapter_without_tools(self):
+        agent = {
+            "provider": "hermes-profile",
+            "profile": "athena",
+            "inference_provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "max_tokens": 8000,
+        }
+        worker_result = {
+            "result_type": "read_only",
+            "status": "completed",
+            "summary": "reviewed",
+            "reason": "",
+            "review_result": "PASS",
+            "findings": [],
+            "artifacts": [],
+        }
+        captured: dict[str, str] = {}
+
+        with tempfile.TemporaryDirectory() as td:
+            state_db = Path(td) / "state.db"
+            conn = sqlite3.connect(state_db)
+            try:
+                conn.execute(
+                    """CREATE TABLE sessions (
+                        id TEXT PRIMARY KEY,
+                        model TEXT,
+                        billing_provider TEXT,
+                        profile_name TEXT,
+                        ended_at REAL,
+                        end_reason TEXT,
+                        api_call_count INTEGER,
+                        tool_call_count INTEGER,
+                        input_tokens INTEGER,
+                        output_tokens INTEGER
+                    )"""
+                )
+                conn.execute(
+                    "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        "session-123",
+                        "gpt-5.6-luna",
+                        "openai-codex",
+                        "athena",
+                        123.0,
+                        "cli_close",
+                        1,
+                        0,
+                        100,
+                        20,
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            def fake_run(command, **kwargs):
+                query_path = Path(command[command.index("--query-file") + 1])
+                captured["prompt"] = query_path.read_text(encoding="utf-8")
+                kwargs["stdout"].write(json.dumps(worker_result))
+                kwargs["stderr"].write(chr(10) + "session_id: session-123" + chr(10))
+                return subprocess.CompletedProcess(args=command, returncode=0)
+
+            with (
+                mock.patch.object(g.subprocess, "run", side_effect=fake_run) as called,
+                mock.patch.object(
+                    g,
+                    "resolve_hermes_profile_state_db",
+                    return_value=state_db,
+                ),
+            ):
+                result = g.call_worker(agent, "bounded prompt", 30)
+
+        self.assertEqual(result, worker_result)
+        self.assertEqual(result.execution_evidence["source"], "hermes_state_db")
+        self.assertEqual(result.execution_evidence["model"], "gpt-5.6-luna")
+        self.assertEqual(result.execution_evidence["provider"], "openai-codex")
+        self.assertEqual(result.execution_evidence["tool_calls"], 0)
+        command = called.call_args.args[0]
+        self.assertEqual(command[0:3], ["hermes", "-p", "athena"])
+        self.assertIn("--model", command)
+        self.assertIn("gpt-5.6-luna", command)
+        self.assertIn("--provider", command)
+        self.assertIn("openai-codex", command)
+        self.assertIn("--ignore-rules", command)
+        self.assertIn("--ignore-user-config", command)
+        self.assertIn("--toolsets", command)
+        self.assertIn("context_engine", command)
+        self.assertIn("--query-file", command)
+        self.assertNotIn("--usage-file", command)
+        self.assertNotIn("--oneshot", command)
+        self.assertIn("-Q", command)
+        self.assertIn("--source", command)
+        self.assertIn("tool", command)
+        self.assertNotIn("bounded prompt", command)
+        self.assertEqual(captured["prompt"], "bounded prompt")
+        self.assertEqual(called.call_args.kwargs["timeout"], 30)
+        self.assertIs(called.call_args.kwargs["stdin"], subprocess.DEVNULL)
+        child_env = called.call_args.kwargs["env"]
+        self.assertIn("PATH", child_env)
+        self.assertIn("SystemDrive", child_env)
+        self.assertNotIn("OPENAI_API_KEY", child_env)
+        self.assertNotIn("ANTHROPIC_API_KEY", child_env)
 
     def test_worker_prompt_uses_current_request_agent_identity(self):
         policy = dict(g.DEFAULT_POLICY)
@@ -354,6 +529,91 @@ class FastGatewayTests(unittest.TestCase):
             self.assertEqual(record["result"]["review_result"], "PASS")
             self.assertEqual(record["result"]["findings"], ["No blocking findings"])
             self.assertEqual(record["result"]["changes"], [])
+            self.assertEqual(source.read_text(encoding="utf-8"), "unchanged\n")
+            self.assertFalse(record["git"]["commit"])
+            self.assertFalse(record["git"]["push"])
+            self.assertTrue(LocalTestStore(auth_path).is_used(auth_id))
+
+    def test_athena_adapter_returns_authorized_read_only_review(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            workspace = root / "delegation-demo"
+            workspace.mkdir()
+            source = workspace / "app.js"
+            source.write_text("unchanged\n", encoding="utf-8")
+            auth_path = root / "auth-v2.json"
+            broker = TaskAuthBroker(
+                LocalTestStore(auth_path, signing_key="gateway-test-key"),
+                root / "auth-audit.jsonl",
+            )
+            auth_id = broker.issue(
+                task_id="athena-review-001",
+                worker="athena",
+                allow=["read_only_review"],
+                deny=["workspace_modify", "git_commit", "git_push", "production_deploy"],
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+            )
+            review_result = {
+                "result_type": "read_only",
+                "status": "completed",
+                "summary": "Athena review completed",
+                "reason": "",
+                "review_result": "PASS",
+                "findings": [],
+                "artifacts": [],
+            }
+            response = g.WorkerResponse(review_result)
+            response.execution_evidence = {
+                "source": "hermes_state_db",
+                "session_id": "session-123",
+                "profile": "athena",
+                "model": "gpt-5.6-luna",
+                "provider": "openai-codex",
+                "api_calls": 1,
+                "tool_calls": 0,
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "completed": True,
+            }
+            agents = {
+                "athena": {
+                    "provider": "hermes-profile",
+                    "profile": "athena",
+                    "inference_provider": "openai-codex",
+                    "model": "gpt-5.6-luna",
+                    "max_tokens": 8000,
+                }
+            }
+
+            with mock.patch.object(g, "call_worker", return_value=response) as called:
+                record = g.run(
+                    {
+                        "task_id": "athena-review-001",
+                        "agent": "athena",
+                        "workspace": "delegation-demo",
+                        "task": "READ-ONLY code review를 수행해",
+                    },
+                    agents,
+                    dict(g.DEFAULT_POLICY),
+                    root,
+                    root / "runs.jsonl",
+                    auth_path,
+                )
+
+            self.assertEqual(called.call_count, 1)
+            self.assertIn(
+                "You are athena, a bounded implementation worker.",
+                called.call_args.args[1],
+            )
+            self.assertEqual(record["status"], "PASS")
+            self.assertEqual(record["auth"]["worker"], "athena")
+            self.assertEqual(record["result_type"], "read_only")
+            self.assertEqual(record["result"]["review_result"], "PASS")
+            self.assertEqual(record["result"]["changes"], [])
+            self.assertEqual(record["execution_evidence"]["session_id"], "session-123")
+            self.assertEqual(record["execution_evidence"]["model"], "gpt-5.6-luna")
+            self.assertEqual(record["execution_evidence"]["provider"], "openai-codex")
+            self.assertEqual(record["attempts"][0]["execution_evidence"]["api_calls"], 1)
             self.assertEqual(source.read_text(encoding="utf-8"), "unchanged\n")
             self.assertFalse(record["git"]["commit"])
             self.assertFalse(record["git"]["push"])
