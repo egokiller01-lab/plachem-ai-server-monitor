@@ -63,7 +63,7 @@ def normalize_result(gateway_result: dict[str, Any]) -> dict[str, Any]:
     if not has_failure:
         failure_reason = result.get("reason") if "reason" in result else None
 
-    return {
+    normalized = {
         "task_id": gateway_result.get("task_id"),
         "worker": gateway_result.get("worker", gateway_result.get("agent")),
         "requested_actions": actions,
@@ -78,3 +78,7 @@ def normalize_result(gateway_result: dict[str, Any]) -> dict[str, Any]:
         "failure_reason": failure_reason,
         "completed_at": gateway_result.get("completed_at", gateway_result.get("timestamp")),
     }
+    for identity_field in ("run_id", "correlation_id", "external_reference"):
+        if identity_field in gateway_result:
+            normalized[identity_field] = gateway_result[identity_field]
+    return normalized

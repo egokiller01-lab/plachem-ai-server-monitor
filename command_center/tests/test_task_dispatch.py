@@ -152,6 +152,34 @@ class TaskDispatchTests(unittest.TestCase):
         self.assertEqual(gateway.run.call_args.args[3], self.project_root.resolve())
         gateway.load_json.assert_not_called()
 
+    def test_identity_fields_are_forwarded_to_gateway_request(self):
+        package = self.package()
+        package.update(
+            {
+                "run_id": "run-dispatch-001",
+                "correlation_id": "corr-dispatch-001",
+                "external_reference": {
+                    "source": "war_room",
+                    "project_id": "test-project",
+                    "external_task_id": "war-task-001",
+                },
+            }
+        )
+        auth = {"broker_called": True, "allow": ["read_only_review"], "worker": "athena"}
+        with (
+            mock.patch.object(task_dispatch, "load_task_authorization", return_value=auth),
+            mock.patch.object(task_dispatch, "fast_gateway") as gateway,
+        ):
+            gateway.merge_policy.return_value = {}
+            gateway.run.return_value = {"status": "PASS", "task_id": package["task_id"]}
+
+            self.dispatch(package)
+
+        request = gateway.run.call_args.args[0]
+        self.assertEqual(request["run_id"], "run-dispatch-001")
+        self.assertEqual(request["correlation_id"], "corr-dispatch-001")
+        self.assertEqual(request["external_reference"], package["external_reference"])
+
     def test_missing_or_rejected_auth_blocks_before_gateway(self):
         package = self.package()
         with (

@@ -31,17 +31,41 @@ def run_sequence(
     sequence_status = "PASS"
     for package in task_packages:
         task_id = package["task_id"]
-        run_registry.create(
+        run = run_registry.create(
             task_id,
-            package["project_id"],
+            package.get("workspace_id", package.get("project_id", "")),
             package["requested_worker"],
+            correlation_id=package.get("correlation_id"),
+            workspace_id=package.get("workspace_id", package.get("project_id", "")),
+            external_reference=package.get("external_reference"),
         )
-        run_registry.transition(task_id, "DISPATCHING")
-        run_registry.transition(task_id, "RUNNING")
-        gateway_result = dispatcher(package, **dict(dispatch_kwargs))
+        run_id = run["run_id"]
+        correlation_id = run["correlation_id"]
+        run_registry.transition(run_id, "DISPATCHING")
+        run_registry.transition(run_id, "RUNNING")
+        identity_enabled = "correlation_id" in package or "external_reference" in package
+        dispatch_package = dict(package)
+        if identity_enabled:
+            dispatch_package.update(
+                {
+                    "run_id": run_id,
+                    "correlation_id": correlation_id,
+                }
+            )
+        gateway_result = dispatcher(dispatch_package, **dict(dispatch_kwargs))
+        gateway_result = dict(gateway_result)
+        if identity_enabled:
+            gateway_result.update(
+                {
+                    "run_id": run_id,
+                    "correlation_id": correlation_id,
+                }
+            )
+            if "external_reference" in package:
+                gateway_result["external_reference"] = package["external_reference"]
         gateway_status = gateway_result.get("status")
         run_registry.transition(
-            task_id,
+            run_id,
             gateway_status,
             gateway_result=gateway_result,
             failure_reason=_failure_reason(gateway_result),

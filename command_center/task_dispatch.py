@@ -66,6 +66,9 @@ def run_gateway(
         "workspace": package.get("workspace", "."),
         "requested_actions": list(package["requested_actions"]),
     }
+    for identity_field in ("run_id", "correlation_id", "external_reference"):
+        if identity_field in package:
+            request[identity_field] = package[identity_field]
     policy = fast_gateway.merge_policy(policy_path)
     return fast_gateway.run(
         request,
@@ -90,7 +93,7 @@ def dispatch(
         validate_task_package(package)
         workspace_registry = WorkspaceRegistry.load(_WORKSPACE_REGISTRY_PATH)
         workspace = workspace_registry.validate(
-            package.get("project_id", ""),
+            package.get("workspace_id", package.get("project_id", "")),
             project_root,
         )
         registry = AgentRegistry.load(Path(agents_path))

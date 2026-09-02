@@ -41,7 +41,9 @@ class RunQuery:
     def _latest_runs(self) -> list[dict[str, Any]]:
         latest: dict[str, tuple[int, dict[str, Any]]] = {}
         for index, record in enumerate(self._records()):
-            latest[record["task_id"]] = (index, record)
+            run_id = record.get("run_id")
+            key = run_id if isinstance(run_id, str) and run_id else f"legacy:{record['task_id']}"
+            latest[key] = (index, record)
         return [
             dict(record)
             for _, record in sorted(latest.values(), key=lambda item: item[0], reverse=True)
@@ -58,6 +60,22 @@ class RunQuery:
             if record["task_id"] == task_id:
                 return record
         return None
+
+    def get_run(self, run_id: str) -> dict[str, Any] | None:
+        for record in self._latest_runs():
+            if record.get("run_id") == run_id:
+                return record
+        return None
+
+    def by_task_id(self, task_id: str) -> list[dict[str, Any]]:
+        return [record for record in self._latest_runs() if record["task_id"] == task_id]
+
+    def by_correlation_id(self, correlation_id: str) -> list[dict[str, Any]]:
+        return [
+            record
+            for record in self._latest_runs()
+            if record.get("correlation_id") == correlation_id
+        ]
 
     def recent(self, limit: int) -> list[dict[str, Any]]:
         return self._limit(self._latest_runs(), limit)
