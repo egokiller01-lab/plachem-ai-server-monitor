@@ -7,7 +7,8 @@ import hmac
 import sqlite3
 import time
 import uuid
-from pathlib import Path
+from contextlib import contextmanager
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from fastapi import APIRouter, Header, HTTPException, Request
@@ -137,20 +138,35 @@ def _now() -> int:
     return int(time.time())
 
 
-def _connect_rw() -> sqlite3.Connection:
+@contextmanager
+def _transaction_connection(path):
+    con = sqlite3.connect(path)
+    try:
+        with con:
+            yield con
+    finally:
+        con.close()
+
+
+@contextmanager
+def _connect_rw():
     path = war_room._db_path()
     if not path.is_file():
         raise HTTPException(503, "War Room data unavailable")
     con = sqlite3.connect(path)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA foreign_keys = ON")
-    con.execute("PRAGMA busy_timeout = 2000")
-    return con
+    try:
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA foreign_keys = ON")
+        con.execute("PRAGMA busy_timeout = 2000")
+        with con:
+            yield con
+    finally:
+        con.close()
 
 
 def provision_action_schema(path: str | None = None) -> str:
     target = path or str(war_room._db_path())
-    with sqlite3.connect(target) as con:
+    with _transaction_connection(target) as con:
         con.executescript(SCHEMA)
         participant_columns = {row[1] for row in con.execute("PRAGMA table_info(war_participants)")}
         if "active" not in participant_columns:
@@ -346,7 +362,8 @@ def _grounding_packet(body: dict[str, Any], project_id: str, document_version: s
         "completion_conditions": supplied.get("completion_conditions") or ["focused tests pass", "full regression passes", "evidence paths supplied"],
         "session_integrity_required": any("existing work sessions" in value.lower() for value in supplied.get("forbidden", []) if isinstance(value, str)),
     }
-    if (not worktree.startswith("/") or any(not isinstance(packet[key], str) or not packet[key].strip() for key in ("branch","revision","api_base","db_label"))
+    absolute_worktree = Path(worktree).is_absolute() or (os.name == "nt" and PurePosixPath(worktree).is_absolute())
+    if (not absolute_worktree or any(not isinstance(packet[key], str) or not packet[key].strip() for key in ("branch","revision","api_base","db_label"))
             or any(not isinstance(values, list) or not values or any(not isinstance(v, str) or not v.strip() for v in values) for values in (packet["forbidden"], packet["completion_conditions"]))):
         raise HTTPException(422, "grounding packet is incomplete")
     return packet

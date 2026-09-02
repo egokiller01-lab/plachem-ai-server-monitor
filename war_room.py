@@ -9,6 +9,7 @@ import os
 import re
 import sqlite3
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -125,11 +126,21 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
     )
 
 
+@contextmanager
+def _transaction_connection(path: str | Path):
+    connection = sqlite3.connect(path)
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
+
+
 def provision_database(path: str | Path | None = None) -> Path:
     """Provision the War Room read model explicitly, outside every GET path."""
     target = Path(path).expanduser() if path is not None else _db_path()
     target.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(target) as connection:
+    with _transaction_connection(target) as connection:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         _initialize_schema(connection)
@@ -186,7 +197,8 @@ def provision_database(path: str | Path | None = None) -> Path:
     return target
 
 
-def _connect_readonly() -> sqlite3.Connection:
+@contextmanager
+def _connect_readonly():
     """Open an existing database without creating directories, schema, or rows."""
     path = _db_path()
     if not path.is_file():
@@ -194,18 +206,20 @@ def _connect_readonly() -> sqlite3.Connection:
     try:
         uri = f"file:{path.resolve().as_posix()}?mode=ro"
         connection = sqlite3.connect(uri, uri=True)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        table_names = {
-            row[0]
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            ).fetchall()
-        }
-        if not SCHEMA_TABLES.issubset(table_names):
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            table_names = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            if not SCHEMA_TABLES.issubset(table_names):
+                raise HTTPException(status_code=503, detail="War Room data unavailable")
+            yield connection
+        finally:
             connection.close()
-            raise HTTPException(status_code=503, detail="War Room data unavailable")
-        return connection
     except HTTPException:
         raise
     except sqlite3.Error as exc:

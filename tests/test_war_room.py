@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+import gc
 import os
 import json
 import sqlite3
@@ -8,6 +10,16 @@ import unittest
 from pathlib import Path
 
 import war_room
+
+
+@contextmanager
+def _test_db(path):
+    connection = sqlite3.connect(path)
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
 
 
 class WarRoomReadOnlyTests(unittest.TestCase):
@@ -28,6 +40,7 @@ class WarRoomReadOnlyTests(unittest.TestCase):
             os.environ.pop("PLACHEM_WAR_ROOM_DB", None)
         else:
             os.environ["PLACHEM_WAR_ROOM_DB"] = self.previous_db
+        gc.collect()
         self.temp_dir.cleanup()
 
     def test_baseline_project_and_participants(self) -> None:
@@ -78,7 +91,7 @@ class WarRoomReadOnlyTests(unittest.TestCase):
     def test_project_scope_and_secret_value_redaction(self) -> None:
         war_room.provision_database()
         db = Path(os.environ["PLACHEM_WAR_ROOM_DB"])
-        with sqlite3.connect(db) as connection:
+        with _test_db(db) as connection:
             connection.execute("INSERT INTO war_projects VALUES (?, ?, ?, ?, ?, ?, ?)",
                 ("other-project", "Other", "active", "other", "v1", 1, 1))
             connection.execute("INSERT INTO war_messages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -91,7 +104,7 @@ class WarRoomReadOnlyTests(unittest.TestCase):
     def test_same_timestamp_cursor_is_lossless(self) -> None:
         war_room.provision_database()
         db = Path(os.environ["PLACHEM_WAR_ROOM_DB"])
-        with sqlite3.connect(db) as connection:
+        with _test_db(db) as connection:
             for message_id in ("tie-a", "tie-b", "tie-c"):
                 connection.execute("INSERT INTO war_messages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (message_id, war_room.PROJECT_ID, "note", "test", "tester", message_id, None, None, 777, None, "clean"))
@@ -107,7 +120,7 @@ class WarRoomReadOnlyTests(unittest.TestCase):
         session_dir = Path(os.environ["OPENCLAW_HOME"]) / "agents" / "main" / "sessions"
         session_dir.mkdir(parents=True)
         (session_dir / "sessions.json").write_text("{broken", encoding="utf-8")
-        with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as connection:
+        with _test_db(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as connection:
             connection.execute("INSERT INTO war_project_sessions(project_id,agent_id,session_key,session_id,enabled) VALUES (?, ?, ?, ?, 1)", (war_room.PROJECT_ID, "main", "s", "s"))
             connection.commit()
         corrupt = war_room.get_operations(war_room.PROJECT_ID)

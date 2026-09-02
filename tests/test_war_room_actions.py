@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
+import subprocess
+from contextlib import contextmanager
+import gc
 import hashlib
 import hmac
 import tempfile
@@ -12,6 +16,16 @@ from pathlib import Path
 from unittest import mock
 
 from fastapi.testclient import TestClient
+
+
+@contextmanager
+def _test_db(path):
+    connection = sqlite3.connect(path)
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
 
 
 class WarRoomControlledApiTests(unittest.TestCase):
@@ -29,6 +43,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
         war_room.provision_database()
         from app import app
         self.client = TestClient(app)
+        self.client.__enter__()
 
     def task_body(self, scope: str, **values):
         body = {
@@ -84,6 +99,10 @@ class WarRoomControlledApiTests(unittest.TestCase):
         os.environ.pop("PLACHEM_WAR_ROOM_REVERSE_PROXY_SECRET", None)
         os.environ.pop("PLACHEM_WAR_ROOM_REAL_ADAPTER", None)
         os.environ.pop("PLACHEM_WAR_ROOM_ADAPTER_COMMAND", None)
+        client = getattr(self, "client", None)
+        if client is not None:
+            client.__exit__(None, None, None)
+        gc.collect()
         self.temp_dir.cleanup()
 
     def test_auth_rbac_idempotency_and_safe_transition(self) -> None:
@@ -113,7 +132,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
         self.assertEqual(201, evidence.status_code, evidence.text)
         evidence2 = self.client.post(f"/api/war-room/tasks/{task_id}/evidence", json={"uri": "/tmp/fixture-artifact.json", "summary": "isolated artifact", "evidence_type":"artifact"}, headers={**headers, "Idempotency-Key": "evidence-2"})
         self.assertEqual(201, evidence2.status_code, evidence2.text)
-        with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
+        with _test_db(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
             row = con.execute("SELECT revision,scope,document_version,qa_cycle FROM war_tasks WHERE id=?", (task_id,)).fetchone()
         payload = json.dumps({"task_id":task_id,"verdict":"PASS","evidence_profile":"required:test,artifact","qa_principal":"ERPqa","task_revision":row[0],"scope_hash":hashlib.sha256(row[1].encode()).hexdigest(),"document_version":row[2],"qa_cycle":row[3]}, sort_keys=True)
         signature = hmac.new(b"fixture-qa-secret", payload.encode(), hashlib.sha256).hexdigest()
@@ -151,7 +170,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
         self.assertEqual("awaiting_approval", first.json()["status"])
         replay = self.client.post(url, json=payload, headers=headers)
         self.assertEqual(first.json(), replay.json())
-        with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
+        with _test_db(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
             self.assertEqual(1, con.execute("SELECT COUNT(*) FROM war_tasks WHERE id=?", (first.json()["task_id"],)).fetchone()[0])
             self.assertEqual(1, con.execute("SELECT COUNT(*) FROM war_messages WHERE id=?", (first.json()["message_id"],)).fetchone()[0])
         bad = self.client.post(url, json={**payload,"agent_ids":["not-agent"]}, headers={**headers,"Idempotency-Key":"prepare-bad"})
@@ -165,7 +184,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
             headers=headers,
         )
         self.assertEqual(201, prepared.status_code, prepared.text)
-        with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
+        with _test_db(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
             task = con.execute("SELECT call_limit,turn_limit FROM war_tasks WHERE id=?", (prepared.json()["task_id"],)).fetchone()
             manager = con.execute("SELECT role,can_read,can_comment,can_approve,can_execute FROM war_participants WHERE project_id=? AND principal_id='ERPmanager'", ("plachem-agent-war-room",)).fetchone()
         self.assertEqual((3, 3), task)
@@ -185,7 +204,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
         result = provision_disposable_sessions(db_path=Path(os.environ["PLACHEM_WAR_ROOM_DB"]), adapter=adapter, project_id="plachem-agent-war-room", agent_ids=["ERPcoder","ERPqa","ERPmanager"])
         self.assertEqual([("ERPcoder","plachem-agent-war-room"),("ERPqa","plachem-agent-war-room"),("ERPmanager","plachem-agent-war-room")], adapter.calls)
         self.assertEqual(3, len(result))
-        with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
+        with _test_db(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
             rows = con.execute("SELECT agent_id,purpose,disposable,enabled FROM war_project_sessions ORDER BY agent_id").fetchall()
         self.assertEqual([("ERPcoder","test",1,1),("ERPmanager","test",1,1),("ERPqa","test",1,1)], rows)
 
@@ -205,7 +224,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
         self.assertEqual(2, len(first.json()["deliveries"]))
         replay = self.client.post(url, json=body, headers={**headers,"Idempotency-Key":"integrated-run"})
         self.assertEqual(first.json(), replay.json())
-        with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
+        with _test_db(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
             self.assertEqual(2, con.execute("SELECT COUNT(*) FROM war_deliveries WHERE message_id=?", (prepared.json()["message_id"],)).fetchone()[0])
 
     def test_responded_without_body_is_failed_and_all_results_enter_qa(self) -> None:
@@ -222,10 +241,10 @@ class WarRoomControlledApiTests(unittest.TestCase):
             def deliver(self, **kwargs): return DeliveryReceipt(kwargs["delivery_id"], "responded")
         result = process_due_deliveries(db_path=Path(os.environ["PLACHEM_WAR_ROOM_DB"]), adapter=EmptyAdapter())
         self.assertEqual("failed", result[0]["status"])
-        with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
+        with _test_db(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
             self.assertEqual("running", con.execute("SELECT status FROM war_tasks WHERE id=?", (prepared["task_id"],)).fetchone()[0])
 
-        with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
+        with _test_db(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
             con.execute("UPDATE war_deliveries SET status='queued',attempt_count=0,error_code=NULL WHERE message_id=?", (prepared["message_id"],)); con.commit()
         class BodyAdapter:
             def deliver(self, **kwargs): return DeliveryReceipt(kwargs["delivery_id"], "responded", response_body=json.dumps({
@@ -235,7 +254,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
             }, ensure_ascii=False))
         result = process_due_deliveries(db_path=Path(os.environ["PLACHEM_WAR_ROOM_DB"]), adapter=BodyAdapter())
         self.assertEqual("responded", result[0]["status"])
-        with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
+        with _test_db(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
             self.assertEqual("qa", con.execute("SELECT status FROM war_tasks WHERE id=?", (prepared["task_id"],)).fetchone()[0])
 
     def test_terminal_structured_validation_failure_moves_task_to_rework_and_audits(self) -> None:
@@ -254,7 +273,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
                 class InvalidAdapter:
                     def deliver(self, **kwargs): return DeliveryReceipt(kwargs["delivery_id"],"responded",response_body=body)
                 process_due_deliveries(db_path=Path(os.environ["PLACHEM_WAR_ROOM_DB"]),adapter=InvalidAdapter())
-                with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
+                with _test_db(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
                     self.assertEqual("rework_required",con.execute("SELECT status FROM war_tasks WHERE id=?",(prepared["task_id"],)).fetchone()[0])
                     self.assertGreaterEqual(con.execute("SELECT COUNT(*) FROM war_audit_events WHERE target_id IN (SELECT id FROM war_deliveries WHERE message_id=?) AND event_type='terminal_response_validation_rework'",(prepared["message_id"],)).fetchone()[0],1)
 
@@ -266,13 +285,22 @@ class WarRoomControlledApiTests(unittest.TestCase):
         self.assertEqual(0,compare(absent,json.loads(json.dumps(absent)))["deleted_count"])
         target=Path(os.environ["PLACHEM_WAR_ROOM_DB"]).parent/"private"/"manifest.json"
         write_private_manifest(target,payload)
-        self.assertEqual(0o700,target.parent.stat().st_mode & 0o777)
-        self.assertEqual(0o600,target.stat().st_mode & 0o777)
+        self.assertTrue(target.parent.is_dir())
+        self.assertTrue(target.is_file())
+        if os.name == "nt":
+            icacls = shutil.which("icacls")
+            self.assertIsNotNone(icacls)
+            acl = subprocess.run([icacls, str(target.parent)], capture_output=True, check=False)
+            self.assertEqual(0, acl.returncode, acl.stderr)
+            self.assertTrue(acl.stdout.strip())
+        else:
+            self.assertEqual(0o700,target.parent.stat().st_mode & 0o777)
+            self.assertEqual(0o600,target.stat().st_mode & 0o777)
 
     def test_session_integrity_required_before_qa_pass_but_not_rejection(self) -> None:
         headers={"X-War-Room-Actor":"main","X-War-Room-Token":"fixture-main-token"}
         prepared=self.client.post("/api/war-room/projects/plachem-agent-war-room/prepare",json={"instruction":"integrity gate","agent_ids":["ERPcoder"],"deadline_at":int(time.time())+900,"document_version":"baseline-2026-08-23","grounding":{"worktree":str(Path.cwd()),"branch":"x","revision":"r","api_base":"/api","db_label":"isolated","forbidden":["existing work sessions"],"completion_conditions":["integrity"]}},headers={**headers,"Idempotency-Key":"integrity-prepare"}).json()
-        with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
+        with _test_db(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
             con.execute("UPDATE war_tasks SET status='qa',qa_cycle=1 WHERE id=?",(prepared["task_id"],)); con.commit()
         for kind in ("test","artifact"):
             self.client.post(f"/api/war-room/tasks/{prepared['task_id']}/evidence",json={"evidence_type":kind,"uri":f"/{kind}","summary":kind},headers={**headers,"Idempotency-Key":f"integrity-{kind}"})
@@ -289,7 +317,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
             headers={**headers,"Idempotency-Key":"rep-prepare"},
         ).json()
         task_id = prepared["task_id"]
-        with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
+        with _test_db(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
             scope = con.execute("SELECT scope,document_version,revision,qa_cycle FROM war_tasks WHERE id=?", (task_id,)).fetchone()
             con.execute("UPDATE war_tasks SET status='qa',qa_cycle=1 WHERE id=?", (task_id,))
             scope_hash = hashlib.sha256(scope[0].encode()).hexdigest()
@@ -304,7 +332,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
         approved = self.client.post(f"/api/war-room/tasks/{task_id}/representative-completion", json={"decision":"approved"}, headers={**headers,"Idempotency-Key":"rep-approved"})
         self.assertEqual(200, approved.status_code, approved.text)
         self.assertEqual("completed", approved.json()["status"])
-        with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
+        with _test_db(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
             self.assertEqual(1, con.execute("SELECT COUNT(*) FROM war_representative_approvals WHERE task_id=? AND representative_id='main'", (task_id,)).fetchone()[0])
 
     def test_qa_fail_moves_task_to_rework_required_with_audit(self) -> None:
@@ -315,7 +343,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
             headers={**headers,"Idempotency-Key":"qa-fail-prepare"},
         ).json()
         task_id = prepared["task_id"]
-        with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
+        with _test_db(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
             con.execute("UPDATE war_tasks SET status='qa',qa_cycle=1 WHERE id=?", (task_id,))
             con.commit()
         failed = self.client.post(
@@ -338,7 +366,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
             headers={"X-War-Room-Actor":"ERPqa","X-War-Room-Token":"fixture-erpqa-token","Idempotency-Key":"qa-fail-verdict"},
         )
         self.assertEqual(409, conflict.status_code, conflict.text)
-        with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
+        with _test_db(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
             self.assertEqual("rework_required", con.execute("SELECT status FROM war_tasks WHERE id=?", (task_id,)).fetchone()[0])
             self.assertEqual(1, con.execute("SELECT COUNT(*) FROM war_audit_events WHERE target_id=? AND event_type='qa_verdict_rework_required'", (task_id,)).fetchone()[0])
 
@@ -350,7 +378,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
             headers={**headers,"Idempotency-Key":"rep-reject-prepare"},
         ).json()
         task_id = prepared["task_id"]
-        with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
+        with _test_db(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
             con.execute("UPDATE war_tasks SET status='qa',qa_cycle=1 WHERE id=?", (task_id,))
             original_revision = con.execute("SELECT revision FROM war_tasks WHERE id=?", (task_id,)).fetchone()[0]
             con.commit()
@@ -361,7 +389,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
         )
         self.assertEqual(200, rejected.status_code, rejected.text)
         self.assertEqual("rework_required", rejected.json()["status"])
-        with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
+        with _test_db(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
             self.assertEqual(original_revision + 1, con.execute("SELECT revision FROM war_tasks WHERE id=?", (task_id,)).fetchone()[0])
 
     def test_quick_qa_opens_hidden_advanced_area_on_pc_and_mobile_contract(self) -> None:
@@ -408,7 +436,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
         self.assertEqual(409, early.status_code)
 
         # One immutable instruction can belong to only one task.
-        with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
+        with _test_db(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
             con.execute("INSERT INTO war_messages VALUES (?,?,?,?,?,?,?,?,?,?,?)", ("hard-source", war_room.PROJECT_ID, "instruction", "agent", "main", "bound", None, None, int(time.time()), "hard-corr", "clean"))
             con.commit()
         linked = self.client.post(base + "/tasks", json=self.task_body("linked", source_message_id="hard-source"), headers={**headers,"Idempotency-Key":"linked-1"})
@@ -419,7 +447,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
         # ACK cannot manufacture a stop; it must bind to a stopped delivery.
         no_stop = self.client.post(base + "/stop-ack", json={"delivery_id":"missing"}, headers={**headers,"Idempotency-Key":"ack-no-stop"})
         self.assertEqual(409, no_stop.status_code)
-        with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
+        with _test_db(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
             stop_cycle=int(time.time())
             con.execute("INSERT INTO war_deliveries (id,message_id,agent_id,status,attempt_count,stop_cycle_at,created_at) VALUES (?,?,?,?,?,?,?)", ("hard-stop-delivery", "hard-source", "ERPcoder", "stopped", 1, stop_cycle, stop_cycle))
             con.execute("UPDATE war_project_control SET stop_requested_at=?,stop_state='stop_requested' WHERE project_id=?", (stop_cycle, war_room.PROJECT_ID))
@@ -432,7 +460,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
         self.client.post(f"/api/war-room/tasks/{task_id}/approvals",json=self.approval_body(),headers={**headers,"Idempotency-Key":"stopped-approve"})
         blocked_run=self.client.post(f"/api/war-room/tasks/{task_id}/transition",json={"status":"running"},headers={**headers,"Idempotency-Key":"stopped-run"})
         self.assertEqual(409,blocked_run.status_code)
-        with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
+        with _test_db(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
             con.execute("UPDATE war_tasks SET status='qa' WHERE id=?",(task_id,)); con.commit()
         blocked_evidence=self.client.post(f"/api/war-room/tasks/{task_id}/evidence",json={"uri":"/tmp/stopped","summary":"blocked"},headers={**headers,"Idempotency-Key":"stopped-evidence"})
         self.assertEqual(409,blocked_evidence.status_code)
@@ -449,7 +477,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
         os.environ["PLACHEM_WAR_ROOM_DB"] = str(fresh)
         provision_war_room_on_startup(); provision_war_room_on_startup()
         self.assertTrue(fresh.is_file())
-        with sqlite3.connect(fresh) as con:
+        with _test_db(fresh) as con:
             self.assertIsNotNone(con.execute("SELECT 1 FROM war_projects LIMIT 1").fetchone())
 
     def test_R_WXGTDY_authenticated_gets_and_principal_mismatch_are_blocked(self) -> None:
@@ -494,7 +522,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
     def test_R_WXGTDY_DB_integrity_and_append_only_audit(self) -> None:
         import war_room
         db = Path(os.environ["PLACHEM_WAR_ROOM_DB"])
-        with sqlite3.connect(db) as con:
+        with _test_db(db) as con:
             con.execute("PRAGMA foreign_keys=ON")
             with self.assertRaises(sqlite3.IntegrityError):
                 con.execute("INSERT INTO war_tasks (id,project_id,scope,status,manyfast_version,created_at,updated_at) VALUES ('bad','missing','x','invalid','v',1,1)")
@@ -523,7 +551,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
 
         db = Path(os.environ["PLACHEM_WAR_ROOM_DB"])
         now = 1_700_000_000
-        with sqlite3.connect(db) as con:
+        with _test_db(db) as con:
             con.execute("PRAGMA foreign_keys=ON")
             con.execute(
                 "INSERT INTO war_messages VALUES (?,?,?,?,?,?,?,?,?,?,?)",
@@ -538,7 +566,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
         first = process_due_deliveries(db_path=db, adapter=adapter, now=now)
         self.assertEqual("failed", first[0]["status"])
         self.assertEqual(["fixture-retry-delivery"], adapter.calls)
-        with sqlite3.connect(db) as con:
+        with _test_db(db) as con:
             row = con.execute("SELECT status,attempt_count FROM war_deliveries WHERE id='fixture-retry-delivery'").fetchone()
             self.assertEqual(("failed", 1), row)
         self.assertTrue(request_delivery_retry(db_path=db, delivery_id="fixture-retry-delivery", now=now + 1))
@@ -569,7 +597,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
 
         db = Path(os.environ["PLACHEM_WAR_ROOM_DB"])
         now = 1_700_000_100
-        with sqlite3.connect(db) as con:
+        with _test_db(db) as con:
             con.execute("PRAGMA foreign_keys=ON")
             con.execute("INSERT INTO war_messages VALUES (?,?,?,?,?,?,?,?,?,?,?)", ("fixture-stop-message", war_room.PROJECT_ID, "instruction", "agent", "main", "stop bytes", None, None, now, "corr-stop", "clean"))
             con.execute("INSERT INTO war_deliveries (id,message_id,agent_id,status,attempt_count,created_at) VALUES (?,?,?,?,?,?)", ("fixture-ack-delivery", "fixture-stop-message", "ERPcoder", "sent", 1, now))
@@ -581,13 +609,13 @@ class WarRoomControlledApiTests(unittest.TestCase):
         failure_adapter = StopAdapter(DeliveryReceipt("fixture-failure-delivery", "failed", error_code="fixture_stop_unavailable"))
         request_project_stop(db_path=db, project_id=war_room.PROJECT_ID, actor_id="main", adapter=ack_adapter, now=now, deadline=now + 5, delivery_ids=["fixture-ack-delivery"])
         request_project_stop(db_path=db, project_id=war_room.PROJECT_ID, actor_id="main", adapter=failure_adapter, now=now, deadline=now + 5, delivery_ids=["fixture-failure-delivery"])
-        with sqlite3.connect(db) as con:
+        with _test_db(db) as con:
             self.assertEqual("stopped", con.execute("SELECT status FROM war_deliveries WHERE id='fixture-ack-delivery'").fetchone()[0])
             self.assertEqual("failed", con.execute("SELECT status FROM war_deliveries WHERE id='fixture-failure-delivery'").fetchone()[0])
             con.execute("UPDATE war_project_control SET stop_state='stop_requested',stop_deadline=? WHERE project_id=?", (now + 5, war_room.PROJECT_ID))
             con.commit()
         process_stop_timers(db_path=db, now=now + 6)
-        with sqlite3.connect(db) as con:
+        with _test_db(db) as con:
             control = con.execute("SELECT stop_state FROM war_project_control WHERE project_id=?", (war_room.PROJECT_ID,)).fetchone()[0]
             self.assertEqual("stop_unconfirmed", control)
 
@@ -603,7 +631,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
         self.assertEqual(200, drift.status_code, drift.text)
         self.assertTrue(drift.json()["drift"])
         self.assertEqual(1, drift.json()["invalidated_tasks"])
-        with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
+        with _test_db(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
             self.assertEqual("awaiting_approval", con.execute("SELECT status FROM war_tasks WHERE id=?", (task_id,)).fetchone()[0])
             self.assertIsNotNone(con.execute("SELECT revoked_at FROM war_approvals WHERE task_id=?", (task_id,)).fetchone()[0])
 
@@ -617,7 +645,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
         self.assertEqual(409, duplicate.status_code)
         updated = self.client.patch(f"/api/war-room/projects/{project_id}", json={"name":"Fixture Observer Project Updated","status":"active"}, headers={**headers,"Idempotency-Key":"project-update"})
         self.assertEqual(200, updated.status_code, updated.text)
-        with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
+        with _test_db(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
             self.assertGreaterEqual(con.execute("SELECT COUNT(*) FROM war_audit_events WHERE project_id=?", (project_id,)).fetchone()[0], 2)
         add = self.client.post(f"/api/war-room/projects/{project_id}/participants", json={"principal_id":"ERPqa","role":"developer"}, headers={**headers,"Idempotency-Key":"participant-add"})
         self.assertEqual(201, add.status_code, add.text)
@@ -641,7 +669,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
         retained = self.client.get(f"/api/war-room/projects/{project_id}", headers=headers)
         self.assertEqual(200, retained.status_code, retained.text)
         self.assertEqual("archived", retained.json()["project"]["status"])
-        with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
+        with _test_db(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
             self.assertGreaterEqual(con.execute("SELECT COUNT(*) FROM war_audit_events WHERE project_id=? AND event_type IN ('project_created','project_updated','project_archived')", (project_id,)).fetchone()[0], 3)
 
     def test_project_create_archive_and_stop_are_idempotent(self) -> None:
@@ -699,7 +727,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
         self.assertEqual(201, first.status_code, first.text)
         second = self.client.post(f"/api/war-room/messages/{message_id}/deliveries", json={"agent_id":"ERPcoder", "task_id":task_id}, headers={**headers,"Idempotency-Key":"bounded-delivery-2"})
         self.assertEqual(409, second.status_code, second.text)
-        with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
+        with _test_db(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
             con.execute("UPDATE war_tasks SET deadline_at=? WHERE id=?", (1, task_id))
             con.commit()
         deadline = self.client.post(f"/api/war-room/messages/{message_id}/deliveries", json={"agent_id":"ERPcoder", "task_id":task_id}, headers={**headers,"Idempotency-Key":"bounded-delivery-deadline"})
@@ -749,7 +777,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
         self.assertEqual(201, first.status_code, first.text)
         limited = self.client.post(f"/api/war-room/messages/{message_id}/deliveries", json={"agent_id":"ERPcoder", "task_id":task_id}, headers={**headers,"Idempotency-Key":"policy-second"})
         self.assertEqual(409, limited.status_code)
-        with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
+        with _test_db(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
             con.execute("UPDATE war_tasks SET deadline_at=? WHERE id=?", (int(time.time()) - 1, task_id))
             con.execute("UPDATE war_task_calls SET call_count=0,turn_count=0 WHERE task_id=?", (task_id,))
             con.commit()
@@ -966,7 +994,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
             def poll(self, **kwargs): return DeliveryReceipt(kwargs["run_id"],"received",run_id=kwargs["run_id"])
 
         db=Path(os.environ["PLACHEM_WAR_ROOM_DB"]); now=1_700_000_000
-        with sqlite3.connect(db) as con:
+        with _test_db(db) as con:
             con.execute("INSERT INTO war_project_sessions(project_id,agent_id,session_key,session_id,enabled,purpose,disposable) VALUES (?,?,?,?,1,'test',1)",(war_room.PROJECT_ID,"ERPcoder","agent:erpcoder:war-room-test:runtime","runtime-session"))
             con.execute("INSERT INTO war_messages VALUES (?,?,?,?,?,?,?,?,?,?,?)",("runtime-message",war_room.PROJECT_ID,"instruction","agent","main","safe",None,None,now,"runtime-corr","clean"))
             con.execute("INSERT INTO war_deliveries(id,message_id,agent_id,status,attempt_count,max_attempts,next_attempt_at,deadline_at,created_at) VALUES (?,?,?,?,?,?,?,?,?)",("runtime-delivery","runtime-message","ERPcoder","queued",0,3,now,now+60,now))
@@ -974,7 +1002,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
         runtime=WarRoomRuntime(adapter=OwnedAdapter())
         self.assertEqual("received",runtime.tick(db_path=db,now=now)[0]["status"])
         self.assertEqual("stopped",runtime.stop_project(db_path=db,project_id=war_room.PROJECT_ID,actor_id="main",now=now+1)["deliveries"][0]["status"])
-        with sqlite3.connect(db) as con:
+        with _test_db(db) as con:
             con.execute("UPDATE war_deliveries SET status='received',run_id='owned-run' WHERE id='runtime-delivery'"); con.commit()
         restarted=WarRoomRuntime(adapter=OwnedAdapter())
         self.assertEqual("failed",restarted.stop_project(db_path=db,project_id=war_room.PROJECT_ID,actor_id="main",now=now+2)["deliveries"][0]["status"])
@@ -999,7 +1027,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
 
         db = Path(os.environ["PLACHEM_WAR_ROOM_DB"])
         now = 1_700_000_000
-        with sqlite3.connect(db) as con:
+        with _test_db(db) as con:
             con.execute("PRAGMA foreign_keys=ON")
             con.execute("INSERT INTO war_project_sessions(project_id,agent_id,session_key,session_id,enabled,purpose,disposable) VALUES (?,?,?,?,1,'test',1)", (war_room.PROJECT_ID,"ERPcoder","agent:erpcoder:war-room-test:fixture","session-disposable"))
             con.execute("INSERT INTO war_messages VALUES (?,?,?,?,?,?,?,?,?,?,?)", ("restart-message",war_room.PROJECT_ID,"instruction","agent","main","safe test",None,None,now,"restart-corr","clean"))
@@ -1025,7 +1053,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
             "verdict":"PASS", "evidence":["/tmp/test.log"], "summary":"ok",
             "representative_completion_claimed":False,
         })
-        with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
+        with _test_db(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
             con.row_factory = sqlite3.Row
             result, error = _structured_result(con, prepared["message_id"], "ERPcoder", response)
         self.assertIsNone(error)
@@ -1047,7 +1075,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
                 "verdict":"PASS", "evidence":["/tmp/test.log"], "summary":"ok",
                 "representative_completion_claimed":False,
             })
-            with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
+            with _test_db(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
                 con.row_factory = sqlite3.Row
                 _, error = _structured_result(con, prepared["message_id"], "ERPcoder", response)
             return error
@@ -1072,7 +1100,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
         }, headers={**headers,"Idempotency-Key":"frozen-prepare"}).json()
         self.client.post(f"/api/war-room/tasks/{prepared['task_id']}/approve-execute", json={"expires_at":int(time.time())+500}, headers={**headers,"Idempotency-Key":"frozen-run"})
         db = Path(os.environ["PLACHEM_WAR_ROOM_DB"])
-        with sqlite3.connect(db) as con:
+        with _test_db(db) as con:
             delivery_id = con.execute("SELECT id FROM war_deliveries WHERE message_id=?", (prepared["message_id"],)).fetchone()[0]
             con.execute("UPDATE war_deliveries SET status='received',run_id='frozen-run' WHERE id=?", (delivery_id,))
             con.commit()
@@ -1088,7 +1116,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
 
         recovered = recover_received_deliveries(db_path=db, gateway=FrozenGateway(), now=int(time.time()))
         self.assertEqual("failed", recovered[0]["status"])
-        with sqlite3.connect(db) as con:
+        with _test_db(db) as con:
             self.assertEqual(("failed","context_mismatch"), con.execute("SELECT status,error_code FROM war_deliveries WHERE id=?", (delivery_id,)).fetchone())
 
     def test_explicit_binding_and_byte_equivalent_selected_fanout(self) -> None:
@@ -1102,7 +1130,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
         self.client.post(f"/api/war-room/tasks/{task_id}/transition",json={"status":"running"},headers={**headers,"Idempotency-Key":"fan-run"})
         fan=self.client.post(f"/api/war-room/messages/{mid}/deliveries",json={"task_id":task_id,"agent_ids":["ERPcoder","ERPqa"]},headers={**headers,"Idempotency-Key":"fan-send"})
         self.assertEqual(201,fan.status_code,fan.text); self.assertEqual(["ERPcoder","ERPqa"],[x["agent_id"] for x in fan.json()["deliveries"]])
-        with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
+        with _test_db(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
             rows=con.execute("SELECT d.agent_id,m.body FROM war_deliveries d JOIN war_messages m ON m.id=d.message_id WHERE d.message_id=? ORDER BY d.agent_id",(mid,)).fetchall()
         self.assertEqual([("ERPcoder","identical bytes"),("ERPqa","identical bytes")],rows)
         self.assertNotIn("main",[row[0] for row in rows])
@@ -1173,7 +1201,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
             "grounding":{"worktree":"/safe/worktree","branch":"fix/collab","revision":"abc123","api_base":"http://127.0.0.1:8114/api/war-room","db_label":"isolated-demo","forbidden":["production DB"],"completion_conditions":["tests pass"]},
         }, headers=headers)
         self.assertEqual(201, response.status_code, response.text)
-        with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
+        with _test_db(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
             packet = json.loads(con.execute("SELECT packet_json FROM war_grounding_packets WHERE task_id=?", (response.json()["task_id"],)).fetchone()[0])
             body = con.execute("SELECT body FROM war_messages WHERE id=?", (response.json()["message_id"],)).fetchone()[0]
         self.assertEqual("abc123", packet["revision"])
@@ -1224,7 +1252,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
         self.assertEqual(linked.json(), replay.json())
         duplicate = self.client.post(base + "/instructions", json={"task_id":task_id,"body":"second instruction"}, headers={**headers, "Idempotency-Key":"tasklink-duplicate"})
         self.assertEqual(409, duplicate.status_code, duplicate.text)
-        with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
+        with _test_db(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
             row = con.execute(
                 "SELECT m.id,t.id,t.status FROM war_messages m JOIN war_tasks t ON t.source_message_id=m.id WHERE m.id=?",
                 (linked.json()["message_id"],),
@@ -1253,7 +1281,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
         self.assertEqual(["ERPcoder"], [row["principal_id"] for row in participants if row["principal_id"] == "ERPcoder"])
         original = self.client.get("/api/war-room/projects/plachem-agent-war-room/participants", headers=headers).json()["items"]
         self.assertIn("ERPcoder", [row["principal_id"] for row in original])
-        with sqlite3.connect(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
+        with _test_db(Path(os.environ["PLACHEM_WAR_ROOM_DB"])) as con:
             rows = con.execute("SELECT project_id, principal_id FROM war_participants WHERE principal_id='ERPcoder' ORDER BY project_id").fetchall()
         self.assertIn(("plachem-agent-war-room", "ERPcoder"), rows)
         self.assertIn((project_id, "ERPcoder"), rows)
@@ -1290,7 +1318,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
         from war_room_worker import recover_received_deliveries
         db = Path(os.environ["PLACHEM_WAR_ROOM_DB"])
         now = int(time.time())
-        with sqlite3.connect(db) as con:
+        with _test_db(db) as con:
             con.execute("INSERT INTO war_messages VALUES (?,?,?,?,?,?,?,?,?,?,?)", ("recovery-message", "plachem-agent-war-room", "instruction", "agent", "main", "recovery body", None, None, now, "recovery-corr", "clean"))
             con.execute("INSERT INTO war_deliveries (id,message_id,agent_id,status,attempt_count,run_id,created_at) VALUES (?,?,?,?,?,?,?)", ("recovery-delivery", "recovery-message", "ERPcoder", "received", 1, "run-recover", now))
             con.commit()
@@ -1299,7 +1327,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
         gateway.complete(run_id="run-recover", status="responded", response_body="recovered result")
         recovered = recover_received_deliveries(db_path=db, gateway=gateway, now=now + 1)
         self.assertEqual([{"delivery_id":"recovery-delivery","run_id":"run-recover","status":"responded"}], recovered)
-        with sqlite3.connect(db) as con:
+        with _test_db(db) as con:
             self.assertEqual("responded", con.execute("SELECT status FROM war_deliveries WHERE id='recovery-delivery'").fetchone()[0])
 
 
