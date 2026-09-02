@@ -20,6 +20,11 @@ from typing import Any, Mapping
 from mock_auth_broker import consume_task_authorization, load_task_authorization
 
 ROOT = Path(__file__).resolve().parent
+_CONTROL_DIR = ROOT.parent / "command_center"
+if str(_CONTROL_DIR) not in sys.path:
+    sys.path.insert(0, str(_CONTROL_DIR))
+
+from runtime_profile import RuntimeProfileResolver
 
 DEFAULT_POLICY = {
     "max_context_files": 20,
@@ -426,9 +431,20 @@ def _parse_worker_result(content: str) -> dict[str, Any]:
 def _call_hermes_profile_worker(
     agent: dict[str, Any], prompt: str, timeout_seconds: int
 ) -> dict[str, Any]:
-    profile = str(agent.get("profile") or "")
+    dynamic_profile = bool(agent.get("runtime_profile"))
+    profile = str(agent.get("runtime_profile") or agent.get("profile") or "")
     model = str(agent.get("model") or "")
     inference_provider = str(agent.get("inference_provider") or "")
+    if dynamic_profile:
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if not local_app_data:
+            raise RuntimeError("LOCALAPPDATA is required for runtime profile resolution")
+        try:
+            runtime_profile = RuntimeProfileResolver(Path(local_app_data) / "hermes").resolve(profile)
+            model = runtime_profile.model
+            inference_provider = runtime_profile.provider
+        except ValueError as exc:
+            raise RuntimeError(f"runtime profile unavailable: {profile}") from exc
     if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", profile):
         raise ValueError("invalid Hermes profile name")
     if not model or not inference_provider:
@@ -459,17 +475,13 @@ def _call_hermes_profile_worker(
     child_env["NO_COLOR"] = "1"
     child_env["PYTHONIOENCODING"] = "utf-8"
 
-    with tempfile.TemporaryDirectory(prefix="fast-gateway-athena-") as td:
+    with tempfile.TemporaryDirectory(prefix="fast-gateway-profile-") as td:
         query_path = Path(td) / "query.txt"
         query_path.write_text(prompt, encoding="utf-8")
         command = [
             "hermes",
             "-p",
             profile,
-            "--model",
-            model,
-            "--provider",
-            inference_provider,
             "--ignore-user-config",
             "--ignore-rules",
             "chat",
@@ -481,6 +493,8 @@ def _call_hermes_profile_worker(
             "--source",
             "tool",
         ]
+        if not dynamic_profile:
+            command[3:3] = ["--model", model, "--provider", inference_provider]
         stdout_path = Path(td) / "stdout.txt"
         stderr_path = Path(td) / "stderr.txt"
         with (
@@ -525,7 +539,7 @@ def _call_hermes_profile_worker(
 
 
 def call_worker(agent: dict[str, Any], prompt: str, timeout_seconds: int) -> dict[str, Any]:
-    if agent.get("provider") == "hermes-profile":
+    if agent.get("runtime_profile") or agent.get("provider") == "hermes-profile":
         return _call_hermes_profile_worker(agent, prompt, timeout_seconds)
 
     payload = {
@@ -695,7 +709,7 @@ def run(
 ) -> dict[str, Any]:
     started = time.monotonic()
     task_id = str(task_request.get("task_id") or f"task-{int(time.time())}")
-    agent_name = str(task_request.get("agent") or "achilles")
+    agent_name = str(task_request.get("agent") or "")
     task = str(task_request.get("task") or "").strip()
     workspace_value = str(task_request.get("workspace") or ".")
 
@@ -726,6 +740,8 @@ def run(
 
     if not task:
         return blocked_record("EMPTY_TASK", None, [])
+    if not agent_name:
+        return blocked_record("MISSING_AGENT", None, [])
     if agent_name not in agents:
         return blocked_record("UNKNOWN_AGENT", None, [])
 
@@ -905,7 +921,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="PLACHEM Fast Delegation Gateway")
     parser.add_argument("--request", type=Path, help="JSON: task_id, agent, task, workspace")
     parser.add_argument("--task", help="Natural-language task text")
-    parser.add_argument("--agent", default="achilles")
+    parser.add_argument("--agent")
     parser.add_argument("--workspace", default=".")
     parser.add_argument("--task-id")
     parser.add_argument("--project-root", type=Path, default=ROOT.parent)

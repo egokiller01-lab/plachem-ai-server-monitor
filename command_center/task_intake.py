@@ -10,6 +10,9 @@ def create_task_package(
     original_instruction: str,
     *,
     requested_worker: str | None = None,
+    required_capabilities: list[str] | None = None,
+    preferred_worker: str | None = None,
+    worker_selection_mode: str = "preferred",
     requested_actions: list[str] | None = None,
     correlation_id: str | None = None,
     source: str | None = None,
@@ -21,6 +24,15 @@ def create_task_package(
         raise TypeError("original_instruction must be a string")
     if requested_worker is not None and not isinstance(requested_worker, str):
         raise TypeError("requested_worker must be a string or None")
+    if required_capabilities is not None and (
+        not isinstance(required_capabilities, list)
+        or not all(isinstance(capability, str) and capability for capability in required_capabilities)
+    ):
+        raise TypeError("required_capabilities must be a list of non-empty strings or None")
+    if preferred_worker is not None and (not isinstance(preferred_worker, str) or not preferred_worker):
+        raise TypeError("preferred_worker must be a non-empty string or None")
+    if worker_selection_mode not in {"preferred", "strict"}:
+        raise ValueError("worker_selection_mode must be preferred or strict")
     if requested_actions is not None and (
         not isinstance(requested_actions, list)
         or not all(isinstance(action, str) for action in requested_actions)
@@ -43,6 +55,9 @@ def create_task_package(
             original_instruction.encode("utf-8")
         ).hexdigest(),
         "requested_worker": requested_worker,
+        "required_capabilities": list(required_capabilities or []),
+        "preferred_worker": preferred_worker,
+        "worker_selection_mode": worker_selection_mode,
         "requested_actions": list(requested_actions or []),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "CREATED",

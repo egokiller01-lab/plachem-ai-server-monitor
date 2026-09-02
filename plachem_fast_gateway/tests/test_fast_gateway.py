@@ -114,13 +114,16 @@ class FastGatewayTests(unittest.TestCase):
         self.assertEqual(
             agents["athena"],
             {
-                "provider": "hermes-profile",
-                "profile": "athena",
-                "inference_provider": "openai-codex",
-                "model": "gpt-5.6-luna",
-                "max_tokens": 8000,
+                "enabled": True,
+                "priority": 30,
+                "capabilities": ["coding", "review", "research", "documentation", "testing", "general"],
+                "runtime_profile": "athena",
             },
         )
+        for agent in agents.values():
+            self.assertNotIn("model", agent)
+            self.assertNotIn("provider", agent)
+            self.assertNotIn("base_url", agent)
 
     def test_load_hermes_session_evidence_verifies_actual_model_and_provider(self):
         with tempfile.TemporaryDirectory() as td:
