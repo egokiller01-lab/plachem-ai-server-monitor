@@ -67,7 +67,7 @@ class AgentRegistry:
         if preferred is not None and not isinstance(preferred, str):
             raise ValueError("INVALID_PREFERRED_WORKER")
         mode = task.get("worker_selection_mode", "preferred")
-        if mode not in {"preferred", "strict"}:
+        if mode not in {"preferred", "strict", "fallback"}:
             raise ValueError("INVALID_WORKER_SELECTION_MODE")
         workspace_id = task.get("workspace_id")
         active_workers = {
