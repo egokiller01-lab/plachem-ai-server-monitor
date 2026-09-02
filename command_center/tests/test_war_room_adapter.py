@@ -217,6 +217,86 @@ class WarRoomTaskCompilerTests(unittest.TestCase):
 
         self.assertEqual(len(result["command_tasks"]), 1)
         self.assertEqual(result["command_tasks"][0]["requested_worker"], "ERPqa")
+        self.assertEqual(result["command_tasks"][0]["depends_on_task_ids"], [])
+
+    def test_explicit_implementation_to_review_maps_agent_dependency_to_task_id(self):
+        result = self.compiler.compile(
+            self.payload(
+                correlation_id="war-corr-1",
+                workflow=[
+                    {"agent_id": "ERPcoder", "role": "implementation", "depends_on": []},
+                    {"agent_id": "ERPqa", "role": "review", "depends_on": ["ERPcoder"]},
+                ],
+            )
+        )
+
+        tasks = result["command_tasks"]
+        self.assertEqual(tasks[0]["workflow_role"], "implementation")
+        self.assertEqual(tasks[0]["depends_on_task_ids"], [])
+        self.assertEqual(tasks[1]["workflow_role"], "review")
+        self.assertEqual(tasks[1]["depends_on_task_ids"], [tasks[0]["task_id"]])
+        self.assertEqual(
+            result["workflow_graph"][1]["depends_on_task_ids"],
+            [tasks[0]["task_id"]],
+        )
+
+    def test_unknown_dependency_rejects_atomically(self):
+        with self.assertRaisesRegex(ValueError, "UNKNOWN_WORKFLOW_DEPENDENCY:missing"):
+            self.compiler.compile(
+                self.payload(
+                    workflow=[
+                        {"agent_id": "ERPcoder", "role": "implementation", "depends_on": []},
+                        {"agent_id": "ERPqa", "role": "review", "depends_on": ["missing"]},
+                    ]
+                )
+            )
+
+        self.assertEqual(self.compiler.compilations, {})
+
+    def test_self_dependency_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "SELF_DEPENDENCY:ERPcoder"):
+            self.compiler.compile(
+                self.payload(
+                    workflow=[
+                        {"agent_id": "ERPcoder", "role": "implementation", "depends_on": ["ERPcoder"]},
+                        {"agent_id": "ERPqa", "role": "review", "depends_on": []},
+                    ]
+                )
+            )
+
+    def test_cycle_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "CYCLE_DETECTED"):
+            self.compiler.compile(
+                self.payload(
+                    workflow=[
+                        {"agent_id": "ERPcoder", "role": "implementation", "depends_on": ["ERPqa"]},
+                        {"agent_id": "ERPqa", "role": "review", "depends_on": ["ERPcoder"]},
+                    ]
+                )
+            )
+
+    def test_duplicate_workflow_agent_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "DUPLICATE_WORKFLOW_AGENT:ERPcoder"):
+            self.compiler.compile(
+                self.payload(
+                    workflow=[
+                        {"agent_id": "ERPcoder", "role": "implementation", "depends_on": []},
+                        {"agent_id": "ERPcoder", "role": "review", "depends_on": []},
+                    ]
+                )
+            )
+
+    def test_workflow_agent_set_mismatch_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "WORKFLOW_AGENT_SET_MISMATCH"):
+            self.compiler.compile(
+                self.payload(
+                    workflow=[
+                        {"agent_id": "ERPcoder", "role": "implementation", "depends_on": []},
+                        {"agent_id": "ERPqa", "role": "review", "depends_on": []},
+                        {"agent_id": "ERPmanager", "role": "observer", "depends_on": []},
+                    ]
+                )
+            )
 
     def test_unknown_workspace_rejects_before_child_creation(self):
         with self.assertRaisesRegex(ValueError, "UNKNOWN_WORKSPACE:missing"):

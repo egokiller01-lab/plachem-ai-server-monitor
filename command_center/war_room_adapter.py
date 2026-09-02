@@ -13,6 +13,7 @@ from workspace_registry import WorkspaceRegistry
 
 _REQUIRED_FIELDS = {"war_project_id", "war_task_id", "scope"}
 _RAW_WORKSPACE_FIELDS = {"project_root", "workspace_root", "workspace_path", "path"}
+_WORKFLOW_ROLES = {"implementation", "review", "observer"}
 
 
 class DuplicateExternalReference(ValueError):
@@ -187,6 +188,7 @@ class WarRoomTaskCompiler:
         self._adapter._workspaces.resolve(workspace_id)
         for agent_id in agents:
             self._adapter._agents.resolve(agent_id)
+        workflow = self._workflow(payload, agents)
 
         correlation_id = payload.get("correlation_id") or f"corr-{uuid.uuid4().hex}"
         if not isinstance(correlation_id, str) or not correlation_id:
@@ -206,8 +208,25 @@ class WarRoomTaskCompiler:
             )
             package = child_adapter.to_task_package(child_payload)
             package["compile_index"] = index
+            package["workflow_role"] = workflow[agent_id]["role"]
+            package["depends_on_task_ids"] = []
+            package["dependency_mode"] = "all_success"
             package["war_room_metadata"]["requested_agent"] = agent_id
             command_tasks.append(package)
+
+        task_ids = {agent_id: package["task_id"] for agent_id, package in zip(agents, command_tasks)}
+        workflow_graph = []
+        for agent_id, package in zip(agents, command_tasks):
+            dependencies = [task_ids[dependency] for dependency in workflow[agent_id]["depends_on"]]
+            package["depends_on_task_ids"] = dependencies
+            workflow_graph.append(
+                {
+                    "task_id": package["task_id"],
+                    "role": package["workflow_role"],
+                    "depends_on_task_ids": list(dependencies),
+                    "dependency_mode": package["dependency_mode"],
+                }
+            )
 
         result = {
             "war_project_id": reference.project_id,
@@ -215,6 +234,70 @@ class WarRoomTaskCompiler:
             "correlation_id": correlation_id,
             "external_reference": copy.deepcopy(command_tasks[0]["external_reference"]),
             "command_tasks": command_tasks,
+            "workflow_graph": workflow_graph,
         }
         self._compilations[key] = copy.deepcopy(result)
         return result
+
+    @staticmethod
+    def _workflow(payload: dict[str, Any], agents: list[str]) -> dict[str, dict[str, Any]]:
+        raw_workflow = payload.get("workflow")
+        if raw_workflow is None:
+            return {
+                agent_id: {"role": "implementation", "depends_on": []}
+                for agent_id in agents
+            }
+        if not isinstance(raw_workflow, list):
+            raise ValueError("workflow must be a list")
+
+        agent_set = set(agents)
+        workflow: dict[str, dict[str, Any]] = {}
+        for item in raw_workflow:
+            if not isinstance(item, dict):
+                raise ValueError("workflow entries must be objects")
+            agent_id = item.get("agent_id")
+            role = item.get("role")
+            dependencies = item.get("depends_on", [])
+            if agent_id in workflow:
+                raise ValueError(f"DUPLICATE_WORKFLOW_AGENT:{agent_id}")
+            if not isinstance(agent_id, str) or not agent_id:
+                raise ValueError("workflow agent_id must be a non-empty string")
+            if role not in _WORKFLOW_ROLES:
+                raise ValueError(f"INVALID_WORKFLOW_ROLE:{agent_id}")
+            if not isinstance(dependencies, list) or not all(
+                isinstance(dependency, str) and dependency for dependency in dependencies
+            ):
+                raise ValueError(f"invalid workflow dependencies:{agent_id}")
+            if agent_id not in agent_set:
+                raise ValueError(f"WORKFLOW_AGENT_SET_MISMATCH:{agent_id}")
+            workflow[agent_id] = {
+                "role": role,
+                "depends_on": list(dict.fromkeys(dependencies)),
+            }
+
+        if set(workflow) != agent_set:
+            raise ValueError("WORKFLOW_AGENT_SET_MISMATCH")
+        for agent_id, item in workflow.items():
+            for dependency in item["depends_on"]:
+                if dependency not in agent_set:
+                    raise ValueError(f"UNKNOWN_WORKFLOW_DEPENDENCY:{dependency}")
+                if dependency == agent_id:
+                    raise ValueError(f"SELF_DEPENDENCY:{agent_id}")
+
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(agent_id: str) -> None:
+            if agent_id in visiting:
+                raise ValueError("CYCLE_DETECTED")
+            if agent_id in visited:
+                return
+            visiting.add(agent_id)
+            for dependency in workflow[agent_id]["depends_on"]:
+                visit(dependency)
+            visiting.remove(agent_id)
+            visited.add(agent_id)
+
+        for agent_id in agents:
+            visit(agent_id)
+        return workflow
