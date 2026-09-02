@@ -24,7 +24,6 @@ _CONTROL_DIR = ROOT.parent / "command_center"
 if str(_CONTROL_DIR) not in sys.path:
     sys.path.insert(0, str(_CONTROL_DIR))
 
-from runtime_profile import RuntimeProfileResolver
 from workspace_registry import WorkspaceRegistry
 from gateway.path_security import reject_reparse_points
 
@@ -408,8 +407,6 @@ def load_hermes_session_evidence(
     session_id: str,
     *,
     expected_profile: str,
-    expected_model: str,
-    expected_provider: str,
 ) -> dict[str, Any]:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", session_id):
         raise RuntimeError("invalid Hermes session id")
@@ -429,8 +426,8 @@ def load_hermes_session_evidence(
     if row is None:
         raise RuntimeError("Hermes session evidence not found")
     model, provider, profile, ended_at, end_reason, api_calls, tool_calls, input_tokens, output_tokens = row
-    if model != expected_model or provider != expected_provider or profile != expected_profile:
-        raise RuntimeError("Hermes session model/provider/profile mismatch")
+    if profile != expected_profile:
+        raise RuntimeError("Hermes session profile mismatch")
     if ended_at is None or not end_reason or int(api_calls or 0) < 1:
         raise RuntimeError("Hermes session evidence is incomplete")
     if int(tool_calls or 0) != 0:
@@ -461,24 +458,9 @@ def _parse_worker_result(content: str) -> dict[str, Any]:
 def _call_hermes_profile_worker(
     agent: dict[str, Any], prompt: str, timeout_seconds: int
 ) -> dict[str, Any]:
-    dynamic_profile = bool(agent.get("runtime_profile"))
     profile = str(agent.get("runtime_profile") or agent.get("profile") or "")
-    model = str(agent.get("model") or "")
-    inference_provider = str(agent.get("inference_provider") or "")
-    if dynamic_profile:
-        local_app_data = os.environ.get("LOCALAPPDATA")
-        if not local_app_data:
-            raise RuntimeError("LOCALAPPDATA is required for runtime profile resolution")
-        try:
-            runtime_profile = RuntimeProfileResolver(Path(local_app_data) / "hermes").resolve(profile)
-            model = runtime_profile.model
-            inference_provider = runtime_profile.provider
-        except ValueError as exc:
-            raise RuntimeError(f"runtime profile unavailable: {profile}") from exc
     if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", profile):
         raise ValueError("invalid Hermes profile name")
-    if not model or not inference_provider:
-        raise ValueError("Hermes profile adapter requires model and inference_provider")
 
     child_env_keys = {
         "APPDATA",
@@ -512,7 +494,6 @@ def _call_hermes_profile_worker(
             "hermes",
             "-p",
             profile,
-            "--ignore-user-config",
             "--ignore-rules",
             "chat",
             "--toolsets",
@@ -523,8 +504,6 @@ def _call_hermes_profile_worker(
             "--source",
             "tool",
         ]
-        if not dynamic_profile:
-            command[3:3] = ["--model", model, "--provider", inference_provider]
         stdout_path = Path(td) / "stdout.txt"
         stderr_path = Path(td) / "stderr.txt"
         with (
@@ -560,8 +539,6 @@ def _call_hermes_profile_worker(
             resolve_hermes_profile_state_db(profile),
             session_ids[0],
             expected_profile=profile,
-            expected_model=model,
-            expected_provider=inference_provider,
         )
         response = WorkerResponse(_parse_worker_result(stdout_text))
         response.execution_evidence = evidence

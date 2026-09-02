@@ -167,8 +167,6 @@ class FastGatewayTests(unittest.TestCase):
                 state_db,
                 "session-123",
                 expected_profile="athena",
-                expected_model="gpt-5.6-luna",
-                expected_provider="openai-codex",
             )
 
             self.assertEqual(evidence["source"], "hermes_state_db")
@@ -257,17 +255,13 @@ class FastGatewayTests(unittest.TestCase):
 
         self.assertEqual(result, worker_result)
         self.assertEqual(result.execution_evidence["source"], "hermes_state_db")
-        self.assertEqual(result.execution_evidence["model"], "gpt-5.6-luna")
-        self.assertEqual(result.execution_evidence["provider"], "openai-codex")
-        self.assertEqual(result.execution_evidence["tool_calls"], 0)
+        self.assertEqual(result.execution_evidence["profile"], "athena")
         command = called.call_args.args[0]
         self.assertEqual(command[0:3], ["hermes", "-p", "athena"])
-        self.assertIn("--model", command)
-        self.assertIn("gpt-5.6-luna", command)
-        self.assertIn("--provider", command)
-        self.assertIn("openai-codex", command)
+        self.assertNotIn("--model", command)
+        self.assertNotIn("--provider", command)
         self.assertIn("--ignore-rules", command)
-        self.assertIn("--ignore-user-config", command)
+        self.assertNotIn("--ignore-user-config", command)
         self.assertIn("--toolsets", command)
         self.assertIn("context_engine", command)
         self.assertIn("--query-file", command)
@@ -285,6 +279,44 @@ class FastGatewayTests(unittest.TestCase):
         self.assertIn("SystemDrive", child_env)
         self.assertNotIn("OPENAI_API_KEY", child_env)
         self.assertNotIn("ANTHROPIC_API_KEY", child_env)
+
+    def test_dynamic_profile_snapshot_drives_launch_and_evidence_validation(self):
+        agent = {"runtime_profile": "athena", "provider": "hermes-profile"}
+        worker_result = {
+            "result_type": "read_only",
+            "status": "completed",
+            "summary": "reviewed",
+            "reason": "",
+            "review_result": "PASS",
+            "findings": [],
+            "artifacts": [],
+        }
+        with tempfile.TemporaryDirectory() as td:
+            state_db = Path(td) / "state.db"
+            conn = sqlite3.connect(state_db)
+            try:
+                conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, model TEXT, billing_provider TEXT, profile_name TEXT, ended_at REAL, end_reason TEXT, api_call_count INTEGER, tool_call_count INTEGER, input_tokens INTEGER, output_tokens INTEGER)")
+                conn.execute("INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ("session-snapshot", "model-from-profile", "provider-from-profile", "athena", 123.0, "cli_close", 1, 0, 100, 20))
+                conn.commit()
+            finally:
+                conn.close()
+
+            def fake_run(command, **kwargs):
+                kwargs["stdout"].write(json.dumps(worker_result))
+                kwargs["stderr"].write("session_id: session-snapshot" + chr(10))
+                return subprocess.CompletedProcess(args=command, returncode=0)
+
+            with (
+                mock.patch.object(g.subprocess, "run", side_effect=fake_run) as called,
+                mock.patch.object(g, "resolve_hermes_profile_state_db", return_value=state_db),
+            ):
+                result = g.call_worker(agent, "bounded prompt", 30)
+
+        command = called.call_args.args[0]
+        self.assertNotIn("--model", command)
+        self.assertNotIn("--provider", command)
+        self.assertNotIn("--ignore-user-config", command)
+        self.assertEqual(result.execution_evidence["profile"], "athena")
 
     def test_worker_prompt_uses_current_request_agent_identity(self):
         policy = dict(g.DEFAULT_POLICY)
