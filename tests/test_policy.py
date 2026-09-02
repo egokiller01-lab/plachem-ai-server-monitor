@@ -36,7 +36,7 @@ def test_allows_low_risk_local_read_task():
     assert decision is PolicyDecision.READY
     assert engine.hermes_executable.endswith("/hermes.exe")
     assert engine.nvidia_smi_executable == "C:/Windows/System32/nvidia-smi.exe"
-    assert engine.runtime_root == "C:/Users/egomine2/PLACHEM-Agent-Control/runtime"
+    assert engine.runtime_root == "E:/PLACHEM-Agent-Control/repo/runtime"
     assert engine.hermes_sha256 == "dc5357dc27045339c7748c96ba1690eeccdd72a903231027a0235a33cdd291c3"
     assert engine.nvidia_smi_sha256 == "9b3da28a74c5bfbf33b147b4b73c105e55b1f74b474e63ec7762843e5f2b635d"
     assert engine.model_sha256 == "4c5e2db039e9325ac7724c8846c71356a24ad1cdfa28002d73ecb6be645f9675"
@@ -168,7 +168,7 @@ def test_policy_engine_loads_authoritative_yaml_configuration(tmp_path):
     agents_path = tmp_path / "agents.yaml"
     policy_path.write_text(
         "default: deny\n"
-        "runtime_root: C:/Users/egomine2/PLACHEM-Agent-Control/runtime\n"
+        "runtime_root: E:/PLACHEM-Agent-Control/repo/runtime\n"
         "mandatory_denials: [production, merge, deploy, secrets_export, custom_deny]\n"
         "critical_denials: [destructive_delete, permission_change]\n"
         "v1:\n"

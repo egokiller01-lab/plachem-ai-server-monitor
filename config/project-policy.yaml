@@ -1,5 +1,5 @@
 default: deny
-runtime_root: C:/Users/egomine2/PLACHEM-Agent-Control/runtime
+runtime_root: E:/PLACHEM-Agent-Control/repo/runtime
 mandatory_denials:
   - production
   - merge

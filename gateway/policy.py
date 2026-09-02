@@ -31,7 +31,7 @@ _MEDIUM_SCOPED_PERMISSIONS = {
     "workspace_write_scoped",
     "local_test",
 }
-_FIXED_RUNTIME = "C:/Users/egomine2/PLACHEM-Agent-Control/runtime"
+_FIXED_RUNTIME = "E:/PLACHEM-Agent-Control/repo/runtime"
 _HERMES_SHA256 = "dc5357dc27045339c7748c96ba1690eeccdd72a903231027a0235a33cdd291c3"
 _NVIDIA_SMI_SHA256 = "9b3da28a74c5bfbf33b147b4b73c105e55b1f74b474e63ec7762843e5f2b635d"
 _MODEL_SHA256 = "4c5e2db039e9325ac7724c8846c71356a24ad1cdfa28002d73ecb6be645f9675"

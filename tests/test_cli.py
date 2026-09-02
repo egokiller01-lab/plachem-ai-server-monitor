@@ -27,7 +27,8 @@ def test_cli_dry_run_validates_any_taskspec_without_starting_worker(tmp_path: Pa
     path = tmp_path / "task.json"
     path.write_text(json.dumps(task), encoding="utf-8")
 
-    exit_code = main(["dry-run", "--task", str(path)])
+    official_runtime = Path(__file__).resolve().parents[1] / "runtime"
+    exit_code = main(["dry-run", "--task", str(path), "--runtime", str(official_runtime)])
 
     assert exit_code == 0
     output = json.loads(capsys.readouterr().out)
@@ -113,6 +114,16 @@ def test_runtime_must_resolve_to_policy_pinned_dedicated_root(tmp_path: Path):
     with pytest.raises(ValueError, match="trusted runtime root"):
         _validated_runtime(tmp_path, policy)
     assert _validated_runtime(Path(policy.runtime_root), policy) == Path(policy.runtime_root)
+
+
+def test_runtime_rejects_legacy_and_arbitrary_roots():
+    policy = PolicyEngine.default()
+    for runtime in (
+        Path("C:/Users/egomine2/PLACHEM-Agent-Control/runtime"),
+        Path("E:/temp/runtime"),
+    ):
+        with pytest.raises(ValueError, match="trusted runtime root"):
+            _validated_runtime(runtime, policy)
 
 
 def test_build_gateway_prepares_audit_before_worker_launch(tmp_path: Path, monkeypatch):
