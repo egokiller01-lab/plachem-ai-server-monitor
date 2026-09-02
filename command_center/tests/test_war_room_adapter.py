@@ -7,6 +7,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from agent_registry import AgentRegistry
 from war_room_adapter import (
     DuplicateExternalReference,
+    CompilationConflict,
+    WarRoomTaskCompiler,
     WarRoomTaskAdapter,
 )
 from workspace_registry import WorkspaceEntry, WorkspaceRegistry
@@ -18,6 +20,7 @@ class WarRoomTaskAdapterTests(unittest.TestCase):
             {
                 "ERPcoder": {"provider": "test-worker"},
                 "ERPqa": {"provider": "test-worker"},
+                "ERPmanager": {"provider": "test-worker"},
             }
         )
         self.workspaces = WorkspaceRegistry(
@@ -127,6 +130,103 @@ class WarRoomTaskAdapterTests(unittest.TestCase):
 
         self.assertEqual(package["requested_worker"], "ERPcoder")
         self.assertNotIn("requested_agents", package)
+
+
+class WarRoomTaskCompilerTests(unittest.TestCase):
+    def setUp(self):
+        agents = AgentRegistry(
+            {
+                "ERPcoder": {"provider": "test-worker"},
+                "ERPqa": {"provider": "test-worker"},
+                "ERPmanager": {"provider": "test-worker"},
+            }
+        )
+        workspaces = WorkspaceRegistry(
+            {
+                "erp": WorkspaceEntry(
+                    project_id="erp",
+                    canonical_root=Path("E:/PLACHEM-Agent-Control/repo"),
+                    branch="phase2-worker-identity",
+                    status="ACTIVE",
+                )
+            }
+        )
+        adapter = WarRoomTaskAdapter(agents, workspaces)
+        self.compiler = WarRoomTaskCompiler(adapter)
+
+    def payload(self, agents=None, **overrides):
+        value = {
+            "war_project_id": "project-1",
+            "war_task_id": "war-task-1",
+            "scope": "ERP fix and review",
+            "requested_agents": agents or ["ERPcoder", "ERPqa"],
+            "workspace_id": "erp",
+        }
+        value.update(overrides)
+        return value
+
+    def test_compiles_two_independent_command_tasks(self):
+        result = self.compiler.compile(self.payload())
+
+        tasks = result["command_tasks"]
+        self.assertEqual(len(tasks), 2)
+        self.assertNotEqual(tasks[0]["task_id"], tasks[1]["task_id"])
+        self.assertEqual([task["requested_worker"] for task in tasks], ["ERPcoder", "ERPqa"])
+        self.assertEqual([task["compile_index"] for task in tasks], [0, 1])
+
+    def test_compiled_tasks_share_correlation_and_external_reference(self):
+        result = self.compiler.compile(self.payload(correlation_id="war-corr-1"))
+
+        tasks = result["command_tasks"]
+        self.assertEqual(result["correlation_id"], "war-corr-1")
+        self.assertEqual({task["correlation_id"] for task in tasks}, {"war-corr-1"})
+        self.assertEqual(
+            {tuple(sorted(task["external_reference"].items())) for task in tasks},
+            {(
+                ("external_task_id", "war-task-1"),
+                ("project_id", "project-1"),
+                ("source", "war_room"),
+            )},
+        )
+
+    def test_unknown_agent_rejects_atomically(self):
+        with self.assertRaisesRegex(ValueError, "UNKNOWN_AGENT:missing"):
+            self.compiler.compile(self.payload(agents=["ERPcoder", "missing"]))
+
+        self.assertEqual(self.compiler.compilations, {})
+
+    def test_same_agent_set_returns_existing_compilation(self):
+        first = self.compiler.compile(self.payload())
+        second = self.compiler.compile(self.payload())
+
+        self.assertEqual(second, first)
+        self.assertEqual(len(self.compiler.compilations), 1)
+
+    def test_changed_agent_set_requires_revision(self):
+        self.compiler.compile(self.payload())
+
+        with self.assertRaises(CompilationConflict):
+            self.compiler.compile(
+                self.payload(agents=["ERPcoder", "ERPqa", "ERPmanager"])
+            )
+
+        self.assertEqual(len(self.compiler.compilations), 1)
+
+    def test_single_agent_remains_compatible(self):
+        result = self.compiler.compile(self.payload(agents=["ERPqa"]))
+
+        self.assertEqual(len(result["command_tasks"]), 1)
+        self.assertEqual(result["command_tasks"][0]["requested_worker"], "ERPqa")
+
+    def test_unknown_workspace_rejects_before_child_creation(self):
+        with self.assertRaisesRegex(ValueError, "UNKNOWN_WORKSPACE:missing"):
+            self.compiler.compile(self.payload(workspace_id="missing"))
+
+        self.assertEqual(self.compiler.compilations, {})
+
+    def test_raw_path_cannot_bypass_workspace_guard(self):
+        with self.assertRaisesRegex(ValueError, "raw workspace path"):
+            self.compiler.compile(self.payload(project_root="E:/PLACHEM-Agent-Control/repo"))
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,6 +25,18 @@ class DuplicateExternalReference(ValueError):
         super().__init__(
             "DUPLICATE_EXTERNAL_REFERENCE:"
             f"war_room:{project_id}:{task_id}:command_task={command_task_id}"
+        )
+
+
+class CompilationConflict(ValueError):
+    """Raised when a War Room task is submitted with a new agent set."""
+
+    def __init__(self, project_id: str, task_id: str) -> None:
+        self.project_id = project_id
+        self.external_task_id = task_id
+        super().__init__(
+            "COMPILATION_REVISION_REQUIRED:"
+            f"war_room:{project_id}:{task_id}"
         )
 
 
@@ -141,3 +154,67 @@ class WarRoomTaskAdapter:
         if assignee is not None and assignee not in requested_agents:
             raise ValueError("assignee_agent_id must be included in requested_agents")
         return list(dict.fromkeys(requested_agents))
+
+
+class WarRoomTaskCompiler:
+    """Compile one War Room task into independently identified child tasks."""
+
+    def __init__(self, adapter: WarRoomTaskAdapter) -> None:
+        self._adapter = adapter
+        self._compilations: dict[tuple[str, str, tuple[str, ...]], dict[str, Any]] = {}
+
+    @property
+    def compilations(self) -> dict[tuple[str, str, tuple[str, ...]], dict[str, Any]]:
+        return copy.deepcopy(self._compilations)
+
+    def compile(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise TypeError("War Room task payload must be an object")
+        if _RAW_WORKSPACE_FIELDS & payload.keys():
+            raise ValueError("raw workspace path is not accepted")
+
+        reference = self._adapter._reference(payload)
+        agents = self._adapter._requested_agents(payload)
+        agent_key = tuple(sorted(agents))
+        key = (reference.project_id, reference.task_id, agent_key)
+        existing = self._compilations.get(key)
+        if existing is not None:
+            return copy.deepcopy(existing)
+        if any(existing_key[:2] == key[:2] for existing_key in self._compilations):
+            raise CompilationConflict(reference.project_id, reference.task_id)
+
+        workspace_id = self._adapter._workspace_id(payload, reference.project_id)
+        self._adapter._workspaces.resolve(workspace_id)
+        for agent_id in agents:
+            self._adapter._agents.resolve(agent_id)
+
+        correlation_id = payload.get("correlation_id") or f"corr-{uuid.uuid4().hex}"
+        if not isinstance(correlation_id, str) or not correlation_id:
+            raise TypeError("correlation_id must be a non-empty string or None")
+
+        command_tasks: list[dict[str, Any]] = []
+        for index, agent_id in enumerate(agents):
+            child_payload = dict(payload)
+            child_payload["requested_agents"] = [agent_id]
+            child_payload["assignee_agent_id"] = agent_id
+            child_payload["correlation_id"] = correlation_id
+            child_adapter = WarRoomTaskAdapter(
+                self._adapter._agents,
+                self._adapter._workspaces,
+                workspace_map=self._adapter._workspace_map,
+                existing_tasks={},
+            )
+            package = child_adapter.to_task_package(child_payload)
+            package["compile_index"] = index
+            package["war_room_metadata"]["requested_agent"] = agent_id
+            command_tasks.append(package)
+
+        result = {
+            "war_project_id": reference.project_id,
+            "war_task_id": reference.task_id,
+            "correlation_id": correlation_id,
+            "external_reference": copy.deepcopy(command_tasks[0]["external_reference"]),
+            "command_tasks": command_tasks,
+        }
+        self._compilations[key] = copy.deepcopy(result)
+        return result
