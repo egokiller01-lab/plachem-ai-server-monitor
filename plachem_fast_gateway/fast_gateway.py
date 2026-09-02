@@ -25,6 +25,8 @@ if str(_CONTROL_DIR) not in sys.path:
     sys.path.insert(0, str(_CONTROL_DIR))
 
 from runtime_profile import RuntimeProfileResolver
+from workspace_registry import WorkspaceRegistry
+from gateway.path_security import reject_reparse_points
 
 DEFAULT_POLICY = {
     "max_context_files": 20,
@@ -69,11 +71,39 @@ def merge_policy(path: Path | None) -> dict[str, Any]:
     return p
 
 
-def normalize_workspace(project_root: Path, workspace_value: str) -> Path:
-    workspace = (project_root / workspace_value).resolve()
-    if not workspace.is_relative_to(project_root):
+WORKSPACE_REGISTRY_PATH = _CONTROL_DIR / "workspaces.json"
+_SAFE_REPO_LOCAL_WORKSPACES = {".", "delegation-demo", "python-demo"}
+
+
+def normalize_workspace(
+    project_root: Path,
+    workspace_value: str,
+    registry: WorkspaceRegistry | None = None,
+) -> Path:
+    """Resolve only a registered workspace whose root matches the invocation root."""
+    active_registry = registry or WorkspaceRegistry.load(WORKSPACE_REGISTRY_PATH)
+    raw = Path(workspace_value)
+    if raw.is_absolute():
+        raise ValueError("workspace escapes project root: absolute workspace path is not allowed")
+    # Registry IDs are resolved first and may target registered external roots.
+    try:
+        entry = active_registry.resolve(workspace_value)
+    except ValueError:
+        entry = None
+    if entry is not None:
+        active_registry.validate(workspace_value, project_root)
+        return entry.canonical_root
+    local_value = workspace_value.removeprefix("./")
+    if workspace_value.startswith("..") or workspace_value.startswith("/") or "\\" in workspace_value or "/" in local_value:
         raise ValueError("workspace escapes project root")
-    if not workspace.exists() or not workspace.is_dir():
+    if local_value not in _SAFE_REPO_LOCAL_WORKSPACES:
+        raise ValueError(f"UNKNOWN_WORKSPACE:{workspace_value}")
+    candidate = project_root / local_value
+    reject_reparse_points(candidate)
+    workspace = candidate.resolve()
+    if not workspace.is_relative_to(project_root.resolve()):
+        raise ValueError("workspace escapes project root")
+    if not workspace.is_dir():
         raise ValueError(f"workspace not found: {workspace}")
     return workspace
 
@@ -769,7 +799,10 @@ def run(
     if not decision["allowed"]:
         return blocked_record(str(decision["reason"]), authorization, requested_actions)
 
-    workspace = normalize_workspace(project_root, workspace_value)
+    try:
+        workspace = normalize_workspace(project_root, workspace_value)
+    except (OSError, TypeError, ValueError) as exc:
+        return blocked_record(f"WORKSPACE_REJECTED:{exc}", authorization, requested_actions)
     context = collect_context(workspace, policy)
     if not context:
         return blocked_record("NO_CONTEXT_FILES", authorization, requested_actions)

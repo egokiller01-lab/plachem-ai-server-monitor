@@ -1,8 +1,13 @@
 {
   "workspaces": {
-    "plachem-agent-control": {
+    "command-center": {
       "root": "E:\\PLACHEM-Agent-Control\\repo",
       "branch": "phase2-worker-identity",
+      "status": "ACTIVE"
+    },
+    "war-room": {
+      "root": "E:\\PLACHEM-Agent-Control\\war-room",
+      "branch": "main",
       "status": "ACTIVE"
     }
   }

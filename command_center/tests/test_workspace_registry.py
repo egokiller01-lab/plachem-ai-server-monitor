@@ -10,7 +10,7 @@ import workspace_registry
 
 
 OFFICIAL_ROOT = Path(r"E:\PLACHEM-Agent-Control\repo")
-OFFICIAL_PROJECT_ID = "plachem-agent-control"
+OFFICIAL_PROJECT_ID = "command-center"
 OFFICIAL_BRANCH = "phase2-worker-identity"
 
 
