@@ -22,6 +22,7 @@ from fastapi.staticfiles import StaticFiles
 import war_room
 from war_room import router as war_room_router
 from war_room_actions import router as war_room_actions_router
+from war_room_command_center import router as war_room_command_center_router
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -31,6 +32,7 @@ app = FastAPI(title="PLACHEM AI Server Monitor")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 app.include_router(war_room_router)
 app.include_router(war_room_actions_router)
+app.include_router(war_room_command_center_router)
 
 
 @app.on_event("startup")

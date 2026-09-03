@@ -392,6 +392,27 @@ document.getElementById("task-form").addEventListener("submit", async event => {
   } catch (error) { out.textContent = error.message; }
 });
 
+document.getElementById("quick-execution-mode").addEventListener("change", event => {
+  document.getElementById("command-center-panel").hidden = event.target.value !== "command_center";
+});
+
+document.getElementById("command-center-dispatch").addEventListener("click", async () => {
+  const button = document.getElementById("command-center-dispatch");
+  const out = document.getElementById("command-center-status");
+  try {
+    const task = window.commandCenterTask;
+    if (!task) throw new Error("Command Center task가 없습니다");
+    button.disabled = true; out.textContent = "명시적 dispatch 중…";
+    const result = await post(`/api/war-room/command-center/tasks/${encodeURIComponent(task.task_id)}/dispatch`, {});
+    out.textContent = `Dispatch 완료 · ${result.run_status || result.status || "accepted"}`;
+    const [status, summary] = await Promise.all([
+      get(`/api/war-room/command-center/${encodeURIComponent(task.war_project_id)}/tasks/${encodeURIComponent(task.war_task_id)}`),
+      get(`/api/war-room/command-center/${encodeURIComponent(task.war_project_id)}/tasks/${encodeURIComponent(task.war_task_id)}/summary`),
+    ]);
+    out.textContent += ` · 상태 ${summary.overall || status.tasks?.[0]?.run_status || "확인됨"}`;
+  } catch (error) { button.disabled = false; out.textContent = `Command Center 실패 · ${error.message}`; }
+});
+
 document.getElementById("quick-task-form").addEventListener("submit", async event => {
   event.preventDefault();
   const out = document.getElementById("quick-result");
@@ -401,6 +422,25 @@ document.getElementById("quick-task-form").addEventListener("submit", async even
     if (!instruction) throw new Error("작업 내용을 입력하세요");
     if (!agent_ids.length) throw new Error("담당 에이전트를 한 명 이상 선택하세요");
     out.textContent = "작업을 준비하고 있습니다…";
+    if (document.getElementById("quick-execution-mode").value === "command_center") {
+      const result = await post("/api/war-room/command-center/submit", {
+        war_project_id: selectedProjectId,
+        war_task_id: `ui-${crypto.randomUUID()}`,
+        scope: instruction,
+        requested_agents: agent_ids,
+        assignee_agent_id: agent_ids[0],
+        workspace_id: "command-center",
+      });
+      const first = result.command_tasks?.[0];
+      if (!first) throw new Error("Command Center가 실행 후보를 반환하지 않았습니다");
+      window.commandCenterTask = { ...first, war_project_id: result.war_project_id, war_task_id: result.war_task_id };
+      const candidates = await get(`/api/war-room/command-center/${encodeURIComponent(result.war_project_id)}/tasks/${encodeURIComponent(result.war_task_id)}/candidates`);
+      document.getElementById("command-center-panel").hidden = false;
+      document.getElementById("command-center-dispatch").hidden = !candidates.candidates?.length;
+      document.getElementById("command-center-status").textContent = candidates.candidates?.length ? `Accepted · READY 후보 ${candidates.candidates.length}개` : "Accepted · READY 후보 없음";
+      out.textContent = "Command Center 작업이 접수되었습니다. 후보를 확인한 뒤 명시적으로 Dispatch하세요.";
+      return;
+    }
     const base = `/api/war-room/projects/${encodeURIComponent(selectedProjectId)}`;
     const task = await post(`${base}/prepare`, {
       instruction,

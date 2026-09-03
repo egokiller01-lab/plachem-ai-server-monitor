@@ -87,6 +87,8 @@
         </div>
         <form id="quick-task-form" class="quick-form">
           <textarea id="quick-instruction" data-permission="manage" required maxlength="4096" placeholder="에이전트에게 맡길 일을 자연스럽게 입력하세요. 예: 재고 화면 오류를 확인하고 수정한 뒤 QA 결과를 보고해."></textarea>
+          <label>실행 모드 <select id="quick-execution-mode"><option value="legacy">Legacy / OpenClaw</option><option value="command_center">Command Center</option></select></label>
+          <div id="command-center-panel" class="placeholder" hidden><strong>Command Center 실행</strong><div id="command-center-status" class="muted">후보를 조회한 뒤 명시적으로 dispatch합니다.</div><button id="command-center-dispatch" type="button" class="primary" hidden>선택 후보 Dispatch</button></div>
           <fieldset id="quick-agent-targets" data-permission="manage" aria-label="담당 에이전트"><legend>담당 에이전트</legend><label><input type="checkbox" value="ERPcoder" checked> ERPcoder</label> <label><input type="checkbox" value="ERPqa" checked> ERPqa</label> <label><input type="checkbox" value="ERPmanager" checked> ERPmanager (단순 요약)</label></fieldset>
           <div class="filterbar"><button id="quick-prepare" class="primary" type="submit" data-permission="manage">작업 시작</button><button id="quick-approve-run" class="primary" type="button" data-permission="approve" onclick="quickApproveAndRun()" hidden disabled>작업 시작</button><button id="quick-open-qa" type="button" onclick="quickOpenQa()" hidden>QA 검수 열기</button><button id="quick-complete" class="primary" type="button" data-representative="true" onclick="quickCompleteTask()" hidden>최종 완료 승인</button><button id="quick-demo-process" type="button" onclick="quickProcessResults()" hidden>시연 응답 처리</button></div>
           <div id="quick-result" class="muted" role="status">작업 내용을 입력해 주세요.</div>
