@@ -1,0 +1,44 @@
+{
+  "qwentest": {
+    "enabled": true,
+    "capabilities": ["safe-smoke", "simple-response"],
+    "runtime_model_id": "openai/gpt-5.6-luna",
+    "allowed_model_ids": ["openai/gpt-5.6-luna"],
+    "allowed_policy_profiles": ["CLOUD_STANDARD"]
+  },
+  "fastgatewaytest": {
+    "enabled": true,
+    "capabilities": ["test-only", "safe-smoke"],
+    "runtime_model_id": "vllm/qwen38_27b_opus_q8_mtp_2x160k",
+    "allowed_model_ids": ["vllm/qwen38_27b_opus_q8_mtp_2x160k"],
+    "allowed_policy_profiles": ["LOCAL_STANDARD"]
+  },
+  "secretary": {
+    "enabled": true,
+    "capabilities": ["secretary"],
+    "runtime_model_id": "vllm/qwen38_27b_opus_q8_mtp_2x160k",
+    "allowed_model_ids": ["vllm/qwen38_27b_opus_q8_mtp_2x160k"],
+    "allowed_policy_profiles": ["LOCAL_STANDARD"]
+  },
+  "erpmanager": {
+    "enabled": true,
+    "capabilities": ["erp-management"],
+    "runtime_model_id": "vllm/qwen38_27b_opus_q8_mtp_2x160k",
+    "allowed_model_ids": ["vllm/qwen38_27b_opus_q8_mtp_2x160k"],
+    "allowed_policy_profiles": ["LOCAL_STANDARD"]
+  },
+  "researcher": {
+    "enabled": true,
+    "capabilities": ["research"],
+    "runtime_model_id": "openai/gpt-5.6-luna",
+    "allowed_model_ids": ["openai/gpt-5.6-luna", "vllm/qwen38_27b_opus_q8_mtp_2x160k"],
+    "allowed_policy_profiles": ["CLOUD_STANDARD", "LOCAL_STANDARD"]
+  },
+  "erpcoder": {
+    "enabled": true,
+    "capabilities": ["gateway-configuration"],
+    "runtime_model_id": "openai/gpt-5.6-luna",
+    "allowed_model_ids": ["openai/gpt-5.6-luna"],
+    "allowed_policy_profiles": ["CLOUD_STANDARD"]
+  }
+}

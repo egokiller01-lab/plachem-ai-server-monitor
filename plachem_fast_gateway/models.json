@@ -1,0 +1,26 @@
+{
+  "models": {
+    "vllm/qwen38_27b_opus_q8_mtp_2x160k": {
+      "runtime_class": "LOCAL",
+      "policy_profile": "LOCAL_STANDARD",
+      "max_runtime": 300,
+      "max_retries": 1,
+      "max_tool_calls": 20,
+      "loop_guard": {"consecutive_threshold": 3},
+      "context_policy": "FRESH_ON_LOOP",
+      "fallback_policy": "MANUAL"
+      ,"max_context_resets": 1
+    },
+    "openai/gpt-5.6-luna": {
+      "runtime_class": "CLOUD",
+      "policy_profile": "CLOUD_STANDARD",
+      "max_runtime": 1800,
+      "max_retries": 1,
+      "max_tool_calls": 100,
+      "loop_guard": {"consecutive_threshold": 5},
+      "context_policy": "REUSE",
+      "fallback_policy": "NONE"
+      ,"max_context_resets": 1
+    }
+  }
+}

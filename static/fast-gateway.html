@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Fast Gateway Command Center</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui,sans-serif; background:#0b1220; color:#e5edf7 }
+    body { max-width:1100px; margin:32px auto; padding:0 20px }
+    header { display:flex; justify-content:space-between; align-items:center; gap:16px }
+    button { background:#1f6feb; color:white; border:0; border-radius:7px; padding:8px 14px }
+    table { width:100%; border-collapse:collapse; margin-top:20px; background:#111b2e }
+    th,td { text-align:left; padding:10px; border-bottom:1px solid #263550 }
+    .state { font-weight:700 }.PASS{color:#4ade80}.FAIL,.TIMEOUT{color:#fb7185}.BLOCKED{color:#fbbf24}
+    .RUNNING{color:#60a5fa}.QUEUED{color:#c4b5fd}.CANCELLED{color:#f472b6;text-decoration:line-through}
+    .NORMAL{color:#4ade80}.GUARDED{color:#fbbf24}.policy-CANCELLED,.policy-BLOCKED{color:#fb7185}
+    #empty { color:#94a3b8; margin-top:20px }
+  </style>
+</head>
+<body>
+  <header><div><h1>Fast Gateway Command Center</h1><p>Core RunRegistry 상태</p></div><button onclick="loadRuns()">새로고침</button></header>
+  <div id="empty" hidden>등록된 Core run이 없습니다.</div>
+  <table aria-label="Fast Gateway runs"><thead><tr><th>Core Run</th><th>Agent</th><th>Runtime Class</th><th>Model/Profile</th><th>Runtime</th><th>Retry</th><th>Policy</th><th>Goal Status</th><th>Context Reset</th><th>Escalation Required</th><th>Escalation Reason</th><th>Final Status</th><th>Cancel Reason</th></tr></thead><tbody id="runs"></tbody></table>
+  <script>
+    const statuses = new Set(['QUEUED','RUNNING','PASS','FAIL','BLOCKED','TIMEOUT','CANCELLED']);
+    const clean = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    async function loadRuns() {
+      const response = await fetch('/api/fast-gateway/runs');
+      const data = await response.json();
+      const rows = Array.isArray(data.runs) ? data.runs : [];
+      document.querySelector('table').hidden = rows.length === 0;
+      document.getElementById('empty').hidden = rows.length !== 0;
+      document.getElementById('runs').innerHTML = rows.map(run => {
+        const status = statuses.has(run.status) ? run.status : 'FAIL';
+        const policy = ['NORMAL','GUARDED','CANCELLED','BLOCKED'].includes(run.policy_status) ? run.policy_status : 'BLOCKED';
+        const modelProfile = `${clean(run.model_profile)} / ${clean(run.policy_profile)}`;
+        const runtime = `${Number(run.runtime_seconds || 0).toFixed(1)}s`;
+        return `<tr><td>${clean(run.core_run_id)}</td><td>${clean(run.agent_id)}</td><td>${clean(run.runtime_class)}</td><td>${modelProfile}</td><td>${runtime}</td><td>${clean(run.retry_count)}</td><td class="state ${policy} policy-${policy}">${policy}</td><td>${clean(run.goal_status)}</td><td>${clean(run.context_reset_count)}</td><td>${clean(run.escalation_required)}</td><td>${clean(run.escalation_reason)}</td><td class="state ${status}">${status}</td><td>${clean(run.cancel_reason)}</td></tr>`;
+      }).join('');
+    }
+    loadRuns();
+  </script>
+</body>
+</html>

@@ -86,9 +86,10 @@ For browser use, the trusted reverse proxy may provide `X-Authenticated-Principa
 The server exchanges that verified identity for an HttpOnly signed session cookie, so
 the browser does not receive or inject a War Room token. The real adapter is disabled
 by default. When `PLACHEM_WAR_ROOM_REAL_ADAPTER=1` is explicitly configured, it uses
-the official OpenClaw Gateway `chat.send` and `chat.abort` RPCs for the named agent's
-latest stored session. `PLACHEM_WAR_ROOM_ADAPTER_COMMAND` may instead provide a reviewed
-bridge executable; neither path uses a shell.
+the verified OpenClaw Gateway WebSocket `agent`, `agent.wait`, and `chat.abort` RPCs
+for an explicitly bound disposable session. The bridge receives its token through
+the service's SecretRef-backed `OPENCLAW_GATEWAY_TOKEN` environment injection; it
+does not log or persist the token.
 
 ## systemd Example
 
