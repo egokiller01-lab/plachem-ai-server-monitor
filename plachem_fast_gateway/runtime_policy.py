@@ -201,6 +201,11 @@ class ModelRegistry:
             if isinstance(max_runtime, bool) or not isinstance(max_runtime, (int, float)) or max_runtime <= 0:
                 raise ValueError(f"INVALID_MAX_RUNTIME:{model_id}")
             if runtime_class is RuntimeClass.LOCAL:
+                # Profiles written before the split-budget contract remain
+                # valid: reserve the historical recovery slice by default.
+                if execution_budget is None and finalization_recovery_budget is None:
+                    finalization_recovery_budget = float(max_runtime) / 5.0
+                    execution_budget = float(max_runtime) - finalization_recovery_budget
                 if (
                     isinstance(execution_budget, bool)
                     or not isinstance(execution_budget, (int, float))
