@@ -18,12 +18,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .worker_transport import WorkerTransport
 from .openclaw_adapter import (
     AdapterError,
     AdapterOutcome,
     CompositeResultValidator,
     CoreRunStatus,
-    OpenClawAdapter,
     RunBinding,
     TransportError,
 )
@@ -546,7 +546,7 @@ class CoreEngine:
         registry: RunRegistry,
         agents: AgentRegistry,
         models: ModelRegistry,
-        adapter: OpenClawAdapter,
+        adapter: WorkerTransport,
         *,
         policy_engine: RuntimePolicyEngine | None = None,
         clock: Callable[[], datetime] = _utcnow,

@@ -1,5 +1,7 @@
 """PLACHEM Fast Gateway production integration components."""
 
+from .worker_transport import WorkerTransport
+
 from .openclaw_adapter import (
     AdapterOutcome,
     CompositeResultValidator,
