@@ -868,12 +868,16 @@ class OpenClawAdapter:
         if preparation.history_was_empty:
             candidates = list(messages)
         elif preparation.watermark_seq is not None:
-            if preparation.watermark_message_id is not None and not any(
+            boundary_found = any(
                 isinstance(message, Mapping)
-                and cls._message_cursor(message)
-                == (preparation.watermark_seq, preparation.watermark_message_id)
+                and cls._message_cursor(message)[0] == preparation.watermark_seq
+                and (
+                    preparation.watermark_message_id is None
+                    or cls._message_cursor(message)[1] == preparation.watermark_message_id
+                )
                 for message in messages
-            ):
+            )
+            if not boundary_found:
                 raise GatewayContractError("HISTORY_WATERMARK_UNVERIFIABLE")
             candidates = []
             for message in messages:

@@ -77,6 +77,18 @@ class WatermarkTests(unittest.TestCase):
         self.assertEqual(CoreRunStatus.FAIL, outcome.status)
         self.assertEqual("HISTORY_WATERMARK_UNVERIFIABLE", outcome.reason)
 
+    def test_seq_only_watermark_requires_exact_boundary_in_window(self):
+        old = {"role": "assistant", "content": "old", "__openclaw": {"seq": 4}}
+        new = {"role": "assistant", "content": "new", "__openclaw": {"seq": 5}}
+        adapter, _, _ = self.adapter([{"messages": [old]}, {"messages": [new]}])
+        adapter.submit("core-1", self.payload())
+        preparation = adapter.bindings.get_preparation("core-1")
+        self.assertEqual(4, preparation.watermark_seq)
+        self.assertIsNone(preparation.watermark_message_id)
+        outcome = adapter.wait("core-1", timeout_seconds=1)
+        self.assertEqual(CoreRunStatus.FAIL, outcome.status)
+        self.assertEqual("HISTORY_WATERMARK_UNVERIFIABLE", outcome.reason)
+
     def test_embedded_wait_result_is_ignored_and_cannot_bypass_watermark(self):
         old = {"role": "assistant", "content": "old", "__openclaw": {"seq": 4, "id": "old"}}
         adapter, socket, _ = self.adapter([{"messages": [old]}, {"messages": [old]}])
