@@ -11,7 +11,8 @@ from typing import Any
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
-from plachem_fast_gateway import CoreEngine, RunRegistry
+from plachem_fast_gateway import CoreEngine
+from plachem_fast_gateway.durable_core_store import DurableCoreStore
 from plachem_fast_gateway.production_runtime import create_ubuntu_core_engine
 
 
@@ -46,8 +47,8 @@ class WaitRequest(BaseModel):
     timeout_seconds: float = Field(gt=0, le=3600)
 
 
-def _run_path() -> Path:
-    return Path(os.environ.get("PLACHEM_FAST_GATEWAY_RUNS", ROOT / "runtime" / "fast-gateway-runs.jsonl"))
+def _core_db_path() -> Path:
+    return Path(os.environ.get("PLACHEM_FAST_GATEWAY_CORE_DB", ROOT / "runtime" / "fast-gateway-core.sqlite3"))
 
 
 def _present(record: dict[str, Any]) -> dict[str, Any]:
@@ -96,7 +97,7 @@ def _require_write(secret: str | None) -> None:
 @lru_cache(maxsize=1)
 def _engine() -> CoreEngine:
     return create_ubuntu_core_engine(
-        runs_path=_run_path(),
+        core_db_path=_core_db_path(),
         agents_path=Path(os.environ.get(
             "PLACHEM_FAST_GATEWAY_AGENTS", ROOT / "plachem_fast_gateway" / "agents.json",
         )),
@@ -111,12 +112,12 @@ def _engine() -> CoreEngine:
 
 @router.get("/runs")
 def recent_runs(limit: int = 50) -> dict[str, Any]:
-    return {"runs": [_present(item) for item in RunRegistry(_run_path()).recent(limit)]}
+    return {"runs": [_present(item) for item in DurableCoreStore(_core_db_path()).recent(limit)]}
 
 
 @router.get("/runs/{core_run_id}")
 def run_status(core_run_id: str) -> dict[str, Any]:
-    record = RunRegistry(_run_path()).get(core_run_id)
+    record = DurableCoreStore(_core_db_path()).get(core_run_id)
     if record is None:
         raise HTTPException(status_code=404, detail="UNKNOWN_CORE_RUN")
     return _present(record)
