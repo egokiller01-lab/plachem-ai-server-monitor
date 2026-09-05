@@ -35,6 +35,24 @@ class DurableCoreStoreTests(unittest.TestCase):
             names={r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         self.assertTrue({"tasks","compilations","runs","results","evidence","idempotency_keys","outbox","legacy_id_mappings"} <= names)
 
+    def test_v1_restart_migrates_additive_ownership_and_sealing(self):
+        self.create(); self.store.transition("run",CoreRunStatus.RUNNING)
+        result={"status":"completed","summary":"ok","evidence":[],"artifacts":[],"scope":{"compliant":True,"violations":[]}}
+        self.store.transition("run",CoreRunStatus.PASS,outcome=AdapterOutcome(CoreRunStatus.PASS,result=result))
+        with sqlite3.connect(self.path) as db:
+            db.execute("DROP TRIGGER evidence_no_insert_after_seal")
+            db.execute("DROP TRIGGER results_no_update")
+            db.execute("ALTER TABLE results DROP COLUMN sealed")
+            db.execute("ALTER TABLE outbox DROP COLUMN lease_owner")
+            db.execute("DELETE FROM schema_migrations WHERE version=2")
+            db.execute("PRAGMA user_version=1")
+        migrated=DurableCoreStore(self.path)
+        self.assertEqual("PASS",migrated.get("run")["status"])
+        with sqlite3.connect(self.path) as db:
+            self.assertEqual(2,db.execute("PRAGMA user_version").fetchone()[0])
+            self.assertIn("lease_owner",{row[1] for row in db.execute("PRAGMA table_info(outbox)")})
+            self.assertEqual(1,db.execute("SELECT sealed FROM results").fetchone()[0])
+
     def test_idempotency_replay_and_conflict(self):
         first,_=self.create(); replay,created=self.create(run="other")
         self.assertFalse(created); self.assertEqual(first["core_run_id"],replay["core_run_id"])
@@ -55,9 +73,21 @@ class DurableCoreStoreTests(unittest.TestCase):
         result={"status":"completed","summary":"ok","evidence":[{"type":"response"}],"artifacts":[],"scope":{"compliant":True,"violations":[]}}
         done=self.store.transition("run",CoreRunStatus.PASS,outcome=AdapterOutcome(CoreRunStatus.PASS,result=result))
         self.assertEqual("PASS",done["status"]); self.assertEqual(done,self.store.transition("run",CoreRunStatus.PASS,outcome=AdapterOutcome(CoreRunStatus.PASS,result=result)))
+        changed={**result,"summary":"different"}
+        with self.assertRaisesRegex(ValueError,"TERMINAL_RESULT_CONFLICT"):
+            self.store.transition("run",CoreRunStatus.PASS,outcome=AdapterOutcome(CoreRunStatus.PASS,result=changed))
         with sqlite3.connect(self.path) as db:
             with self.assertRaises(sqlite3.IntegrityError): db.execute("UPDATE results SET reason='x'")
             with self.assertRaises(sqlite3.IntegrityError): db.execute("DELETE FROM evidence")
+            result_id=db.execute("SELECT result_id FROM results WHERE core_run_id='run'").fetchone()[0]
+            with self.assertRaises(sqlite3.IntegrityError):
+                db.execute("INSERT INTO evidence VALUES('late',?,99,'{}')",(result_id,))
+
+    def test_expected_version_cas(self):
+        self.create()
+        self.store.transition("run",CoreRunStatus.RUNNING,expected_version=0)
+        with self.assertRaisesRegex(ValueError,"CONCURRENT_RUN_UPDATE"):
+            self.store.cancel_run("run",expected_version=0)
 
     def test_cancelled_and_cancel_complete_race_has_one_terminal(self):
         self.create(); self.store.transition("run",CoreRunStatus.RUNNING)
@@ -70,11 +100,29 @@ class DurableCoreStoreTests(unittest.TestCase):
         self.assertIn(self.store.get("run")["status"],{"CANCELLED","PASS"}); self.assertEqual(1,len(errors))
 
     def test_outbox_claim_reclaim_ack_retry_dead(self):
-        self.create(); claimed=self.store.claim_outbox("w",limit=1,lease_seconds=0)
-        self.assertEqual(1,len(claimed)); reclaimed=self.store.claim_outbox("w2",limit=1)
-        self.assertEqual(claimed[0]["event_id"],reclaimed[0]["event_id"])
-        self.store.retry_outbox(reclaimed[0]["event_id"],max_attempts=1)
+        self.create(); claimed=self.store.claim_outbox("w",limit=1,lease_seconds=1)
+        self.assertEqual(1,len(claimed)); self.assertEqual("w",claimed[0]["lease_owner"])
+        with self.assertRaisesRegex(ValueError,"OUTBOX_NOT_LEASED"):
+            self.store.ack_outbox(claimed[0]["event_id"],worker_id="other")
+        self.store.retry_outbox(claimed[0]["event_id"],worker_id="w",max_attempts=1)
         with sqlite3.connect(self.path) as db: self.assertEqual("DEAD",db.execute("SELECT status FROM outbox").fetchone()[0])
+
+    def test_outbox_rejects_nonpositive_claim_parameters(self):
+        self.create()
+        for kwargs,error in (({"limit":0},"INVALID_LIMIT"),({"lease_seconds":0},"INVALID_LEASE_SECONDS")):
+            with self.assertRaisesRegex(ValueError,error): self.store.claim_outbox("w",**kwargs)
+
+    def test_outbox_ack_requires_owner_and_live_lease(self):
+        self.create(); event=self.store.claim_outbox("owner",limit=1,lease_seconds=30)[0]
+        self.store.ack_outbox(event["event_id"],worker_id="owner")
+        with sqlite3.connect(self.path) as db:
+            self.assertEqual(("DELIVERED",None),db.execute("SELECT status,lease_owner FROM outbox WHERE event_id=?",(event["event_id"],)).fetchone())
+        self.store.transition("run",CoreRunStatus.RUNNING)
+        leased=self.store.claim_outbox("owner",limit=1,lease_seconds=30)[0]
+        with sqlite3.connect(self.path) as db:
+            db.execute("UPDATE outbox SET lease_until='1970-01-01T00:00:00+00:00' WHERE event_id=?",(leased["event_id"],))
+        with self.assertRaisesRegex(ValueError,"OUTBOX_NOT_LEASED"):
+            self.store.ack_outbox(leased["event_id"],worker_id="owner")
 
     def test_legacy_mapping_conflicts_fail_closed(self):
         self.create(); self.store.map_legacy("war","old","run"); self.store.map_legacy("war","old","run")
@@ -82,7 +130,9 @@ class DurableCoreStoreTests(unittest.TestCase):
 
     def test_future_schema_fails_before_write(self):
         with sqlite3.connect(self.path) as db: db.execute("PRAGMA user_version=999")
+        before=self.path.read_bytes()
         with self.assertRaisesRegex(ValueError,"UNSUPPORTED_CORE_SCHEMA"): DurableCoreStore(self.path)
+        self.assertEqual(before,self.path.read_bytes())
 
     def test_production_composition_uses_only_sqlite_core_store(self):
         agents=Path(self.tmp.name)/"agents.json"; models=Path(self.tmp.name)/"models.json"
