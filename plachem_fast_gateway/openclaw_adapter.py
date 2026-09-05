@@ -690,6 +690,9 @@ class OpenClawAdapter:
         if existing is not None:
             if existing.agent_id != params["agentId"] or existing.idempotency_key != params["idempotencyKey"]:
                 raise IdempotencyConflict("core run binding does not match retry")
+            requested_session = params.get("sessionKey")
+            if requested_session is not None and requested_session != existing.session_key:
+                raise SessionBindingError("core run sessionKey does not match retry binding")
             return existing
         response = self.rpc.request("agent", params, timeout=float(params["timeout"]) + 5.0)
         status = str(response.get("status") or "")
