@@ -44,6 +44,15 @@ class FakeSocket:
         self.closed = False
         self.hello = hello
 
+    def open(self):
+        self.closed = False
+        self.responses.append(json.dumps({
+            "type": "event",
+            "event": "connect.challenge",
+            "payload": {"nonce": "mock-challenge", "ts": 1},
+        }))
+        return self
+
     def send(self, raw):
         if self.fail_send:
             raise OSError("socket closed")
@@ -53,8 +62,8 @@ class FakeSocket:
         if method == "connect":
             payload = self.hello or {
                 "type": "hello-ok",
-                "auth": {"role": "operator", "scopes": ["operator.write"]},
-                "features": {"methods": ["agent", "agent.wait", "chat.history", "chat.abort"]},
+                "auth": {"role": "operator", "scopes": ["operator.read", "operator.write"]},
+                "features": {"methods": ["agent", "agent.wait", "chat.history", "sessions.abort"]},
             }
         else:
             handler = self.handlers[method]
@@ -79,7 +88,7 @@ class SequenceSocketFactory:
         self.calls += 1
         if not self.sockets:
             raise OSError("reconnect unavailable")
-        return self.sockets.pop(0)
+        return self.sockets.pop(0).open()
 
 
 def accepted(params):
@@ -101,7 +110,7 @@ class OpenClawAdapterTests(unittest.TestCase):
             FakeSecretRef(),
             store or MemoryRunBindingStore(),
             result_validator=validator,
-            socket_factory=lambda _url, _timeout: fake,
+            socket_factory=lambda _url, _timeout: fake.open(),
         )
         return adapter, fake
 
@@ -119,7 +128,7 @@ class OpenClawAdapterTests(unittest.TestCase):
     def test_connect_auth_and_agent_availability(self):
         secret_ref = FakeSecretRef()
         fake = FakeSocket()
-        adapter = OpenClawAdapter(secret_ref, MemoryRunBindingStore(), socket_factory=lambda *_: fake)
+        adapter = OpenClawAdapter(secret_ref, MemoryRunBindingStore(), socket_factory=lambda *_: fake.open())
         hello = adapter.connect()
         self.assertEqual("hello-ok", hello["type"])
         self.assertEqual(1, secret_ref.calls)
@@ -127,7 +136,7 @@ class OpenClawAdapterTests(unittest.TestCase):
         self.assertEqual(4, connect["params"]["minProtocol"])
         self.assertEqual(4, connect["params"]["maxProtocol"])
         self.assertEqual("gateway-client", connect["params"]["client"]["id"])
-        self.assertEqual(["operator.write"], connect["params"]["scopes"])
+        self.assertEqual(["operator.read", "operator.write"], connect["params"]["scopes"])
         self.assertEqual("super-secret-token", connect["params"]["auth"]["token"])
         self.assertIn("agent", adapter.rpc.methods)
 
@@ -145,7 +154,7 @@ class OpenClawAdapterTests(unittest.TestCase):
             "type": "hello-ok",
             "protocol": 4,
             "auth": {"role": "operator", "scopes": ["operator.admin"]},
-            "features": {"methods": ["agent"]},
+            "features": {"methods": ["agent", "agent.wait", "chat.history", "sessions.abort"]},
         }
         adapter, _ = self.adapter(socket=FakeSocket(hello=hello))
         self.assertEqual(hello, adapter.connect())
@@ -156,7 +165,7 @@ class OpenClawAdapterTests(unittest.TestCase):
         hello = {
             "type": "hello-ok",
             "auth": {"scopes": ["operator.write"]},
-            "features": {"methods": ["agent"]},
+            "features": {"methods": ["agent", "agent.wait", "chat.history", "sessions.abort"]},
         }
         adapter, fake = self.adapter(socket=FakeSocket(hello=hello))
         with self.assertRaisesRegex(GatewayContractError, "operator role"):
@@ -167,10 +176,10 @@ class OpenClawAdapterTests(unittest.TestCase):
         hello = {
             "type": "hello-ok",
             "auth": {"role": "operator"},
-            "features": {"methods": ["agent"]},
+            "features": {"methods": ["agent", "agent.wait", "chat.history", "sessions.abort"]},
         }
         adapter, fake = self.adapter(socket=FakeSocket(hello=hello))
-        with self.assertRaisesRegex(GatewayContractError, "operator.write scope"):
+        with self.assertRaisesRegex(GatewayContractError, "operator.read/write scopes"):
             adapter.connect()
         self.assertTrue(fake.closed)
 
@@ -178,7 +187,7 @@ class OpenClawAdapterTests(unittest.TestCase):
         hello = {
             "type": "hello-ok",
             "auth": {"role": "node", "scopes": ["operator.write"]},
-            "features": {"methods": ["agent"]},
+            "features": {"methods": ["agent", "agent.wait", "chat.history", "sessions.abort"]},
         }
         adapter, _ = self.adapter(socket=FakeSocket(hello=hello))
         with self.assertRaisesRegex(GatewayContractError, "operator role"):
@@ -188,10 +197,10 @@ class OpenClawAdapterTests(unittest.TestCase):
         hello = {
             "type": "hello-ok",
             "auth": {"role": "operator", "scopes": ["operator.read"]},
-            "features": {"methods": ["agent"]},
+            "features": {"methods": ["agent", "agent.wait", "chat.history", "sessions.abort"]},
         }
         adapter, _ = self.adapter(socket=FakeSocket(hello=hello))
-        with self.assertRaisesRegex(GatewayContractError, "operator.write scope"):
+        with self.assertRaisesRegex(GatewayContractError, "operator.read/write scopes"):
             adapter.connect()
 
     def test_raw_token_constructor_path_is_not_available(self):
@@ -337,7 +346,7 @@ class OpenClawAdapterTests(unittest.TestCase):
         self.assertEqual(CoreRunStatus.CANCELLED, binding.status)
 
     def test_abort_never_reconnects_away_from_submit_owner_connection(self):
-        adapter, fake = self.adapter({"agent": accepted, "chat.abort": {"aborted": True}})
+        adapter, fake = self.adapter({"agent": accepted, "sessions.abort": {"status": "aborted"}})
         adapter.submit("core-run-1", self.payload())
         adapter.rpc._last_activity -= 120.0
         binding = adapter.cancel("core-run-1")
@@ -346,15 +355,15 @@ class OpenClawAdapterTests(unittest.TestCase):
         self.assertEqual(1, sum(call["method"] == "connect" for call in fake.calls))
 
     def test_abort_uses_bound_identity_and_adds_cancelled(self):
-        handlers = {"agent": accepted, "chat.abort": {"aborted": True}}
+        handlers = {"agent": accepted, "sessions.abort": {"status": "aborted"}}
         adapter, fake = self.adapter(handlers)
         adapter.submit("core-run-1", self.payload())
         binding = adapter.cancel("core-run-1")
         self.assertEqual(CoreRunStatus.CANCELLED, binding.status)
         abort = fake.calls[-1]
-        self.assertEqual("chat.abort", abort["method"])
+        self.assertEqual("sessions.abort", abort["method"])
         self.assertEqual(
-            {"sessionKey": "agent:qwentest:main", "runId": "openclaw-run-1", "agentId": "qwentest"},
+            {"key": "agent:qwentest:main", "runId": "openclaw-run-1", "agentId": "qwentest"},
             abort["params"],
         )
 

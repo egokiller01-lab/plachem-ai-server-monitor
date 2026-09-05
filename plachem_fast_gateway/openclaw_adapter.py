@@ -23,7 +23,7 @@ from typing import Any, Callable, Mapping, Protocol
 
 PROTOCOL_VERSION = 4
 DEFAULT_GATEWAY_URL = "ws://127.0.0.1:18789"
-REQUIRED_SCOPE = "operator.write"
+REQUIRED_SCOPES = ("operator.read", "operator.write")
 _AGENT_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
 _ALLOWED_SUBMIT_FIELDS = {
     "message",
@@ -197,6 +197,7 @@ class GatewayRPCClient:
                 socket = self._socket_factory(self._url, self._connect_timeout)
                 self._socket = socket
                 self._last_activity = time.monotonic()
+                self._receive_challenge_locked(timeout=self._connect_timeout)
                 payload = self._request_locked(
                     "connect",
                     {
@@ -209,7 +210,7 @@ class GatewayRPCClient:
                             "mode": "backend",
                         },
                         "role": "operator",
-                        "scopes": [REQUIRED_SCOPE],
+                        "scopes": list(REQUIRED_SCOPES),
                         "auth": {"token": token},
                     },
                     timeout=self._connect_timeout,
@@ -230,16 +231,43 @@ class GatewayRPCClient:
             self.role, raw_scopes = self._extract_negotiated_auth(hello)
             self.scopes = tuple(str(item) for item in raw_scopes if isinstance(item, str))
             self._methods = self._extract_methods(hello)
-            if "agent" not in self._methods:
+            required_methods = {"agent", "agent.wait", "chat.history", "sessions.abort"}
+            missing_methods = sorted(required_methods - self._methods)
+            if missing_methods:
                 self.close()
-                raise GatewayContractError("OpenClaw agent method is unavailable")
+                raise GatewayContractError(
+                    f"OpenClaw required method is unavailable: {missing_methods[0]}"
+                )
             if self.role != "operator":
                 self.close()
                 raise GatewayContractError("OpenClaw operator role was not negotiated")
-            if REQUIRED_SCOPE not in self.scopes and "operator.admin" not in self.scopes:
+            if "operator.admin" not in self.scopes and not set(REQUIRED_SCOPES).issubset(self.scopes):
                 self.close()
-                raise GatewayContractError("OpenClaw operator.write scope was not negotiated")
+                raise GatewayContractError("OpenClaw operator.read/write scopes were not negotiated")
             return hello
+
+    def _receive_challenge_locked(self, *, timeout: float) -> Mapping[str, Any]:
+        if self._socket is None:
+            raise TransportError("OpenClaw Gateway is not connected")
+        try:
+            decoded = json.loads(self._socket.recv(timeout=timeout))
+        except TimeoutError:
+            raise
+        except Exception as exc:
+            raise TransportError("OpenClaw Gateway challenge failed") from exc
+        if not isinstance(decoded, Mapping):
+            raise GatewayContractError("OpenClaw challenge is not an object")
+        payload = decoded.get("payload")
+        nonce = payload.get("nonce") if isinstance(payload, Mapping) else None
+        if (
+            decoded.get("type") != "event"
+            or decoded.get("event") != "connect.challenge"
+            or not isinstance(nonce, str)
+            or not nonce
+        ):
+            raise GatewayContractError("OpenClaw connect.challenge was not returned")
+        self._last_activity = time.monotonic()
+        return decoded
 
     @staticmethod
     def _hello_payload(payload: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -742,9 +770,9 @@ class OpenClawAdapter:
         binding = self._require_binding(core_run_id)
         try:
             response = self.rpc.request_on_owner_connection(
-                "chat.abort",
+                "sessions.abort",
                 {
-                    "sessionKey": binding.session_key,
+                    "key": binding.session_key,
                     "runId": binding.openclaw_run_id,
                     "agentId": binding.agent_id,
                 },
@@ -755,9 +783,13 @@ class OpenClawAdapter:
             if exc.code not in {"RUN_NOT_FOUND", "ALREADY_FINISHED", "RUN_ALREADY_FINISHED", "NO_ACTIVE_RUN"}:
                 raise
             return self._set_status(binding, CoreRunStatus.CANCELLED)
-        if response.get("aborted") is not True and not (
-            response.get("ok") is True and response.get("runIds") == []
-        ):
+        confirmed = (
+            response.get("aborted") is True
+            or response.get("abortedRunId") == binding.openclaw_run_id
+            or response.get("status") in {"aborted", "no-active-run"}
+            or (response.get("ok") is True and response.get("runIds") == [])
+        )
+        if not confirmed:
             raise GatewayContractError("OpenClaw did not confirm abort")
         return self._set_status(binding, CoreRunStatus.CANCELLED)
 
