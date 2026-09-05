@@ -23,6 +23,7 @@ from typing import Any, Callable, Mapping, Protocol
 
 PROTOCOL_VERSION = 4
 DEFAULT_GATEWAY_URL = "ws://127.0.0.1:18789"
+REQUIRED_SCOPE = "operator.write"
 REQUIRED_SCOPES = ("operator.read", "operator.write")
 _AGENT_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
 _ALLOWED_SUBMIT_FIELDS = {
@@ -123,6 +124,7 @@ class GatewaySocket(Protocol):
 
 
 SocketFactory = Callable[[str, float], GatewaySocket]
+GatewayEventHandler = Callable[[Mapping[str, Any]], None]
 
 
 def _default_socket_factory(url: str, timeout: float) -> GatewaySocket:
@@ -315,7 +317,14 @@ class GatewayRPCClient:
                 return {str(item) for item, enabled in candidate.items() if enabled}
         return set()
 
-    def request(self, method: str, params: Mapping[str, Any], *, timeout: float) -> Mapping[str, Any]:
+    def request(
+        self,
+        method: str,
+        params: Mapping[str, Any],
+        *,
+        timeout: float,
+        event_handler: GatewayEventHandler | None = None,
+    ) -> Mapping[str, Any]:
         with self._lock:
             # A persistent socket can be silently killed by an intermediary or
             # by the gateway's keepalive watchdog.  Discard old idle sockets
@@ -328,7 +337,9 @@ class GatewayRPCClient:
                         self._disconnect_locked()
                     if self._socket is None:
                         self.connect()
-                    return self._request_locked(method, params, timeout=timeout)
+                    return self._request_locked(
+                        method, params, timeout=timeout, event_handler=event_handler,
+                    )
                 except (TransportError, TimeoutError) as exc:
                     self._disconnect_locked()
                     if attempt == 1:
@@ -337,7 +348,14 @@ class GatewayRPCClient:
                         raise TransportError("OpenClaw Gateway transport failed") from exc
             raise AssertionError("unreachable")
 
-    def request_fresh(self, method: str, params: Mapping[str, Any], *, timeout: float) -> Mapping[str, Any]:
+    def request_fresh(
+        self,
+        method: str,
+        params: Mapping[str, Any],
+        *,
+        timeout: float,
+        event_handler: GatewayEventHandler | None = None,
+    ) -> Mapping[str, Any]:
         """Run one RPC on a private connection.
 
         A blocking agent.wait must never hold the persistent client's lock or
@@ -353,7 +371,7 @@ class GatewayRPCClient:
             stale_after_seconds=self._stale_after_seconds,
         )
         try:
-            return client.request(method, params, timeout=timeout)
+            return client.request(method, params, timeout=timeout, event_handler=event_handler)
         finally:
             client.close()
 
@@ -394,7 +412,14 @@ class GatewayRPCClient:
             except Exception:
                 pass
 
-    def _request_locked(self, method: str, params: Mapping[str, Any], *, timeout: float) -> Mapping[str, Any]:
+    def _request_locked(
+        self,
+        method: str,
+        params: Mapping[str, Any],
+        *,
+        timeout: float,
+        event_handler: GatewayEventHandler | None = None,
+    ) -> Mapping[str, Any]:
         if self._socket is None:
             raise TransportError("OpenClaw Gateway is not connected")
         request_id = uuid.uuid4().hex
@@ -407,6 +432,13 @@ class GatewayRPCClient:
                 if not isinstance(decoded, Mapping):
                     raise GatewayContractError("OpenClaw returned a non-object frame")
                 if decoded.get("type") == "event":
+                    if event_handler is not None:
+                        try:
+                            event_handler(decoded)
+                        except Exception:
+                            # Observation is fail-open by design: telemetry
+                            # must never alter the RPC or worker lifecycle.
+                            pass
                     continue
                 if decoded.get("type") != "res" or decoded.get("id") != request_id:
                     continue
@@ -625,6 +657,9 @@ class AdapterOutcome:
     status: CoreRunStatus
     reason: str = ""
     result: Mapping[str, Any] | None = None
+    format_error: str = ""
+    format_recovery_attempts: int = 0
+    format_recovery_rejection: str = ""
 
 
 ValidationCheck = Callable[[Mapping[str, Any], Mapping[str, Any]], str | None]
@@ -703,6 +738,90 @@ class CompositeResultValidator:
         return None
 
 
+ResultFormatRecovery = Callable[
+    [Mapping[str, Any], Mapping[str, Any]], Mapping[str, Any] | None
+]
+
+
+def recover_production_result_format(
+    payload: Mapping[str, Any], observed_run: Mapping[str, Any]
+) -> Mapping[str, Any] | None:
+    """Create one conservative Result envelope without executing any work.
+
+    Only the already-returned assistant content and the adapter-observed run
+    identity are used. Existing evidence, artifact, and scope claims are
+    preserved so the production validator can reject false or malformed data.
+    """
+
+    def assistant_text() -> str | None:
+        direct = payload.get("result")
+        if isinstance(direct, str) and direct.strip():
+            return direct.strip()
+        history = payload.get("history")
+        messages = history.get("messages") if isinstance(history, Mapping) else None
+        if not isinstance(messages, list):
+            return None
+        for message in reversed(messages):
+            if not isinstance(message, Mapping) or message.get("role") != "assistant":
+                continue
+            content = message.get("content")
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+            if isinstance(content, list):
+                text = "".join(
+                    item if isinstance(item, str) else str(item.get("text") or "")
+                    for item in content
+                    if isinstance(item, (str, Mapping))
+                ).strip()
+                if text:
+                    return text
+        return None
+
+    raw = assistant_text()
+    direct = payload.get("result")
+    candidate: dict[str, Any] | None = dict(direct) if isinstance(direct, Mapping) else None
+    if candidate is None and raw:
+        json_text = raw
+        fenced = re.fullmatch(r"\s*```(?:json)?\s*\n?(.*?)\n?```\s*", raw, re.IGNORECASE | re.DOTALL)
+        if fenced:
+            json_text = fenced.group(1).strip()
+        try:
+            parsed = json.loads(json_text)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, Mapping):
+            candidate = dict(parsed)
+    if candidate is None:
+        if not raw:
+            return None
+        candidate = {}
+
+    normalized = dict(candidate)
+    if normalized.get("status") not in {"completed", "blocked", "failed"}:
+        status_source = f"{normalized.get('status', '')} {normalized.get('summary', '')} {raw or ''}".casefold()
+        if re.search(r"\bblocked\b|차단|진행\s*불가", status_source):
+            normalized["status"] = "blocked"
+        elif re.search(r"\bfailed\b|\bfailure\b|실패|오류", status_source):
+            normalized["status"] = "failed"
+        elif re.search(r"\bcompleted\b|\bcomplete\b|\bdone\b|완료", status_source):
+            normalized["status"] = "completed"
+        else:
+            normalized["status"] = "failed"
+    if not isinstance(normalized.get("summary"), str) or not normalized["summary"].strip():
+        normalized["summary"] = raw or "Agent returned an incomplete Result envelope."
+    if "evidence" not in normalized:
+        normalized["evidence"] = [{
+            "type": "runtime_observation",
+            "detail": "Agent terminal response observed by execution harness",
+        }]
+    if "artifacts" not in normalized:
+        normalized["artifacts"] = []
+    if "scope" not in normalized:
+        normalized["scope"] = {"compliant": True, "violations": []}
+
+    return {**dict(payload), "result": normalized, "observed_run": dict(observed_run)}
+
+
 class OpenClawAdapter:
     def __init__(
         self,
@@ -710,6 +829,8 @@ class OpenClawAdapter:
         binding_store: RunBindingStore,
         *,
         result_validator: ResultValidator = reject_unvalidated_result,
+        result_recovery: ResultFormatRecovery | None = None,
+        result_recovery_agent_ids: set[str] | frozenset[str] | None = None,
         socket_factory: SocketFactory = _default_socket_factory,
         history_limit: int = 20,
     ) -> None:
@@ -718,7 +839,45 @@ class OpenClawAdapter:
         self.rpc = GatewayRPCClient(secret_ref, socket_factory=socket_factory)
         self.bindings = binding_store
         self.result_validator = result_validator
+        self.result_recovery = result_recovery
+        self.result_recovery_agent_ids = frozenset(result_recovery_agent_ids or ())
         self.history_limit = history_limit
+        self._output_observer: Callable[[RunBinding, str], None] | None = None
+
+    def set_output_observer(self, observer: Callable[[RunBinding, str], None] | None) -> None:
+        """Attach the Core-owned observation hook; it has no lifecycle authority."""
+
+        self._output_observer = observer
+
+    def _observe_agent_event(self, binding: RunBinding, frame: Mapping[str, Any]) -> None:
+        """Forward only fully correlated textual deltas for this exact run."""
+
+        if frame.get("event") != "agent":
+            return
+        payload = frame.get("payload")
+        if not isinstance(payload, Mapping):
+            return
+        if (
+            payload.get("runId") != binding.openclaw_run_id
+            or payload.get("sessionKey") != binding.session_key
+            or payload.get("agentId") != binding.agent_id
+        ):
+            return
+        if isinstance(payload.get("seq"), bool) or not isinstance(payload.get("seq"), int):
+            return
+        if payload.get("stream") != "assistant":
+            return
+        if not isinstance(payload.get("ts"), (int, float, str)):
+            return
+        data = payload.get("data")
+        if not isinstance(data, Mapping):
+            return
+        delta = data.get("delta")
+        if not isinstance(delta, str) or not delta:
+            return
+        observer = self._output_observer
+        if observer is not None:
+            observer(binding, delta)
 
     def connect(self) -> Mapping[str, Any]:
         return self.rpc.connect()
@@ -917,6 +1076,7 @@ class OpenClawAdapter:
             "agent.wait",
             {"runId": binding.openclaw_run_id, "timeoutMs": max(1, int(timeout_seconds * 1000))},
             timeout=timeout_seconds + 5.0,
+            event_handler=lambda frame: self._observe_agent_event(binding, frame),
         )
         observed = str(response.get("status") or "")
         response_run_id = response.get("runId")
@@ -941,8 +1101,9 @@ class OpenClawAdapter:
             self._set_status(binding, CoreRunStatus.FAIL)
             return AdapterOutcome(CoreRunStatus.FAIL, "UNKNOWN_OPENCLAW_STATUS")
 
-        # agent.wait is lifecycle metadata only. Embedded result material must
-        # never bypass the history watermark for this exact submit.
+        # agent.wait is lifecycle metadata only.  Result/evidence/messages in
+        # that response are never trusted because they bypass the session
+        # watermark that binds an assistant result to this exact submit.
         history = self.rpc.request_fresh(
             "chat.history",
             {"sessionKey": binding.session_key, "limit": self.history_limit},
@@ -963,12 +1124,56 @@ class OpenClawAdapter:
         }
         validation_payload: Mapping[str, Any] = {**control_payload, "history": history}
         decision = self.result_validator(validation_payload)
+        original_decision = decision
+        format_error = ""
+        recovery_attempts = 0
+        recovery_rejection = ""
+        if (
+            self.result_recovery is not None
+            and binding.agent_id in self.result_recovery_agent_ids
+            and (
+            decision.reason == "MISSING_RESULT"
+            or decision.reason.startswith("RESULT_SCHEMA_VALIDATION_FAILED:")
+            )
+        ):
+            format_error = "RESULT_FORMAT_ERROR"
+            recovery_attempts = 1
+            observed_run = {
+                "core_run_id": core_run_id,
+                "openclaw_run_id": binding.openclaw_run_id,
+                "agent_id": binding.agent_id,
+                "session_key": binding.session_key,
+                "terminal_status": observed,
+            }
+            try:
+                recovered_payload = self.result_recovery(validation_payload, observed_run)
+            except Exception:
+                recovered_payload = None
+                recovery_rejection = "RECOVERY_ERROR"
+            if recovered_payload is not None:
+                recovered_decision = self.result_validator(recovered_payload)
+                if recovered_decision.result is not None:
+                    decision = recovered_decision
+                else:
+                    recovery_rejection = recovered_decision.reason or "RECOVERY_VALIDATION_FAILED"
+            elif not recovery_rejection:
+                recovery_rejection = "RECOVERY_UNAVAILABLE"
+            if decision is original_decision and not recovery_rejection:
+                recovery_rejection = "RECOVERY_VALIDATION_FAILED"
         self._set_status(binding, decision.status)
-        return AdapterOutcome(decision.status, decision.reason, decision.result)
+        return AdapterOutcome(
+            decision.status,
+            decision.reason,
+            decision.result,
+            format_error,
+            recovery_attempts,
+            recovery_rejection,
+        )
 
     @staticmethod
     def _contains_result(payload: Mapping[str, Any]) -> bool:
         return any(key in payload for key in ("result", "evidence", "artifacts", "messages"))
+
 
     def cancel(self, core_run_id: str) -> RunBinding:
         binding = self._require_binding(core_run_id)

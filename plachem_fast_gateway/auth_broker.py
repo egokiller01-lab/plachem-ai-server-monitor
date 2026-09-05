@@ -272,6 +272,11 @@ class SQLiteAuthBroker:
                             scope, expected_digest, {"reason": "INVALID_TOKEN"})
                 denied = "INVALID_TOKEN"
             code = None if denied else self._deny_reason(row, scope, expected_digest, now)
+            if code == "ALREADY_CONSUMED" and row["consumed_run_id"] == _bound(run_id):
+                if not hmac.compare_digest(row["task_digest"], expected_digest):
+                    code = "TASK_MISMATCH"
+                else:
+                    code = None
             if denied:
                 pass
             elif code:

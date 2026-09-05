@@ -9,9 +9,11 @@ from .openclaw_adapter import (
     EnvironmentSecretRef,
     MemoryRunBindingStore,
     OpenClawAdapter,
+    recover_production_result_format,
     RunBinding,
     SQLiteRunBindingStore,
     ValidationDecision,
+    REQUIRED_SCOPE,
 )
 from .core_engine import AgentRegistry, CoreEngine, RunRegistry, production_result_validator
 from .runtime_policy import (
@@ -25,17 +27,21 @@ from .runtime_policy import (
     normalize_goal_contract,
     normalize_progress_checkpoint,
 )
+from .loop_detector import LoopDetectorConfig, RunScope, RunScopedLoopDetector, normalize, repeated_suffix
 
 __all__ = [
+    "WorkerTransport",
     "AdapterOutcome",
     "CompositeResultValidator",
     "CoreRunStatus",
     "EnvironmentSecretRef",
     "MemoryRunBindingStore",
     "OpenClawAdapter",
+    "recover_production_result_format",
     "RunBinding",
     "SQLiteRunBindingStore",
     "ValidationDecision",
+    "REQUIRED_SCOPE",
     "AgentRegistry",
     "CoreEngine",
     "RunRegistry",
@@ -49,4 +55,9 @@ __all__ = [
     "GoalContract",
     "normalize_goal_contract",
     "normalize_progress_checkpoint",
+    "LoopDetectorConfig",
+    "RunScope",
+    "RunScopedLoopDetector",
+    "normalize",
+    "repeated_suffix",
 ]

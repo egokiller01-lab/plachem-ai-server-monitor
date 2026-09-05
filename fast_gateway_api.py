@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hmac
+import json
 import os
 from functools import lru_cache
 from pathlib import Path
@@ -17,6 +18,7 @@ from plachem_fast_gateway.production_runtime import create_ubuntu_core_engine
 
 
 ROOT = Path(__file__).resolve().parent
+_run_path = lambda: Path(os.environ.get("PLACHEM_FAST_GATEWAY_RUNS", ROOT / "runtime" / "fast-gateway-runs.jsonl"))
 router = APIRouter(prefix="/api/fast-gateway", tags=["fast-gateway"])
 
 
@@ -29,6 +31,10 @@ class DispatchRequest(BaseModel):
     timeout_seconds: float = Field(gt=0, le=3600)
     idempotency_key: str | None = Field(default=None, min_length=1, max_length=256)
     goal_contract: "GoalContractRequest | None" = None
+    auth_token: str | None = Field(default=None, min_length=1, max_length=512)
+    action: str = Field(default="dispatch", min_length=1, max_length=128)
+    workspace_id: str = Field(default="command-center", min_length=1, max_length=256)
+    project_id: str = Field(default="fast-gateway", min_length=1, max_length=256)
 
 
 class GoalContractRequest(BaseModel):
@@ -65,9 +71,15 @@ def _present(record: dict[str, Any]) -> dict[str, Any]:
             "completed_at",
             "reason",
             "result",
+            "format_error",
+            "format_recovery_attempts",
+            "format_recovery_rejection",
             "runtime_class",
             "model_profile",
             "policy_profile",
+            "max_runtime",
+            "execution_budget",
+            "finalization_recovery_budget",
             "runtime_seconds",
             "retry_count",
             "tool_call_count",
@@ -112,6 +124,17 @@ def _engine() -> CoreEngine:
 
 @router.get("/runs")
 def recent_runs(limit: int = 50) -> dict[str, Any]:
+    # Keep the historical run-file seam for callers/tests while production
+    # uses the durable SQLite projection.
+    path = _run_path()
+    if path.exists() and path.suffix == ".jsonl":
+        rows = []
+        for line in path.read_text(encoding="utf-8").splitlines()[-limit:]:
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                continue
+        return {"runs": [_present(item) for item in reversed(rows)]}
     return {"runs": [_present(item) for item in DurableCoreStore(_core_db_path()).recent(limit)]}
 
 
@@ -129,6 +152,8 @@ def dispatch_run(
     x_fast_gateway_secret: str | None = Header(default=None),
 ) -> dict[str, Any]:
     _require_write(x_fast_gateway_secret)
+    if not (os.environ.get("PLACHEM_AUTH_BROKER_DB") and os.environ.get("PLACHEM_AUTH_BROKER_KEY_ID")):
+        raise HTTPException(status_code=503, detail="AUTH_BROKER_UNAVAILABLE")
     try:
         payload = request.model_dump()
         goal = payload.get("goal_contract")

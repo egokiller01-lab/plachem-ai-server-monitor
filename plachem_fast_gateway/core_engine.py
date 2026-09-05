@@ -37,6 +37,8 @@ from .runtime_policy import (
     normalize_goal_contract,
     normalize_progress_checkpoint,
 )
+from .loop_detector import RunScope, RunScopedLoopDetector
+from .auth_broker import AuthBrokerError, AuthScope, SQLiteAuthBroker
 
 
 _TERMINAL = {
@@ -64,9 +66,12 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _request_hash(agent_id: str, message: str, timeout_seconds: float, goal_id: str) -> str:
+def _request_hash(agent_id: str, message: str, timeout_seconds: float, goal_id: str,
+                  action: str = "dispatch", workspace_id: str = "command-center",
+                  project_id: str = "fast-gateway") -> str:
     raw = json.dumps(
-        {"agent_id": agent_id, "message": message, "timeout_seconds": timeout_seconds, "goal_id": goal_id},
+        {"agent_id": agent_id, "message": message, "timeout_seconds": timeout_seconds, "goal_id": goal_id,
+         "action": action, "workspace_id": workspace_id, "project_id": project_id},
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -134,6 +139,13 @@ class AgentRegistry:
             raise ValueError(f"UNKNOWN_AGENT:{agent_id}")
         return registration
 
+    def candidate_agent_ids(self, required_capabilities: list[str] | None = None) -> list[str]:
+        required = {value.strip().casefold() for value in (required_capabilities or []) if isinstance(value, str) and value.strip()}
+        return [
+            agent_id for agent_id, registration in self._registrations.items()
+            if registration.enabled and required.issubset({value.casefold() for value in registration.capabilities})
+        ]
+
 
 class RunRegistry:
     """Append-only Core run registry imported from the phase2 state model."""
@@ -143,10 +155,12 @@ class RunRegistry:
         path: str | Path,
         *,
         clock: Callable[[], datetime] = _utcnow,
+        auth_broker: SQLiteAuthBroker | None = None,
         run_id_factory: Callable[[], str] | None = None,
     ) -> None:
         self.path = Path(path)
         self._clock = clock
+        self.auth_broker = auth_broker
         self._run_id_factory = run_id_factory or (lambda: f"core-{uuid.uuid4().hex}")
         self._lock = threading.RLock()
 
@@ -187,11 +201,16 @@ class RunRegistry:
                 "completed_at": None,
                 "reason": "",
                 "result": None,
+                "format_error": "",
+                "format_recovery_attempts": 0,
+                "format_recovery_rejection": "",
                 "openclaw_binding": None,
                 "runtime_class": policy.get("runtime_class", RuntimeClass.UNKNOWN.value),
                 "model_profile": policy.get("model_profile"),
                 "policy_profile": policy.get("policy_profile", "UNKNOWN"),
                 "max_runtime": policy.get("max_runtime"),
+                "execution_budget": policy.get("execution_budget"),
+                "finalization_recovery_budget": policy.get("finalization_recovery_budget"),
                 "max_retries": policy.get("max_retries"),
                 "max_tool_calls": policy.get("max_tool_calls"),
                 "context_policy": policy.get("context_policy", "MANUAL"),
@@ -256,9 +275,31 @@ class RunRegistry:
                 record["completed_at"] = now
                 record["reason"] = reason or (outcome.reason if outcome is not None else "")
                 record["result"] = copy.deepcopy(dict(outcome.result)) if outcome and outcome.result is not None else None
+                if outcome is not None:
+                    record["format_error"] = outcome.format_error
+                    record["format_recovery_attempts"] = outcome.format_recovery_attempts
+                    record["format_recovery_rejection"] = outcome.format_recovery_rejection
                 if status == CoreRunStatus.CANCELLED:
                     record["cancel_reason"] = record["reason"]
                     record["policy_status"] = "CANCELLED"
+            self._append(record)
+            return copy.deepcopy(record)
+
+    def reconcile_abort_observation(self, core_run_id: str) -> dict[str, Any]:
+        """Atomically reconcile only the confirmed abort observation failure."""
+        with self._lock:
+            record = self.get(core_run_id)
+            if record is None:
+                raise ValueError(f"UNKNOWN_CORE_RUN:{core_run_id}")
+            if record.get("status") != CoreRunStatus.FAIL.value or record.get("reason") != "OPENCLAW_ERROR":
+                return copy.deepcopy(record)
+            now = self._clock().astimezone(timezone.utc).isoformat()
+            record["status"] = CoreRunStatus.CANCELLED.value
+            record["updated_at"] = now
+            record["completed_at"] = now
+            record["reason"] = "USER_CANCEL"
+            record["cancel_reason"] = "USER_CANCEL"
+            record["policy_status"] = "CANCELLED"
             self._append(record)
             return copy.deepcopy(record)
 
@@ -549,16 +590,45 @@ class CoreEngine:
         adapter: WorkerTransport,
         *,
         policy_engine: RuntimePolicyEngine | None = None,
+        loop_detector: RunScopedLoopDetector | None = None,
         clock: Callable[[], datetime] = _utcnow,
+        auth_broker: SQLiteAuthBroker | None = None,
     ) -> None:
         self.registry = registry
         self.agents = agents
         self.models = models
         self.adapter = adapter
         self.policy_engine = policy_engine or RuntimePolicyEngine()
+        self.loop_detector = loop_detector or RunScopedLoopDetector()
         self._clock = clock
+        self.auth_broker = auth_broker
         self._lock = threading.RLock()
         self._deadline_timers: dict[str, threading.Timer] = {}
+        self._terminal_transition_guard: Callable[[str], bool] | None = None
+        set_output_observer = getattr(self.adapter, "set_output_observer", None)
+        if callable(set_output_observer):
+            set_output_observer(self._observe_bound_output)
+
+    def _observe_bound_output(self, binding: RunBinding, output: str) -> None:
+        record = self.registry.get(binding.core_run_id)
+        if (
+            record is None
+            or record.get("status") != CoreRunStatus.RUNNING.value
+            or record.get("runtime_class") != RuntimeClass.LOCAL.value
+        ):
+            return
+        self.observe_local_run_output(
+            core_run_id=binding.core_run_id,
+            openclaw_run_id=binding.openclaw_run_id,
+            session_key=binding.session_key,
+            agent_id=binding.agent_id,
+            output=output,
+        )
+
+    def set_terminal_transition_guard(self, guard: Callable[[str], bool] | None) -> None:
+        """Install an external cancellation-intent guard for terminal writes."""
+        with self._lock:
+            self._terminal_transition_guard = guard
 
     def dispatch(
         self,
@@ -569,11 +639,16 @@ class CoreEngine:
         core_run_id: str | None = None,
         idempotency_key: str | None = None,
         goal_contract: Mapping[str, Any] | None = None,
+        auth_token: str | None = None,
+        action: str = "dispatch",
+        workspace_id: str = "command-center",
+        project_id: str = "fast-gateway",
     ) -> dict[str, Any]:
         return self._dispatch(
             agent_id=agent_id, message=message, timeout_seconds=timeout_seconds,
             core_run_id=core_run_id, idempotency_key=idempotency_key,
             goal_contract=goal_contract, session_key=None, parent_core_run_id=None, context_reset_count=0,
+            auth_token=auth_token, action=action, workspace_id=workspace_id, project_id=project_id,
         )
 
     def _dispatch(
@@ -588,6 +663,10 @@ class CoreEngine:
         session_key: str | None,
         parent_core_run_id: str | None,
         context_reset_count: int,
+        auth_token: str | None = None,
+        action: str = "dispatch",
+        workspace_id: str = "command-center",
+        project_id: str = "fast-gateway",
     ) -> dict[str, Any]:
         with self._lock:
             registration = self.agents.require(agent_id)
@@ -598,13 +677,18 @@ class CoreEngine:
             actual_id = core_run_id or f"core-{uuid.uuid4().hex}"
             key = idempotency_key or actual_id
             contract = normalize_goal_contract(goal_contract)
-            digest = _request_hash(agent_id, message, float(timeout_seconds), contract.goal_id)
             try:
                 profile = self.models.resolve(registration)
                 policy = self._policy_metadata(profile)
+                effective_timeout = (
+                    profile.max_runtime
+                    if profile.runtime_class is RuntimeClass.LOCAL
+                    else float(timeout_seconds)
+                )
                 resolution_error = ""
             except PolicyResolutionError:
                 profile = None
+                effective_timeout = float(timeout_seconds)
                 policy = {
                     "runtime_class": RuntimeClass.UNKNOWN.value,
                     "model_profile": registration.runtime_model_id,
@@ -613,6 +697,8 @@ class CoreEngine:
                     "fallback_policy": "NONE",
                 }
                 resolution_error = "MODEL_PROFILE_MISMATCH"
+            digest = _request_hash(agent_id, message, effective_timeout, contract.goal_id,
+                                   action, workspace_id, project_id)
             record, created = self.registry.create(
                 core_run_id=actual_id,
                 agent_id=agent_id,
@@ -623,7 +709,18 @@ class CoreEngine:
                 parent_core_run_id=parent_core_run_id,
                 context_reset_count=context_reset_count,
             )
-            if not created:
+            if not created and record["status"] != CoreRunStatus.QUEUED.value:
+                return record
+            if self.auth_broker is not None:
+                scope = AuthScope(agent_id=agent_id, action=action, workspace_id=workspace_id,
+                                  project_id=project_id, task_contract=contract.as_dict())
+                try:
+                    self.auth_broker.verify_and_consume(auth_token, scope, run_id=actual_id)
+                except AuthBrokerError as exc:
+                    return self.registry.transition(actual_id, CoreRunStatus.BLOCKED, reason=f"AUTH_{exc.code}")
+            else:
+                if record["status"] == CoreRunStatus.QUEUED.value:
+                    return self.registry.transition(actual_id, CoreRunStatus.BLOCKED, reason="AUTH_BROKER_UNAVAILABLE")
                 return record
             if resolution_error:
                 self.registry.update_policy(
@@ -639,7 +736,7 @@ class CoreEngine:
                     "message": message,
                     "agentId": agent_id,
                     "idempotencyKey": key,
-                    "timeout": timeout_seconds,
+                    "timeout": effective_timeout,
                 }
                 if session_key is not None:
                     submit_payload["sessionKey"] = session_key
@@ -832,7 +929,14 @@ class CoreEngine:
                 remaining = profile.max_runtime - elapsed_before
                 if remaining <= 0:
                     return self._cancel_for_policy(core_run_id, profile, "RUNTIME_LIMIT")
-                bounded_wait = min(requested_wait, remaining)
+                execution_remaining = profile.execution_budget - elapsed_before
+                if profile.runtime_class is RuntimeClass.LOCAL and execution_remaining <= 0:
+                    return self._finalize_local_execution(core_run_id, profile)
+                bounded_wait = min(
+                    requested_wait,
+                    remaining,
+                    execution_remaining if profile.runtime_class is RuntimeClass.LOCAL else remaining,
+                )
                 try:
                     outcome = self.adapter.wait(core_run_id, timeout_seconds=bounded_wait)
                 except TimeoutError:
@@ -842,9 +946,18 @@ class CoreEngine:
                     outcome = AdapterOutcome(CoreRunStatus.FAIL, reason)
                 elapsed = self._runtime_seconds(self._require(core_run_id))
                 self.registry.update_policy(core_run_id, runtime_seconds=elapsed)
+                guard = self._terminal_transition_guard
+                if guard is not None and guard(core_run_id):
+                    return self._require(core_run_id)
+                if (
+                    profile.runtime_class is RuntimeClass.LOCAL
+                    and elapsed >= profile.execution_budget
+                    and outcome.status in {CoreRunStatus.RUNNING, CoreRunStatus.TIMEOUT}
+                ):
+                    return self._finalize_local_execution(core_run_id, profile)
                 if elapsed >= profile.max_runtime and outcome.status in {CoreRunStatus.RUNNING, CoreRunStatus.TIMEOUT}:
                     return self._cancel_for_policy(core_run_id, profile, "RUNTIME_LIMIT")
-                if outcome.status != CoreRunStatus.TIMEOUT or profile.runtime_class != RuntimeClass.LOCAL:
+                if outcome.status != CoreRunStatus.TIMEOUT:
                     break
                 if outcome.reason != "OPENCLAW_TIMEOUT":
                     break
@@ -855,46 +968,93 @@ class CoreEngine:
                 meaningful_wait = min(1.0, bounded_wait / 2.0)
                 if elapsed - elapsed_before < meaningful_wait:
                     return self._require(core_run_id)
-            if outcome.status == CoreRunStatus.RUNNING:
-                return self._require(core_run_id)
-            if outcome.status == CoreRunStatus.TIMEOUT:
+            return self._apply_adapter_outcome(core_run_id, outcome)
+
+    def _apply_adapter_outcome(self, core_run_id: str, outcome: AdapterOutcome) -> dict[str, Any]:
+        if outcome.status == CoreRunStatus.RUNNING:
+            return self._require(core_run_id)
+        if outcome.status == CoreRunStatus.TIMEOUT:
                 # A bounded wait timeout is terminal for Core, but the
                 # underlying OpenClaw run may still be alive.  Best-effort
                 # abort it on the adapter's independent connection before
                 # recording TIMEOUT, so no worker is left orphaned.
-                try:
-                    self.adapter.cancel(core_run_id)
-                except (AdapterError, TimeoutError):
-                    self.registry.update_policy(
-                        core_run_id,
-                        event_code="TIMEOUT_ABORT_FAILED",
-                        cancel_reason="TIMEOUT_ABORT_FAILED",
-                        policy_status="GUARDED",
-                    )
-                self._clear_runtime_deadline(core_run_id)
-                return self.registry.transition(core_run_id, CoreRunStatus.TIMEOUT, outcome=outcome)
-            if outcome.result is not None and isinstance(outcome.result.get("progress_checkpoint"), Mapping):
-                try:
-                    observed = self.observe_progress_checkpoint(core_run_id, outcome.result["progress_checkpoint"])
-                except ValueError:
-                    self.registry.update_goal_state(
-                        core_run_id, event_code="GOAL_CHECKPOINT_INVALID", goal_status="DRIFT",
-                    )
-                    self._clear_runtime_deadline(core_run_id)
-                    return self.registry.transition(
-                        core_run_id, CoreRunStatus.BLOCKED, reason="GOAL_CHECKPOINT_INVALID",
-                    )
-                if CoreRunStatus(observed["status"]) in _TERMINAL:
-                    self._clear_runtime_deadline(core_run_id)
-                    return observed
-                if observed.get("goal_status") in {"GUARDED", "DRIFT"}:
-                    goal_state = dict((observed.get("policy_state") or {}).get("goal") or {})
-                    goal_state["openclaw_completed"] = True
-                    self.registry.update_goal_state(core_run_id, goal_state=goal_state)
-                    self._clear_runtime_deadline(core_run_id)
-                    return self._require(core_run_id)
+            try:
+                self.adapter.cancel(core_run_id)
+            except (AdapterError, TimeoutError):
+                self.registry.update_policy(
+                    core_run_id,
+                    event_code="TIMEOUT_ABORT_FAILED",
+                    cancel_reason="TIMEOUT_ABORT_FAILED",
+                    policy_status="GUARDED",
+                )
             self._clear_runtime_deadline(core_run_id)
-            return self.registry.transition(core_run_id, outcome.status, outcome=outcome)
+            return self.registry.transition(core_run_id, CoreRunStatus.TIMEOUT, outcome=outcome)
+        if outcome.result is not None and isinstance(outcome.result.get("progress_checkpoint"), Mapping):
+            try:
+                observed = self.observe_progress_checkpoint(core_run_id, outcome.result["progress_checkpoint"])
+            except ValueError:
+                self.registry.update_goal_state(
+                    core_run_id, event_code="GOAL_CHECKPOINT_INVALID", goal_status="DRIFT",
+                )
+                self._clear_runtime_deadline(core_run_id)
+                return self.registry.transition(
+                    core_run_id, CoreRunStatus.BLOCKED, reason="GOAL_CHECKPOINT_INVALID",
+                )
+            if CoreRunStatus(observed["status"]) in _TERMINAL:
+                self._clear_runtime_deadline(core_run_id)
+                return observed
+            if observed.get("goal_status") in {"GUARDED", "DRIFT"}:
+                goal_state = dict((observed.get("policy_state") or {}).get("goal") or {})
+                goal_state["openclaw_completed"] = True
+                self.registry.update_goal_state(core_run_id, goal_state=goal_state)
+                self._clear_runtime_deadline(core_run_id)
+                return self._require(core_run_id)
+        self._clear_runtime_deadline(core_run_id)
+        return self.registry.transition(core_run_id, outcome.status, outcome=outcome)
+
+    def _finalize_local_execution(
+        self, core_run_id: str, profile: RuntimeModelProfile,
+    ) -> dict[str, Any]:
+        """Use only the reserved LOCAL budget for collection/recovery/cleanup."""
+        record = self._require(core_run_id)
+        if CoreRunStatus(record["status"]) in _TERMINAL:
+            return record
+        if not any(
+            event.get("code") == "EXECUTION_BUDGET_EXHAUSTED"
+            for event in record.get("policy_events", [])
+            if isinstance(event, Mapping)
+        ):
+            self.registry.update_policy(
+                core_run_id,
+                event_code="EXECUTION_BUDGET_EXHAUSTED",
+                event_details={
+                    "execution_budget": profile.execution_budget,
+                    "finalization_recovery_budget": profile.finalization_recovery_budget,
+                },
+                policy_status="GUARDED",
+            )
+        elapsed = self._runtime_seconds(self._require(core_run_id))
+        remaining = profile.max_runtime - elapsed
+        if remaining <= 0:
+            return self._cancel_for_policy(core_run_id, profile, "RUNTIME_LIMIT")
+        # agent.wait may use up to five seconds of transport overhead and a
+        # history fetch may use another fifteen. Reserve twenty seconds for
+        # cancellation/record finalization inside the 60-second segment.
+        collection_window = min(10.0, max(0.01, remaining - 20.0))
+        try:
+            outcome = self.adapter.wait(core_run_id, timeout_seconds=collection_window)
+        except (AdapterError, TimeoutError):
+            outcome = AdapterOutcome(CoreRunStatus.RUNNING, "FINALIZATION_COLLECTION_FAILED")
+        elapsed = self._runtime_seconds(self._require(core_run_id))
+        self.registry.update_policy(core_run_id, runtime_seconds=elapsed)
+        if elapsed >= profile.max_runtime:
+            return self._cancel_for_policy(core_run_id, profile, "RUNTIME_LIMIT")
+        if outcome.status in _TERMINAL and not (
+            outcome.status is CoreRunStatus.TIMEOUT
+            and outcome.reason == "OPENCLAW_TIMEOUT"
+        ):
+            return self._apply_adapter_outcome(core_run_id, outcome)
+        return self._cancel_for_policy(core_run_id, profile, "RUNTIME_LIMIT")
 
     def observe_runtime_event(self, core_run_id: str, event: Mapping[str, Any]) -> dict[str, Any]:
         """Trusted hook for verified runtime events; it is intentionally not an HTTP endpoint."""
@@ -936,6 +1096,51 @@ class CoreEngine:
                 )
             return self._require(core_run_id)
 
+    def observe_local_run_output(
+        self,
+        *,
+        core_run_id: str,
+        openclaw_run_id: str,
+        session_key: str,
+        agent_id: str,
+        output: str,
+    ) -> dict[str, Any]:
+        """Observe verified run output without changing the worker lifecycle."""
+
+        with self._lock:
+            record = self._require(core_run_id)
+            if record.get("status") != CoreRunStatus.RUNNING.value:
+                return record
+            if record.get("runtime_class") != RuntimeClass.LOCAL.value:
+                raise ValueError("LOOP_DETECTION_LOCAL_ONLY")
+            binding = record.get("openclaw_binding")
+            expected = {
+                "openclaw_run_id": openclaw_run_id,
+                "session_key": session_key,
+                "agent_id": agent_id,
+            }
+            if not isinstance(binding, Mapping) or any(binding.get(key) != value for key, value in expected.items()):
+                raise ValueError("RUN_CORRELATION_MISMATCH")
+            event = self.loop_detector.observe(
+                RunScope(core_run_id, openclaw_run_id, session_key, agent_id), output,
+            )
+            if event is not None:
+                details = {
+                    "core_run_id": core_run_id,
+                    "openclaw_run_id": openclaw_run_id,
+                    "sessionKey": session_key,
+                    "agentId": agent_id,
+                    "repeat_count": event["repeat_count"],
+                    "unit_chars": event["unit_chars"],
+                }
+                self.registry.update_policy(
+                    core_run_id,
+                    event_code="LOOP_SUSPECTED",
+                    event_details=details,
+                    policy_status=record.get("policy_status", "NORMAL"),
+                )
+            return self._require(core_run_id)
+
     def cancel(self, core_run_id: str) -> dict[str, Any]:
         with self._lock:
             record = self._require(core_run_id)
@@ -964,6 +1169,53 @@ class CoreEngine:
                 reason="OPENCLAW_ABORTED",
             )
 
+    def mark_user_cancelled(self, core_run_id: str) -> dict[str, Any]:
+        """Reconcile an external, already-confirmed user abort."""
+        with self._lock:
+            record = self._require(core_run_id)
+            if CoreRunStatus(record["status"]) in _TERMINAL:
+                return record
+            self._clear_runtime_deadline(core_run_id)
+            return self.registry.transition(
+                core_run_id, CoreRunStatus.CANCELLED, reason="USER_CANCEL",
+            )
+
+    def mark_user_cancelled_after_abort(self, core_run_id: str) -> dict[str, Any]:
+        """Reconcile the exact terminal error emitted by an abort race."""
+        with self._lock:
+            record = self._require(core_run_id)
+            status = CoreRunStatus(record["status"])
+            if status == CoreRunStatus.FAIL and record.get("reason") == "OPENCLAW_ERROR":
+                self._clear_runtime_deadline(core_run_id)
+                return self.registry.reconcile_abort_observation(core_run_id)
+            if status not in _TERMINAL:
+                self._clear_runtime_deadline(core_run_id)
+                return self.registry.transition(
+                    core_run_id, CoreRunStatus.CANCELLED, reason="USER_CANCEL",
+                )
+            return record
+
+    def reconcile_external_completion(self, core_run_id: str) -> dict[str, Any]:
+        """Refresh a run after an external idempotent abort race."""
+        with self._lock:
+            record = self._require(core_run_id)
+            if CoreRunStatus(record["status"]) in _TERMINAL:
+                return record
+        try:
+            outcome = self.adapter.wait(core_run_id, timeout_seconds=0.01)
+        except (AdapterError, TimeoutError):
+            return self.status(core_run_id)
+        with self._lock:
+            record = self._require(core_run_id)
+            if CoreRunStatus(record["status"]) in _TERMINAL:
+                return record
+            if outcome.status not in _TERMINAL:
+                return record
+            self._clear_runtime_deadline(core_run_id)
+            return self.registry.transition(
+                core_run_id, outcome.status, outcome=outcome, reason=outcome.reason,
+            )
+
     def status(self, core_run_id: str) -> dict[str, Any]:
         return self._require(core_run_id)
 
@@ -983,6 +1235,8 @@ class CoreEngine:
             "model_profile": profile.model_id,
             "policy_profile": profile.policy_profile,
             "max_runtime": profile.max_runtime,
+            "execution_budget": profile.execution_budget,
+            "finalization_recovery_budget": profile.finalization_recovery_budget,
             "max_retries": profile.max_retries,
             "max_tool_calls": profile.max_tool_calls,
             "context_policy": profile.context_policy,
@@ -1072,7 +1326,12 @@ class CoreEngine:
         )
 
     def _schedule_runtime_deadline(self, core_run_id: str, profile: RuntimeModelProfile) -> None:
-        timer = threading.Timer(profile.max_runtime, self._enforce_runtime_deadline, args=(core_run_id,))
+        deadline = (
+            profile.execution_budget
+            if profile.runtime_class is RuntimeClass.LOCAL
+            else profile.max_runtime
+        )
+        timer = threading.Timer(deadline, self._enforce_runtime_deadline, args=(core_run_id,))
         timer.daemon = True
         old = self._deadline_timers.pop(core_run_id, None)
         if old is not None:
@@ -1103,5 +1362,9 @@ class CoreEngine:
                 self._clear_runtime_deadline(core_run_id)
                 self.registry.transition(core_run_id, CoreRunStatus.BLOCKED, reason="MODEL_PROFILE_MISMATCH")
                 return
-            self.registry.update_policy(core_run_id, runtime_seconds=profile.max_runtime)
-            self._cancel_for_policy(core_run_id, profile, "RUNTIME_LIMIT")
+            if profile.runtime_class is RuntimeClass.LOCAL:
+                self.registry.update_policy(core_run_id, runtime_seconds=profile.execution_budget)
+                self._finalize_local_execution(core_run_id, profile)
+            else:
+                self.registry.update_policy(core_run_id, runtime_seconds=profile.max_runtime)
+                self._cancel_for_policy(core_run_id, profile, "RUNTIME_LIMIT")
