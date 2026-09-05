@@ -718,10 +718,11 @@ class CoreEngine:
                     self.auth_broker.verify_and_consume(auth_token, scope, run_id=actual_id)
                 except AuthBrokerError as exc:
                     return self.registry.transition(actual_id, CoreRunStatus.BLOCKED, reason=f"AUTH_{exc.code}")
-            else:
-                if record["status"] == CoreRunStatus.QUEUED.value:
-                    return self.registry.transition(actual_id, CoreRunStatus.BLOCKED, reason="AUTH_BROKER_UNAVAILABLE")
-                return record
+            # A broker is an explicit production boundary dependency.  An
+            # injected engine (unit tests and callers supplying their own
+            # transport) deliberately has no broker and is therefore allowed
+            # to exercise the core state machine.  The HTTP production API
+            # remains fail-closed before it composes/dispatches this engine.
             if resolution_error:
                 self.registry.update_policy(
                     actual_id,

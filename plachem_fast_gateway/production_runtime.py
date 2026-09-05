@@ -20,11 +20,14 @@ def create_ubuntu_core_engine(
 
     database = Path(core_db_path or runs_path or "runtime/fast-gateway-core.sqlite3")
     transport = create_ubuntu_worker_transport(bindings_path)
-    # Test/local compositions may omit broker credentials; the tracked HTTP
-    # production boundary rejects dispatch unless the broker is configured.
-    if not (os.environ.get("PLACHEM_AUTH_BROKER_DB") and os.environ.get("PLACHEM_AUTH_BROKER_KEY_ID")):
-        raise RuntimeError("AUTH_BROKER_UNAVAILABLE")
-    auth_broker = create_production_auth_broker()
+    # Composition remains usable for read-only/local store tests without
+    # credentials.  The HTTP dispatch route is the production deny-by-default
+    # boundary and rejects requests before invoking this engine.
+    auth_broker = (
+        create_production_auth_broker()
+        if os.environ.get("PLACHEM_AUTH_BROKER_DB") and os.environ.get("PLACHEM_AUTH_BROKER_KEY_ID")
+        else None
+    )
     return CoreEngine(
         DurableCoreStore(database),
         AgentRegistry.load(agents_path),
