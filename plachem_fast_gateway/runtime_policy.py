@@ -215,7 +215,7 @@ class ModelRegistry:
                 if (
                     isinstance(finalization_recovery_budget, bool)
                     or not isinstance(finalization_recovery_budget, (int, float))
-                    or finalization_recovery_budget <= 0
+                    or finalization_recovery_budget < 0
                 ):
                     raise ValueError(f"INVALID_FINALIZATION_RECOVERY_BUDGET:{model_id}")
                 if abs(float(execution_budget) + float(finalization_recovery_budget) - float(max_runtime)) > 1e-9:
