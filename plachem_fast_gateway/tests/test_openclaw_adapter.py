@@ -66,7 +66,9 @@ class FakeSocket:
                 "features": {"methods": ["agent", "agent.wait", "chat.history", "sessions.abort"]},
             }
         else:
-            handler = self.handlers[method]
+            handler = self.handlers.get(method, {"messages": []} if method == "chat.history" else None)
+            if handler is None:
+                raise KeyError(method)
             payload = handler(frame["params"]) if callable(handler) else handler
         self.responses.append(json.dumps({"type": "res", "id": frame["id"], "ok": True, "payload": payload}))
 
@@ -216,9 +218,9 @@ class OpenClawAdapterTests(unittest.TestCase):
         adapter, fake = self.adapter({"agent": accepted})
         binding = adapter.submit("core-run-1", self.payload())
         self.assertEqual(CoreRunStatus.RUNNING, binding.status)
-        self.assertEqual("agent:qwentest:main", binding.session_key)
+        self.assertEqual("agent:qwentest:fast-gateway-core-run-1", binding.session_key)
         params = fake.calls[-1]["params"]
-        self.assertEqual({"message", "agentId", "idempotencyKey", "timeout"}, set(params))
+        self.assertEqual({"message", "agentId", "idempotencyKey", "timeout", "sessionKey"}, set(params))
 
     def test_wait_validates_before_pass(self):
         handlers = {"agent": accepted, "agent.wait": {"status": "ok", "result": {"status": "completed"}}}
@@ -363,7 +365,7 @@ class OpenClawAdapterTests(unittest.TestCase):
         abort = fake.calls[-1]
         self.assertEqual("sessions.abort", abort["method"])
         self.assertEqual(
-            {"key": "agent:qwentest:main", "runId": "openclaw-run-1", "agentId": "qwentest"},
+            {"key": "agent:qwentest:fast-gateway-core-run-1", "runId": "openclaw-run-1", "agentId": "qwentest"},
             abort["params"],
         )
 

@@ -11,16 +11,8 @@ from typing import Any
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
-from plachem_fast_gateway import (
-    AgentRegistry,
-    CoreEngine,
-    EnvironmentSecretRef,
-    ModelRegistry,
-    OpenClawAdapter,
-    RunRegistry,
-    SQLiteRunBindingStore,
-    production_result_validator,
-)
+from plachem_fast_gateway import CoreEngine, RunRegistry
+from plachem_fast_gateway.production_runtime import create_ubuntu_core_engine
 
 
 ROOT = Path(__file__).resolve().parent
@@ -103,25 +95,17 @@ def _require_write(secret: str | None) -> None:
 
 @lru_cache(maxsize=1)
 def _engine() -> CoreEngine:
-    agents_path = Path(
-        os.environ.get("PLACHEM_FAST_GATEWAY_AGENTS", ROOT / "plachem_fast_gateway" / "agents.json")
-    )
-    models_path = Path(
-        os.environ.get("PLACHEM_FAST_GATEWAY_MODELS", ROOT / "plachem_fast_gateway" / "models.json")
-    )
-    bindings_path = Path(
-        os.environ.get("PLACHEM_FAST_GATEWAY_BINDINGS", ROOT / "runtime" / "fast-gateway-bindings.sqlite3")
-    )
-    adapter = OpenClawAdapter(
-        EnvironmentSecretRef(),
-        SQLiteRunBindingStore(bindings_path),
-        result_validator=production_result_validator(),
-    )
-    return CoreEngine(
-        RunRegistry(_run_path()),
-        AgentRegistry.load(agents_path),
-        ModelRegistry.load(models_path),
-        adapter,
+    return create_ubuntu_core_engine(
+        runs_path=_run_path(),
+        agents_path=Path(os.environ.get(
+            "PLACHEM_FAST_GATEWAY_AGENTS", ROOT / "plachem_fast_gateway" / "agents.json",
+        )),
+        models_path=Path(os.environ.get(
+            "PLACHEM_FAST_GATEWAY_MODELS", ROOT / "plachem_fast_gateway" / "models.json",
+        )),
+        bindings_path=Path(os.environ.get(
+            "PLACHEM_FAST_GATEWAY_BINDINGS", ROOT / "runtime" / "fast-gateway-bindings.sqlite3",
+        )),
     )
 
 

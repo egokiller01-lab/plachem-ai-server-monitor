@@ -45,7 +45,11 @@ class Socket:
                 "features": {"methods": ["agent", "agent.wait", "chat.history", "sessions.abort"]},
             }
         else:
-            handler = self.handlers[frame["method"]]
+            handler = self.handlers.get(
+                frame["method"], {"messages": []} if frame["method"] == "chat.history" else None,
+            )
+            if handler is None:
+                raise KeyError(frame["method"])
             payload = handler(frame["params"]) if callable(handler) else handler
         self.responses.append(json.dumps({"type": "res", "id": frame["id"], "ok": True, "payload": payload}))
 

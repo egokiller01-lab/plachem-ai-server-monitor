@@ -448,16 +448,48 @@ class RunBindingStore(Protocol):
 
     def put(self, binding: RunBinding) -> None: ...
 
+    def get_preparation(self, core_run_id: str) -> "RunPreparation | None": ...
+
+    def put_preparation(self, preparation: "RunPreparation") -> None: ...
+
+
+@dataclass(frozen=True)
+class RunPreparation:
+    core_run_id: str
+    agent_id: str
+    session_key: str
+    idempotency_key: str
+    watermark_seq: int | None
+    watermark_message_id: str | None
+    captured_at_ms: int
+    history_was_empty: bool
+
 
 class MemoryRunBindingStore:
     def __init__(self) -> None:
         self._items: dict[str, RunBinding] = {}
+        self._preparations: dict[str, RunPreparation] = {}
 
     def get(self, core_run_id: str) -> RunBinding | None:
         return self._items.get(core_run_id)
 
     def put(self, binding: RunBinding) -> None:
         self._items[binding.core_run_id] = binding
+
+    def get_preparation(self, core_run_id: str) -> RunPreparation | None:
+        return self._preparations.get(core_run_id)
+
+    def put_preparation(self, preparation: RunPreparation) -> None:
+        existing = self._preparations.get(preparation.core_run_id)
+        if existing is not None and existing != preparation:
+            raise IdempotencyConflict("run preparation conflicts")
+        if any(
+            item.idempotency_key == preparation.idempotency_key
+            and item.core_run_id != preparation.core_run_id
+            for item in self._preparations.values()
+        ):
+            raise IdempotencyConflict("run preparation idempotency conflicts")
+        self._preparations[preparation.core_run_id] = preparation
 
 
 class SQLiteRunBindingStore:
@@ -476,6 +508,18 @@ class SQLiteRunBindingStore:
                        session_id TEXT,
                        idempotency_key TEXT NOT NULL UNIQUE,
                        status TEXT NOT NULL
+                   )"""
+            )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS openclaw_run_preparations (
+                       core_run_id TEXT PRIMARY KEY,
+                       agent_id TEXT NOT NULL,
+                       session_key TEXT NOT NULL,
+                       idempotency_key TEXT NOT NULL UNIQUE,
+                       watermark_seq INTEGER,
+                       watermark_message_id TEXT,
+                       captured_at_ms INTEGER NOT NULL,
+                       history_was_empty INTEGER NOT NULL CHECK(history_was_empty IN (0, 1))
                    )"""
             )
 
@@ -513,6 +557,48 @@ class SQLiteRunBindingStore:
                 )
         except sqlite3.IntegrityError as exc:
             raise IdempotencyConflict("run or idempotency binding conflicts") from exc
+
+    def get_preparation(self, core_run_id: str) -> RunPreparation | None:
+        with sqlite3.connect(self.path) as connection:
+            row = connection.execute(
+                """SELECT core_run_id, agent_id, session_key, idempotency_key,
+                          watermark_seq, watermark_message_id, captured_at_ms, history_was_empty
+                     FROM openclaw_run_preparations WHERE core_run_id = ?""",
+                (core_run_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return RunPreparation(*row[:-1], bool(row[-1]))
+
+    def put_preparation(self, preparation: RunPreparation) -> None:
+        values = asdict(preparation)
+        values["history_was_empty"] = int(preparation.history_was_empty)
+        try:
+            with sqlite3.connect(self.path) as connection:
+                connection.execute(
+                    """INSERT INTO openclaw_run_preparations
+                           (core_run_id, agent_id, session_key, idempotency_key,
+                            watermark_seq, watermark_message_id, captured_at_ms, history_was_empty)
+                       VALUES (:core_run_id, :agent_id, :session_key, :idempotency_key,
+                               :watermark_seq, :watermark_message_id, :captured_at_ms, :history_was_empty)
+                       ON CONFLICT(core_run_id) DO NOTHING""",
+                    values,
+                )
+                row = connection.execute(
+                    """SELECT agent_id, session_key, idempotency_key, watermark_seq,
+                              watermark_message_id, captured_at_ms, history_was_empty
+                         FROM openclaw_run_preparations WHERE core_run_id = ?""",
+                    (preparation.core_run_id,),
+                ).fetchone()
+        except sqlite3.IntegrityError as exc:
+            raise IdempotencyConflict("run preparation conflicts") from exc
+        expected = (
+            preparation.agent_id, preparation.session_key, preparation.idempotency_key,
+            preparation.watermark_seq, preparation.watermark_message_id,
+            preparation.captured_at_ms, int(preparation.history_was_empty),
+        )
+        if row != expected:
+            raise IdempotencyConflict("run preparation conflicts")
 
 
 @dataclass(frozen=True)
@@ -686,14 +772,42 @@ class OpenClawAdapter:
         if not isinstance(core_run_id, str) or not core_run_id:
             raise GatewayContractError("core_run_id is required")
         params = self._validate_submit(payload)
+        agent_id = str(params["agentId"])
+        requested_session = params.get("sessionKey")
+        session_key = requested_session or f"agent:{agent_id}:fast-gateway-{core_run_id}"
+        self._validate_session_binding(session_key, agent_id)
+        params["sessionKey"] = session_key
         existing = self.bindings.get(core_run_id)
         if existing is not None:
             if existing.agent_id != params["agentId"] or existing.idempotency_key != params["idempotencyKey"]:
                 raise IdempotencyConflict("core run binding does not match retry")
-            requested_session = params.get("sessionKey")
-            if requested_session is not None and requested_session != existing.session_key:
+            if session_key != existing.session_key:
                 raise SessionBindingError("core run sessionKey does not match retry binding")
             return existing
+        preparation = self.bindings.get_preparation(core_run_id)
+        if preparation is not None:
+            if (
+                preparation.agent_id != agent_id
+                or preparation.session_key != session_key
+                or preparation.idempotency_key != params["idempotencyKey"]
+            ):
+                raise IdempotencyConflict("core run preparation does not match retry")
+        else:
+            history = self.rpc.request(
+                "chat.history", {"sessionKey": session_key, "limit": self.history_limit}, timeout=15.0,
+            )
+            watermark_seq, watermark_message_id, history_was_empty = self._capture_watermark(history)
+            preparation = RunPreparation(
+                core_run_id=core_run_id,
+                agent_id=agent_id,
+                session_key=session_key,
+                idempotency_key=str(params["idempotencyKey"]),
+                watermark_seq=watermark_seq,
+                watermark_message_id=watermark_message_id,
+                captured_at_ms=int(time.time() * 1000),
+                history_was_empty=history_was_empty,
+            )
+            self.bindings.put_preparation(preparation)
         response = self.rpc.request("agent", params, timeout=float(params["timeout"]) + 5.0)
         status = str(response.get("status") or "")
         if status not in {"accepted", "in_flight", "ok"}:
@@ -702,8 +816,9 @@ class OpenClawAdapter:
         session_key = response.get("sessionKey")
         if not isinstance(run_id, str) or not run_id:
             raise GatewayContractError("OpenClaw runId is missing")
-        agent_id = str(params["agentId"])
         session_key = self._validate_session_binding(session_key, agent_id)
+        if session_key != preparation.session_key:
+            raise SessionBindingError("OpenClaw response sessionKey does not match preparation")
         session_id = response.get("sessionId")
         if session_id is not None and not isinstance(session_id, str):
             raise GatewayContractError("OpenClaw sessionId is invalid")
@@ -718,6 +833,64 @@ class OpenClawAdapter:
         )
         self.bindings.put(binding)
         return binding
+
+    @staticmethod
+    def _message_cursor(message: Mapping[str, Any]) -> tuple[int | None, str | None]:
+        metadata = message.get("__openclaw")
+        seq = metadata.get("seq") if isinstance(metadata, Mapping) else None
+        message_id = metadata.get("id") if isinstance(metadata, Mapping) else None
+        if isinstance(seq, bool) or not isinstance(seq, int):
+            seq = None
+        if not isinstance(message_id, str) or not message_id:
+            message_id = message.get("id") or message.get("messageId")
+        if not isinstance(message_id, str) or not message_id:
+            message_id = None
+        return seq, message_id
+
+    @classmethod
+    def _capture_watermark(cls, history: Mapping[str, Any]) -> tuple[int | None, str | None, bool]:
+        messages = history.get("messages")
+        if not isinstance(messages, list):
+            raise GatewayContractError("HISTORY_WATERMARK_UNVERIFIABLE")
+        assistants = [item for item in messages if isinstance(item, Mapping) and item.get("role") == "assistant"]
+        if not assistants:
+            return None, None, True
+        seq, message_id = cls._message_cursor(assistants[-1])
+        return seq, message_id, False
+
+    @classmethod
+    def _history_after_watermark(
+        cls, history: Mapping[str, Any], preparation: RunPreparation,
+    ) -> Mapping[str, Any]:
+        messages = history.get("messages")
+        if not isinstance(messages, list):
+            raise GatewayContractError("HISTORY_WATERMARK_UNVERIFIABLE")
+        if preparation.history_was_empty:
+            candidates = list(messages)
+        elif preparation.watermark_seq is not None:
+            candidates = []
+            for message in messages:
+                if not isinstance(message, Mapping):
+                    continue
+                seq, _ = cls._message_cursor(message)
+                if seq is not None and seq > preparation.watermark_seq:
+                    candidates.append(message)
+        elif preparation.watermark_message_id is not None:
+            boundary = next(
+                (index for index, message in enumerate(messages)
+                 if isinstance(message, Mapping)
+                 and cls._message_cursor(message)[1] == preparation.watermark_message_id),
+                None,
+            )
+            if boundary is None:
+                raise GatewayContractError("HISTORY_WATERMARK_UNVERIFIABLE")
+            candidates = messages[boundary + 1:]
+        else:
+            raise GatewayContractError("HISTORY_WATERMARK_UNVERIFIABLE")
+        assistants = [item for item in candidates if isinstance(item, Mapping) and item.get("role") == "assistant"]
+        if not assistants:
+            raise GatewayContractError("MISSING_POST_SUBMIT_RESULT")
+        return {**dict(history), "messages": assistants}
 
     def wait(self, core_run_id: str, *, timeout_seconds: float) -> AdapterOutcome:
         binding = self._require_binding(core_run_id)
@@ -735,6 +908,10 @@ class OpenClawAdapter:
             timeout=timeout_seconds + 5.0,
         )
         observed = str(response.get("status") or "")
+        response_run_id = response.get("runId")
+        if response_run_id is not None and response_run_id != binding.openclaw_run_id:
+            self._set_status(binding, CoreRunStatus.FAIL)
+            return AdapterOutcome(CoreRunStatus.FAIL, "OPENCLAW_RUN_MISMATCH")
         if observed in {"pending", "accepted", "in_flight"}:
             self._set_status(binding, CoreRunStatus.RUNNING)
             return AdapterOutcome(CoreRunStatus.RUNNING, "RUN_STILL_ACTIVE")
@@ -760,6 +937,15 @@ class OpenClawAdapter:
                 {"sessionKey": binding.session_key, "limit": self.history_limit},
                 timeout=min(timeout_seconds + 5.0, 30.0),
             )
+            preparation = self.bindings.get_preparation(core_run_id)
+            if preparation is None:
+                self._set_status(binding, CoreRunStatus.FAIL)
+                return AdapterOutcome(CoreRunStatus.FAIL, "HISTORY_WATERMARK_UNVERIFIABLE")
+            try:
+                history = self._history_after_watermark(history, preparation)
+            except GatewayContractError as exc:
+                self._set_status(binding, CoreRunStatus.FAIL)
+                return AdapterOutcome(CoreRunStatus.FAIL, str(exc))
             validation_payload = {**dict(response), "history": history}
         decision = self.result_validator(validation_payload)
         self._set_status(binding, decision.status)
