@@ -960,7 +960,7 @@ class CoreEngine:
                     return self._cancel_for_policy(core_run_id, profile, "RUNTIME_LIMIT")
                 if outcome.status != CoreRunStatus.TIMEOUT:
                     break
-                if outcome.reason != "OPENCLAW_TIMEOUT":
+                if profile.runtime_class is not RuntimeClass.LOCAL or outcome.reason != "OPENCLAW_TIMEOUT":
                     break
                 # A LOCAL agent.wait window is not the run deadline. Continue
                 # only while the absolute dispatch-based policy budget remains.
