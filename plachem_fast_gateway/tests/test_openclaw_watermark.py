@@ -68,6 +68,37 @@ class WatermarkTests(unittest.TestCase):
         self.assertEqual(CoreRunStatus.FAIL, outcome.status)
         self.assertEqual("MISSING_POST_SUBMIT_RESULT", outcome.reason)
 
+    def test_higher_seq_without_stored_boundary_is_rejected(self):
+        old = {"role": "assistant", "content": "old", "__openclaw": {"seq": 4, "id": "old"}}
+        new = {"role": "assistant", "content": "new", "__openclaw": {"seq": 5, "id": "new"}}
+        adapter, _, _ = self.adapter([{"messages": [old]}, {"messages": [new]}])
+        adapter.submit("core-1", self.payload())
+        outcome = adapter.wait("core-1", timeout_seconds=1)
+        self.assertEqual(CoreRunStatus.FAIL, outcome.status)
+        self.assertEqual("HISTORY_WATERMARK_UNVERIFIABLE", outcome.reason)
+
+    def test_embedded_wait_result_is_ignored_and_cannot_bypass_watermark(self):
+        old = {"role": "assistant", "content": "old", "__openclaw": {"seq": 4, "id": "old"}}
+        adapter, socket, _ = self.adapter([{"messages": [old]}, {"messages": [old]}])
+        socket.handlers["agent.wait"] = {
+            "status": "ok",
+            "result": {"status": "completed", "summary": "stale embedded"},
+            "messages": [{"role": "assistant", "content": "embedded"}],
+            "evidence": [{"type": "claim"}],
+        }
+        adapter.submit("core-1", self.payload())
+        outcome = adapter.wait("core-1", timeout_seconds=1)
+        self.assertEqual(CoreRunStatus.FAIL, outcome.status)
+        self.assertEqual("MISSING_POST_SUBMIT_RESULT", outcome.reason)
+
+    def test_empty_pre_history_allows_new_sequenced_result(self):
+        new = {"role": "assistant", "content": "new", "__openclaw": {"seq": 9, "id": "new"}}
+        adapter, _, _ = self.adapter([{"messages": []}, {"messages": [new]}])
+        adapter.submit("core-1", self.payload())
+        outcome = adapter.wait("core-1", timeout_seconds=1)
+        self.assertEqual(CoreRunStatus.PASS, outcome.status)
+        self.assertEqual("new", outcome.result["content"])
+
     def test_only_new_assistant_is_validated(self):
         old = {"role": "assistant", "content": "old", "__openclaw": {"seq": 4, "id": "old"}}
         new = {"role": "assistant", "content": "new", "__openclaw": {"seq": 5, "id": "new"}}

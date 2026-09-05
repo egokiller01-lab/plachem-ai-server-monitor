@@ -868,6 +868,13 @@ class OpenClawAdapter:
         if preparation.history_was_empty:
             candidates = list(messages)
         elif preparation.watermark_seq is not None:
+            if preparation.watermark_message_id is not None and not any(
+                isinstance(message, Mapping)
+                and cls._message_cursor(message)
+                == (preparation.watermark_seq, preparation.watermark_message_id)
+                for message in messages
+            ):
+                raise GatewayContractError("HISTORY_WATERMARK_UNVERIFIABLE")
             candidates = []
             for message in messages:
                 if not isinstance(message, Mapping):
@@ -930,23 +937,27 @@ class OpenClawAdapter:
             self._set_status(binding, CoreRunStatus.FAIL)
             return AdapterOutcome(CoreRunStatus.FAIL, "UNKNOWN_OPENCLAW_STATUS")
 
-        validation_payload: Mapping[str, Any] = response
-        if not self._contains_result(response):
-            history = self.rpc.request_fresh(
-                "chat.history",
-                {"sessionKey": binding.session_key, "limit": self.history_limit},
-                timeout=min(timeout_seconds + 5.0, 30.0),
-            )
-            preparation = self.bindings.get_preparation(core_run_id)
-            if preparation is None:
-                self._set_status(binding, CoreRunStatus.FAIL)
-                return AdapterOutcome(CoreRunStatus.FAIL, "HISTORY_WATERMARK_UNVERIFIABLE")
-            try:
-                history = self._history_after_watermark(history, preparation)
-            except GatewayContractError as exc:
-                self._set_status(binding, CoreRunStatus.FAIL)
-                return AdapterOutcome(CoreRunStatus.FAIL, str(exc))
-            validation_payload = {**dict(response), "history": history}
+        # agent.wait is lifecycle metadata only. Embedded result material must
+        # never bypass the history watermark for this exact submit.
+        history = self.rpc.request_fresh(
+            "chat.history",
+            {"sessionKey": binding.session_key, "limit": self.history_limit},
+            timeout=min(timeout_seconds + 5.0, 30.0),
+        )
+        preparation = self.bindings.get_preparation(core_run_id)
+        if preparation is None:
+            self._set_status(binding, CoreRunStatus.FAIL)
+            return AdapterOutcome(CoreRunStatus.FAIL, "HISTORY_WATERMARK_UNVERIFIABLE")
+        try:
+            history = self._history_after_watermark(history, preparation)
+        except GatewayContractError as exc:
+            self._set_status(binding, CoreRunStatus.FAIL)
+            return AdapterOutcome(CoreRunStatus.FAIL, str(exc))
+        control_payload = {
+            key: value for key, value in response.items()
+            if key not in {"result", "evidence", "artifacts", "messages", "history"}
+        }
+        validation_payload: Mapping[str, Any] = {**control_payload, "history": history}
         decision = self.result_validator(validation_payload)
         self._set_status(binding, decision.status)
         return AdapterOutcome(decision.status, decision.reason, decision.result)

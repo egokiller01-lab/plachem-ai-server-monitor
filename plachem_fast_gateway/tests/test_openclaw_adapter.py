@@ -223,7 +223,15 @@ class OpenClawAdapterTests(unittest.TestCase):
         self.assertEqual({"message", "agentId", "idempotencyKey", "timeout", "sessionKey"}, set(params))
 
     def test_wait_validates_before_pass(self):
-        handlers = {"agent": accepted, "agent.wait": {"status": "ok", "result": {"status": "completed"}}}
+        histories = iter([
+            {"messages": []},
+            {"messages": [{"role": "assistant", "content": {"status": "completed"}}]},
+        ])
+        handlers = {
+            "agent": accepted,
+            "agent.wait": {"status": "ok", "result": {"status": "completed"}},
+            "chat.history": lambda _: next(histories),
+        }
         adapter, _ = self.adapter(handlers)
         adapter.submit("core-run-1", self.payload())
         decision = adapter.wait("core-run-1", timeout_seconds=2)
