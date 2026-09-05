@@ -42,6 +42,17 @@ class AuthBrokerTests(unittest.TestCase):
 
     def test_deny_default_without_token(self):
         self.assert_code("AUTH_REQUIRED", lambda: self.broker.verify_and_consume(None, self.scope, run_id="r1"))
+        audit = self.broker.list_audit()
+        self.assertEqual(("DENY", "AUTH_REQUIRED", None),
+                         (audit[-1]["outcome"], audit[-1]["error_code"], audit[-1]["grant_id"]))
+
+    def test_unknown_token_is_audited_without_token_identifier(self):
+        marker = "unknown-bearer-marker"
+        self.assert_code("INVALID_TOKEN", lambda: self.broker.verify_and_consume(marker, self.scope, run_id="r1"))
+        audit = self.broker.list_audit()[-1]
+        self.assertEqual(("DENY", "INVALID_TOKEN", None),
+                         (audit["outcome"], audit["error_code"], audit["grant_id"]))
+        self.assertNotIn(marker.encode(), self.path.read_bytes())
 
     def test_issue_exact_consume_and_no_raw_token(self):
         grant = self.issue(now_ms=1000)
@@ -63,6 +74,13 @@ class AuthBrokerTests(unittest.TestCase):
         self.assert_code("REVOKED", lambda: self.broker.verify_and_consume(grant.token, self.scope, run_id="r", now_ms=1002))
         expired = self.broker.issue(self.scope, ttl_seconds=1, created_by="main", now_ms=2000)
         self.assert_code("EXPIRED", lambda: self.broker.verify_and_consume(expired.token, self.scope, run_id="r", now_ms=3000))
+
+    def test_consumed_grant_is_terminal_and_cannot_be_revoked(self):
+        grant = self.issue(now_ms=1000)
+        self.broker.verify_and_consume(grant.token, self.scope, run_id="r", now_ms=1001)
+        self.assert_code("ALREADY_CONSUMED", lambda: self.broker.revoke(grant.grant_id, revoked_by="main", now_ms=1002))
+        self.assertEqual(("REVOKE", "DENY", "ALREADY_CONSUMED"),
+                         tuple(self.broker.list_audit()[-1][key] for key in ("event_type", "outcome", "error_code")))
 
     def test_tampered_token(self):
         grant = self.issue()
@@ -143,7 +161,42 @@ class AuthBrokerTests(unittest.TestCase):
                               self.scope.project_id, dict(reversed(list(self.scope.task_contract.items()))))
         self.assertEqual(canonical_task_digest(self.scope), canonical_task_digest(reordered))
         bad = AuthScope("a", "b", "c", "d", {"message": "secret body"})
-        with self.assertRaises(ValueError): canonical_task_digest(bad)
+        self.assert_code("FORBIDDEN_FIELD", lambda: canonical_task_digest(bad))
+
+    def test_forbidden_fields_are_rejected_recursively_before_database_write(self):
+        before = self.path.read_bytes()
+        for key in ("model", "provider", "endpoint", "credential", "token", "secret",
+                    "password", "api_key", "api-key", "apikey"):
+            with self.subTest(key=key):
+                scope = AuthScope("a", "b", "c", "d", {"outer": [{key: "marker"}]})
+                self.assert_code("FORBIDDEN_FIELD", lambda s=scope: self.broker.issue(
+                    s, ttl_seconds=1, created_by="main"))
+        self.assertEqual(before, self.path.read_bytes())
+
+    def test_actor_identity_is_hashed_and_raw_markers_are_absent(self):
+        creator = "creator-unique-marker"
+        revoker = "revoker-unique-marker"
+        grant = self.broker.issue(self.scope, ttl_seconds=60, created_by=creator)
+        self.broker.revoke(grant.grant_id, revoked_by=revoker)
+        raw = self.path.read_bytes()
+        self.assertNotIn(creator.encode(), raw)
+        self.assertNotIn(revoker.encode(), raw)
+        with sqlite3.connect(self.path) as db:
+            stored = db.execute("SELECT created_by FROM auth_grants WHERE grant_id=?", (grant.grant_id,)).fetchone()[0]
+        self.assertTrue(stored.startswith("id-v1:"))
+
+    def test_future_schema_is_rejected_before_any_schema_write(self):
+        path = Path(self.tmp.name) / "future.sqlite3"
+        with sqlite3.connect(path) as db:
+            db.execute("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at_ms INTEGER NOT NULL, checksum TEXT NOT NULL)")
+            db.execute("INSERT INTO schema_migrations VALUES(99,1,'future')")
+        with sqlite3.connect(path) as db:
+            before = tuple(db.execute("SELECT type,name,sql FROM sqlite_master ORDER BY type,name"))
+        self.assert_code("SCHEMA_UNSUPPORTED", lambda: SQLiteAuthBroker(path, self.keys, key_id="k1"))
+        with sqlite3.connect(path) as db:
+            after = tuple(db.execute("SELECT type,name,sql FROM sqlite_master ORDER BY type,name"))
+            self.assertEqual([(99, 1, "future")], db.execute("SELECT * FROM schema_migrations").fetchall())
+        self.assertEqual(before, after)
 
     def test_production_factory_is_fail_closed_and_sqlite_only(self):
         with patch.dict(os.environ, {}, clear=True):

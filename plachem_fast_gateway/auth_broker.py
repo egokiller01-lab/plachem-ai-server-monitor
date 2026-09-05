@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import sqlite3
 import time
@@ -23,10 +24,15 @@ ERROR_CODES = frozenset({
     "AUTH_REQUIRED", "INVALID_TOKEN", "NOT_FOUND", "EXPIRED", "REVOKED",
     "ALREADY_CONSUMED", "BINDING_MISMATCH", "TASK_DIGEST_MISMATCH", "CONFLICT",
     "STORE_BUSY", "STORE_CORRUPT", "AUDIT_INTEGRITY_FAILED", "SCHEMA_UNSUPPORTED",
+    "FORBIDDEN_FIELD",
 })
 _SCHEMA_VERSION = 1
-_SENSITIVE = frozenset({"token", "credential", "secret", "password", "message", "task"})
+_SENSITIVE = frozenset({
+    "model", "provider", "endpoint", "token", "credential", "credentials", "secret",
+    "password", "api_key", "apikey", "message", "task",
+})
 _DETAIL_KEYS = frozenset({"reason", "key_id", "schema_version"})
+_IDENTITY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,127}$")
 
 
 class AuthBrokerError(RuntimeError):
@@ -119,12 +125,19 @@ def _bound(value: str) -> str:
     return value.strip()
 
 
+def _identity_digest(value: str) -> str:
+    if not isinstance(value, str) or not _IDENTITY.fullmatch(value):
+        raise ValueError("INVALID_IDENTITY")
+    return "id-v1:" + hashlib.sha256(value.encode()).hexdigest()
+
+
 def _canonical_value(value: Any) -> Any:
     if isinstance(value, Mapping):
         result = {}
         for key, item in value.items():
-            if not isinstance(key, str) or key.lower() in _SENSITIVE:
-                raise ValueError("INVALID_TASK_CONTRACT")
+            normalized = key.lower().replace("-", "_") if isinstance(key, str) else ""
+            if not isinstance(key, str) or normalized in _SENSITIVE:
+                raise AuthBrokerError("FORBIDDEN_FIELD")
             result[key] = _canonical_value(item)
         return result
     if isinstance(value, (list, tuple)):
@@ -188,11 +201,19 @@ class SQLiteAuthBroker:
         checksum = hashlib.sha256(ddl.encode()).hexdigest()
         try:
             with self._connect() as db:
+                objects = db.execute("""SELECT name FROM sqlite_master
+                    WHERE name NOT LIKE 'sqlite_%' ORDER BY name""").fetchall()
+                names = {row["name"] for row in objects}
+                if names and "schema_migrations" not in names:
+                    raise AuthBrokerError("SCHEMA_UNSUPPORTED")
+                if "schema_migrations" in names:
+                    rows = db.execute("SELECT version,checksum FROM schema_migrations").fetchall()
+                    if any(row["version"] > _SCHEMA_VERSION for row in rows):
+                        raise AuthBrokerError("SCHEMA_UNSUPPORTED")
+                else:
+                    rows = []
                 db.execute("PRAGMA journal_mode=WAL")
                 db.executescript(ddl)
-                rows = db.execute("SELECT version,checksum FROM schema_migrations").fetchall()
-                if any(row["version"] > _SCHEMA_VERSION for row in rows):
-                    raise AuthBrokerError("SCHEMA_UNSUPPORTED")
                 row = next((r for r in rows if r["version"] == _SCHEMA_VERSION), None)
                 if row and row["checksum"] != checksum:
                     raise AuthBrokerError("SCHEMA_UNSUPPORTED")
@@ -220,7 +241,7 @@ class SQLiteAuthBroker:
                 db.execute("""INSERT INTO auth_grants VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
                     grant_id, token_id, mac, self.key_id, digest, _bound(scope.agent_id),
                     _bound(scope.action), _bound(scope.workspace_id), _bound(scope.project_id),
-                    now, expires, None, None, None, _bound(created_by),
+                    now, expires, None, None, None, _identity_digest(created_by),
                 ))
             except sqlite3.IntegrityError as exc:
                 raise AuthBrokerError("CONFLICT") from exc
@@ -230,7 +251,11 @@ class SQLiteAuthBroker:
 
     def verify_and_consume(self, token: str | None, scope: AuthScope, *, run_id: str,
                            now_ms: int | None = None) -> ConsumedGrant:
+        expected_digest = canonical_task_digest(scope)
         if not token:
+            with self._transaction() as db:
+                self._audit(db, None, "CONSUME", "DENY", "AUTH_REQUIRED", run_id,
+                            scope, expected_digest, {"reason": "AUTH_REQUIRED"})
             raise AuthBrokerError("AUTH_REQUIRED")
         now = _now_ms() if now_ms is None else now_ms
         token_id = hashlib.sha256(token.encode()).hexdigest()
@@ -239,12 +264,17 @@ class SQLiteAuthBroker:
         with self._transaction() as db:
             row = db.execute("SELECT * FROM auth_grants WHERE token_id=?", (token_id,)).fetchone()
             if row is None:
-                raise AuthBrokerError("INVALID_TOKEN")
-            if not hmac.compare_digest(bytes(row["token_mac"]), self._token_mac(token, row["key_id"])):
-                raise AuthBrokerError("INVALID_TOKEN")
-            expected_digest = canonical_task_digest(scope)
-            code = self._deny_reason(row, scope, expected_digest, now)
-            if code:
+                self._audit(db, None, "CONSUME", "DENY", "INVALID_TOKEN", run_id,
+                            scope, expected_digest, {"reason": "INVALID_TOKEN"})
+                denied = "INVALID_TOKEN"
+            elif not hmac.compare_digest(bytes(row["token_mac"]), self._token_mac(token, row["key_id"])):
+                self._audit(db, row["grant_id"], "CONSUME", "DENY", "INVALID_TOKEN", run_id,
+                            scope, expected_digest, {"reason": "INVALID_TOKEN"})
+                denied = "INVALID_TOKEN"
+            code = None if denied else self._deny_reason(row, scope, expected_digest, now)
+            if denied:
+                pass
+            elif code:
                 self._audit(db, row["grant_id"], "CONSUME", "DENY", code, run_id,
                             scope, expected_digest, {"reason": code})
                 denied = code
@@ -265,19 +295,28 @@ class SQLiteAuthBroker:
 
     def revoke(self, grant_id: str, *, revoked_by: str, now_ms: int | None = None) -> None:
         now = _now_ms() if now_ms is None else now_ms
+        denied = False
         with self._transaction() as db:
             row = db.execute("SELECT * FROM auth_grants WHERE grant_id=?", (_bound(grant_id),)).fetchone()
             if row is None:
                 raise AuthBrokerError("NOT_FOUND")
             if row["revoked_at_ms"] is not None:
                 raise AuthBrokerError("REVOKED")
-            changed = db.execute("UPDATE auth_grants SET revoked_at_ms=? WHERE grant_id=? AND revoked_at_ms IS NULL",
-                                 (now, grant_id)).rowcount
-            if changed != 1:
-                raise AuthBrokerError("CONFLICT")
             scope = AuthScope(row["agent_id"], row["action"], row["workspace_id"], row["project_id"], {})
-            self._audit(db, grant_id, "REVOKED", "ALLOW", None, None, scope,
-                        row["task_digest"], {"reason": _bound(revoked_by)})
+            if row["consumed_at_ms"] is not None:
+                self._audit(db, grant_id, "REVOKE", "DENY", "ALREADY_CONSUMED", None,
+                            scope, row["task_digest"], {"reason": "ALREADY_CONSUMED"})
+                denied = True
+            else:
+                changed = db.execute("""UPDATE auth_grants SET revoked_at_ms=?
+                    WHERE grant_id=? AND revoked_at_ms IS NULL AND consumed_at_ms IS NULL""",
+                    (now, grant_id)).rowcount
+                if changed != 1:
+                    raise AuthBrokerError("CONFLICT")
+                self._audit(db, grant_id, "REVOKED", "ALLOW", None, None, scope,
+                            row["task_digest"], {"reason": _identity_digest(revoked_by)})
+        if denied:
+            raise AuthBrokerError("ALREADY_CONSUMED")
 
     def verify_audit(self) -> None:
         try:
@@ -321,7 +360,7 @@ class SQLiteAuthBroker:
     def _transaction(self):
         return _ImmediateTransaction(self, self.busy_retries, self.busy_delay)
 
-    def _audit(self, db: sqlite3.Connection, grant_id: str, event_type: str, outcome: str,
+    def _audit(self, db: sqlite3.Connection, grant_id: str | None, event_type: str, outcome: str,
                error: str | None, run_id: str | None, scope: AuthScope, digest: str,
                details: Mapping[str, Any]) -> None:
         if set(details) - _DETAIL_KEYS:
