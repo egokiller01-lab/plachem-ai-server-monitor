@@ -33,6 +33,18 @@ class RuntimeModelProfile:
     context_policy: str
     fallback_policy: str
     max_context_resets: int
+    execution_budget: float | None = None
+    finalization_recovery_budget: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.execution_budget is None and self.finalization_recovery_budget is None:
+            if self.runtime_class is RuntimeClass.LOCAL:
+                recovery = float(self.max_runtime) / 5.0
+                object.__setattr__(self, "execution_budget", float(self.max_runtime) - recovery)
+                object.__setattr__(self, "finalization_recovery_budget", recovery)
+            else:
+                object.__setattr__(self, "execution_budget", float(self.max_runtime))
+                object.__setattr__(self, "finalization_recovery_budget", 0.0)
 
 
 _CONTEXT_POLICIES = {"REUSE", "FRESH_ON_RETRY", "FRESH_ON_LOOP", "MANUAL"}
@@ -178,6 +190,8 @@ class ModelRegistry:
             if not isinstance(profile_name, str) or not profile_name:
                 raise ValueError(f"INVALID_POLICY_PROFILE:{model_id}")
             max_runtime = value.get("max_runtime")
+            execution_budget = value.get("execution_budget")
+            finalization_recovery_budget = value.get("finalization_recovery_budget")
             max_retries = value.get("max_retries")
             max_tool_calls = value.get("max_tool_calls")
             loop_guard = value.get("loop_guard")
@@ -186,6 +200,26 @@ class ModelRegistry:
             max_context_resets = value.get("max_context_resets", 1)
             if isinstance(max_runtime, bool) or not isinstance(max_runtime, (int, float)) or max_runtime <= 0:
                 raise ValueError(f"INVALID_MAX_RUNTIME:{model_id}")
+            if runtime_class is RuntimeClass.LOCAL:
+                if (
+                    isinstance(execution_budget, bool)
+                    or not isinstance(execution_budget, (int, float))
+                    or execution_budget <= 0
+                ):
+                    raise ValueError(f"INVALID_EXECUTION_BUDGET:{model_id}")
+                if (
+                    isinstance(finalization_recovery_budget, bool)
+                    or not isinstance(finalization_recovery_budget, (int, float))
+                    or finalization_recovery_budget <= 0
+                ):
+                    raise ValueError(f"INVALID_FINALIZATION_RECOVERY_BUDGET:{model_id}")
+                if abs(float(execution_budget) + float(finalization_recovery_budget) - float(max_runtime)) > 1e-9:
+                    raise ValueError(f"INVALID_RUNTIME_BUDGET_SUM:{model_id}")
+            else:
+                if execution_budget is not None or finalization_recovery_budget is not None:
+                    raise ValueError(f"CLOUD_RUNTIME_BUDGET_OVERRIDE_FORBIDDEN:{model_id}")
+                execution_budget = max_runtime
+                finalization_recovery_budget = 0.0
             if isinstance(max_retries, bool) or not isinstance(max_retries, int) or max_retries < 0:
                 raise ValueError(f"INVALID_MAX_RETRIES:{model_id}")
             if max_tool_calls is not None and (
@@ -208,6 +242,8 @@ class ModelRegistry:
                 runtime_class=runtime_class,
                 policy_profile=profile_name,
                 max_runtime=float(max_runtime),
+                execution_budget=float(execution_budget),
+                finalization_recovery_budget=float(finalization_recovery_budget),
                 max_retries=max_retries,
                 max_tool_calls=max_tool_calls,
                 loop_guard=dict(loop_guard),

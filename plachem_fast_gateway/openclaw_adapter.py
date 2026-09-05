@@ -1076,7 +1076,6 @@ class OpenClawAdapter:
             "agent.wait",
             {"runId": binding.openclaw_run_id, "timeoutMs": max(1, int(timeout_seconds * 1000))},
             timeout=timeout_seconds + 5.0,
-            event_handler=lambda frame: self._observe_agent_event(binding, frame),
         )
         observed = str(response.get("status") or "")
         response_run_id = response.get("runId")
