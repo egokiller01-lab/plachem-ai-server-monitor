@@ -39,7 +39,7 @@ from .runtime_policy import (
     neutral_runtime_profile,
 )
 from .loop_detector import RunScope, RunScopedLoopDetector
-from .auth_broker import AuthBrokerError, AuthScope, SQLiteAuthBroker
+from .auth_broker import AuthBrokerError, SQLiteAuthBroker, execution_auth_scope
 
 
 _TERMINAL = {
@@ -117,16 +117,16 @@ class AgentRegistry:
                 raise ValueError(f"INVALID_AGENT_ENABLED:{agent_id}")
             if not isinstance(capabilities, list) or not all(isinstance(item, str) and item for item in capabilities):
                 raise ValueError(f"INVALID_AGENT_CAPABILITIES:{agent_id}")
-            if not isinstance(runtime_model_id, str) or not runtime_model_id:
-                raise ValueError(f"INVALID_RUNTIME_MODEL:{agent_id}")
-            if not isinstance(allowed_model_ids, list) or not all(
-                isinstance(item, str) and item for item in allowed_model_ids
-            ):
-                raise ValueError(f"INVALID_ALLOWED_MODELS:{agent_id}")
-            if not isinstance(allowed_policy_profiles, list) or not all(
-                isinstance(item, str) and item for item in allowed_policy_profiles
-            ):
-                raise ValueError(f"INVALID_ALLOWED_PROFILES:{agent_id}")
+            # Retain well-formed historical metadata for descriptive callers,
+            # but never make it an admission requirement. OpenClaw owns the
+            # agent's current model/provider configuration.
+            runtime_model_id = runtime_model_id if isinstance(runtime_model_id, str) else ""
+            allowed_model_ids = [
+                item for item in allowed_model_ids if isinstance(item, str) and item
+            ] if isinstance(allowed_model_ids, list) else []
+            allowed_policy_profiles = [
+                item for item in allowed_policy_profiles if isinstance(item, str) and item
+            ] if isinstance(allowed_policy_profiles, list) else []
             registrations[agent_id] = AgentRegistration(
                 agent_id,
                 enabled,
@@ -597,6 +597,8 @@ class CoreEngine:
         loop_detector: RunScopedLoopDetector | None = None,
         clock: Callable[[], datetime] = _utcnow,
         auth_broker: SQLiteAuthBroker | None = None,
+        auth_required: bool = False,
+        grant_authorizer: Any | None = None,
     ) -> None:
         self.registry = registry
         self.agents = agents
@@ -607,6 +609,8 @@ class CoreEngine:
         self.loop_detector = loop_detector or RunScopedLoopDetector()
         self._clock = clock
         self.auth_broker = auth_broker
+        self.auth_required = auth_required
+        self.grant_authorizer = grant_authorizer
         self._lock = threading.RLock()
         self._deadline_timers: dict[str, threading.Timer] = {}
         self._terminal_transition_guard: Callable[[str], bool] | None = None
@@ -701,18 +705,33 @@ class CoreEngine:
             )
             if not created and record["status"] != CoreRunStatus.QUEUED.value:
                 return record
+            if self.auth_required and self.auth_broker is None:
+                return self.registry.transition(actual_id, CoreRunStatus.BLOCKED, reason="AUTH_BROKER_UNAVAILABLE")
             if self.auth_broker is not None:
-                scope = AuthScope(agent_id=agent_id, action=action, workspace_id=workspace_id,
-                                  project_id=project_id, task_contract=contract.as_dict())
+                scope = execution_auth_scope(
+                    agent_id=agent_id, message=message, core_run_id=actual_id,
+                    idempotency_key=key, goal_contract=contract.as_dict(),
+                    action=action, workspace_id=workspace_id, project_id=project_id,
+                )
                 try:
-                    self.auth_broker.verify_and_consume(auth_token, scope, run_id=actual_id)
+                    if (auth_token is not None and self.grant_authorizer is not None
+                            and self.grant_authorizer.owns_run(actual_id)):
+                        raise AuthBrokerError("FORBIDDEN_FIELD")
+                    if auth_token is None and self.grant_authorizer is not None:
+                        # Server-side approval resolver only; never a request
+                        # field. Its transaction spans issue and consumption.
+                        with self.grant_authorizer.authorize(self.auth_broker, scope) as authorized:
+                            grant_scope, token = authorized
+                            if (grant_scope.agent_id != scope.agent_id or grant_scope.action != scope.action
+                                    or grant_scope.task_contract != scope.task_contract):
+                                raise AuthBrokerError("BINDING_MISMATCH")
+                            self.auth_broker.verify_and_consume(token, grant_scope, run_id=actual_id)
+                    else:
+                        self.auth_broker.verify_and_consume(auth_token, scope, run_id=actual_id)
                 except AuthBrokerError as exc:
                     return self.registry.transition(actual_id, CoreRunStatus.BLOCKED, reason=f"AUTH_{exc.code}")
-            # A broker is an explicit production boundary dependency.  An
-            # injected engine (unit tests and callers supplying their own
-            # transport) deliberately has no broker and is therefore allowed
-            # to exercise the core state machine.  The HTTP production API
-            # remains fail-closed before it composes/dispatches this engine.
+            # Production factories require authorization even when called
+            # outside HTTP. Bare CoreEngine remains an explicit test seam.
             try:
                 submit_payload = {
                     "message": message,
@@ -800,6 +819,11 @@ class CoreEngine:
             source = self._require(core_run_id)
             if CoreRunStatus(source["status"]) in _TERMINAL:
                 raise ValueError("SOURCE_RUN_TERMINAL")
+            if self.auth_required or self.auth_broker is not None:
+                # A consumed dispatch grant does not authorize a new run.
+                # Preserve the parent until an explicit child-grant contract
+                # is implemented; never cancel first and discover this later.
+                raise ValueError("AUTH_REAUTHORIZATION_REQUIRED")
             profile = self._profile_for_record(source)
             if profile.context_policy not in {"FRESH_ON_LOOP", "FRESH_ON_RETRY"}:
                 raise ValueError("FRESH_CONTEXT_NOT_ALLOWED")
@@ -1251,12 +1275,14 @@ class CoreEngine:
         }
 
     def _profile_for_record(self, record: Mapping[str, Any]) -> RuntimeModelProfile:
-        model_id = record.get("model_profile")
-        if isinstance(model_id, str):
-            try:
-                return self.models.require(model_id)
-            except (KeyError, ValueError):
-                pass
+        """Use the same server policy as admission throughout the lifecycle.
+
+        Recorded model metadata is not policy authority, including legacy run
+        records and a model registry entry named ``__neutral__``. Looking it
+        up here could change a live run's retry/deadline/recovery behavior.
+        Keep the existing server profile and dispatch-based time accounting;
+        do not reset budgets or rewrite historical records on observation.
+        """
         return self._neutral_profile
 
     def _runtime_seconds(self, record: Mapping[str, Any]) -> float:

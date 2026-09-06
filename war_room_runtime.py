@@ -15,7 +15,7 @@ from typing import Any
 from war_room_adapter import OpenClawSessionAdapter, SessionAdapter
 from war_room_worker import process_due_deliveries, recover_received_deliveries, request_project_stop
 import war_room
-from fast_gateway_service import create_core_engine
+from fast_gateway_service import get_persistent_harness
 from war_room_fast_gateway import FastGatewayWarRoomAdapter
 
 
@@ -69,7 +69,9 @@ class WarRoomRuntime:
         if execution_mode != "FAST_GATEWAY":
             return self.adapter
         if self._fast_adapter is None:
-            self._fast_adapter = FastGatewayWarRoomAdapter(create_core_engine(), db_path)
+            # Delivery and Phase 2 must share the observer and Gateway owner.
+            # Adapter.poll() is a projection and does not collect completion.
+            self._fast_adapter = FastGatewayWarRoomAdapter(get_persistent_harness().engine, db_path)
         return self._fast_adapter
 
     def stop_project(self, *, db_path: str | Path, project_id: str, actor_id: str, now: int | None = None) -> dict[str, Any]:
@@ -97,9 +99,9 @@ class WarRoomRuntime:
         closer = getattr(self.adapter, "close", None)
         if closer:
             closer()
-        if self._fast_adapter is not None:
-            self._fast_adapter.control_rpc.close()
-            self._fast_adapter.engine.adapter.close()
+        # The application owns shared Harness shutdown. Closing this worker
+        # must not disconnect a Phase 2 execution using the same owner.
+        self._fast_adapter = None
 
 
 _RUNTIME: WarRoomRuntime | None = None

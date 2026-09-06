@@ -20,6 +20,10 @@ class FastGatewayWarRoomAdapter:
         self.control_rpc = control_rpc or GatewayControlRPC(owner_rpc)
         self._stop_lock = threading.Lock()
 
+    @property
+    def reserves_call_budget(self) -> bool:
+        return getattr(self.engine, "auth_required", False) is True
+
     @staticmethod
     def core_id(delivery_id: str) -> str:
         return f"war-{delivery_id}"

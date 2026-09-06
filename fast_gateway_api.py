@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import hmac
-import json
 import os
-from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +12,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from plachem_fast_gateway import CoreEngine
 from plachem_fast_gateway.core_engine import RunRegistry
-from plachem_fast_gateway.production_runtime import create_ubuntu_core_engine
+from plachem_fast_gateway.auth_broker import AuthBrokerError
+from fast_gateway_service import get_persistent_harness
 
 
 ROOT = Path(__file__).resolve().parent
@@ -51,10 +50,6 @@ class WaitRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     timeout_seconds: float = Field(gt=0, le=3600)
-
-
-def _core_db_path() -> Path:
-    return Path(os.environ.get("PLACHEM_FAST_GATEWAY_CORE_DB", ROOT / "runtime" / "fast-gateway-core.sqlite3"))
 
 
 def _present(record: dict[str, Any]) -> dict[str, Any]:
@@ -106,37 +101,25 @@ def _require_write(secret: str | None) -> None:
         raise HTTPException(status_code=401, detail="AUTHENTICATION_REQUIRED")
 
 
-@lru_cache(maxsize=1)
 def _engine() -> CoreEngine:
-    return create_ubuntu_core_engine(
-        core_db_path=_core_db_path(),
-        agents_path=Path(os.environ.get(
-            "PLACHEM_FAST_GATEWAY_AGENTS", ROOT / "plachem_fast_gateway" / "agents.json",
-        )),
-        models_path=Path(os.environ.get(
-            "PLACHEM_FAST_GATEWAY_MODELS", ROOT / "plachem_fast_gateway" / "models.json",
-        )),
-        bindings_path=Path(os.environ.get(
-            "PLACHEM_FAST_GATEWAY_BINDINGS", ROOT / "runtime" / "fast-gateway-bindings.sqlite3",
-        )),
-    )
+    # Dispatch, observation, cancellation and projection use the same JSONL
+    # registry and owner as War Room. Never create a second lifecycle owner.
+    legacy_path = os.environ.get("PLACHEM_FAST_GATEWAY_CORE_DB")
+    if legacy_path and Path(legacy_path).resolve() != _run_path().resolve():
+        raise ValueError("LEGACY_RUN_STORE_CONFIG_REQUIRES_REVIEW")
+    try:
+        return get_persistent_harness().engine
+    except AuthBrokerError as exc:
+        raise HTTPException(status_code=503, detail="AUTH_BROKER_UNAVAILABLE") from exc
 
 
 @router.get("/runs")
 def recent_runs(limit: int = 50) -> dict[str, Any]:
-    # Keep the historical run-file seam for callers/tests while production
-    # uses the durable SQLite projection.
-    path = _run_path()
-    if path.exists() and path.suffix == ".jsonl":
-        rows = []
-        for line in path.read_text(encoding="utf-8").splitlines()[-limit:]:
-            try:
-                rows.append(json.loads(line))
-            except ValueError:
-                continue
-        return {"runs": [_present(item) for item in reversed(rows)]}
     registry = RunRegistry(_run_path())
-    return {"runs": [_present(item) for item in registry.recent(limit)]}
+    try:
+        return {"runs": [_present(item) for item in registry.recent(limit)]}
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc).split(":", 1)[0]) from exc
 
 
 @router.get("/runs/{core_run_id}")

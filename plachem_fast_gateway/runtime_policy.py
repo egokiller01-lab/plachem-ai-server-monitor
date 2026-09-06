@@ -1,4 +1,8 @@
-"""Fail-closed runtime-model policy resolution and deterministic loop guards."""
+"""Server-owned lifecycle policy and deterministic guards.
+
+The legacy ModelRegistry helpers remain available for historical/reference
+callers; production Gateway composition does not load or resolve that registry.
+"""
 
 from __future__ import annotations
 
@@ -48,7 +52,11 @@ class RuntimeModelProfile:
 
 
 def neutral_runtime_profile() -> RuntimeModelProfile:
-    """Model-independent lifecycle policy used by Gateway admission."""
+    """Model-independent server policy for admission and subsequent handling.
+
+    LOCAL and LOCAL_LLM reason labels are retained for existing consumers;
+    they do not identify or select the actual OpenClaw model/provider.
+    """
     return RuntimeModelProfile(
         model_id="__neutral__", runtime_class=RuntimeClass.LOCAL,
         policy_profile="NEUTRAL", max_runtime=300.0, max_retries=1,

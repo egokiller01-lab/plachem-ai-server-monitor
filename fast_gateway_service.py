@@ -18,6 +18,7 @@ from plachem_fast_gateway import (
     production_result_validator,
     recover_production_result_format,
 )
+from plachem_fast_gateway.auth_broker import create_production_auth_broker
 
 ROOT = Path(__file__).resolve().parent
 
@@ -216,6 +217,14 @@ _HARNESSES: dict[tuple[str, str], PersistentExecutionHarness] = {}
 _HARNESSES_LOCK = threading.RLock()
 
 
+def close_persistent_harnesses() -> None:
+    """Release shared Gateway owners when the application shuts down."""
+    with _HARNESSES_LOCK:
+        harnesses = list(_HARNESSES.values())
+    for harness in harnesses:
+        harness.close()
+
+
 def create_core_engine(*, run_path: str | Path | None = None,
                        bindings_path: str | Path | None = None,
                        agents_path: str | Path | None = None,
@@ -225,9 +234,10 @@ def create_core_engine(*, run_path: str | Path | None = None,
     run_file = Path(run_path or os.environ.get("PLACHEM_FAST_GATEWAY_RUNS", ROOT / "runtime" / "fast-gateway-runs.jsonl"))
     binding_file = Path(bindings_path or os.environ.get("PLACHEM_FAST_GATEWAY_BINDINGS", ROOT / "runtime" / "fast-gateway-bindings.sqlite3"))
     agent_file = Path(agents_path or os.environ.get("PLACHEM_FAST_GATEWAY_AGENTS", ROOT / "plachem_fast_gateway" / "agents.json"))
-    model_file = Path(models_path or os.environ.get("PLACHEM_FAST_GATEWAY_MODELS", ROOT / "plachem_fast_gateway" / "models.json"))
     agent_registry = AgentRegistry.load(agent_file)
-    model_registry = ModelRegistry.load(model_file)
+    # models_path remains accepted for call compatibility. Model metadata is
+    # not a startup dependency or an execution policy source for this service.
+    model_registry = ModelRegistry({})
     # Recovery eligibility is an explicit service-level capability, not a
     # consequence of an Agent's descriptive runtime_model_id.  Keep the
     # configured candidate set neutral; the adapter's validator still gates
@@ -239,7 +249,16 @@ def create_core_engine(*, run_path: str | Path | None = None,
         result_recovery=recover_production_result_format,
         result_recovery_agent_ids=local_recovery_agents,
     )
-    return CoreEngine(RunRegistry(run_file), agent_registry, model_registry, gateway_adapter)
+    from war_room_authorization import WarRoomGrantAuthorizer
+    import war_room
+    broker = (create_production_auth_broker()
+              if os.environ.get("PLACHEM_AUTH_BROKER_DB") and os.environ.get("PLACHEM_AUTH_BROKER_KEY_ID")
+              else None)
+    return CoreEngine(
+        RunRegistry(run_file), agent_registry, model_registry, gateway_adapter,
+        auth_broker=broker, auth_required=True,
+        grant_authorizer=WarRoomGrantAuthorizer(war_room._db_path()),
+    )
 
 
 def get_persistent_harness(*, run_path: str | Path | None = None,

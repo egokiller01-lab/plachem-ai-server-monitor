@@ -84,6 +84,22 @@ class AuthScope:
     task_contract: Mapping[str, Any]
 
 
+def execution_auth_scope(*, agent_id: str, message: str, core_run_id: str,
+                         idempotency_key: str, goal_contract: Mapping[str, Any],
+                         action: str = "dispatch", workspace_id: str = "command-center",
+                         project_id: str = "fast-gateway") -> AuthScope:
+    """Bind a grant to one exact instruction/run without storing its plaintext.
+
+    The normalized goal comes from Core. Model/provider data are not inputs.
+    Legacy goal-only grants cannot authorize this execution contract.
+    """
+    return AuthScope(agent_id, action, workspace_id, project_id, {
+        "authorization_version": 2, "goal_contract": dict(goal_contract),
+        "instruction_sha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+        "core_run_id": core_run_id, "idempotency_key": idempotency_key,
+    })
+
+
 @dataclass(frozen=True)
 class IssuedGrant:
     grant_id: str

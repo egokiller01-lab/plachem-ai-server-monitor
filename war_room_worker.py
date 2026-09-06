@@ -244,7 +244,10 @@ def process_due_deliveries(*, db_path: str | Path, adapter: SessionAdapter, adap
                 _persist_execution(con, snapshot=snapshotter(row["id"]), project_id=row["project_id"], task_id=row["task_id"], agent_id=row["agent_id"], now=current)
             task = con.execute("SELECT id FROM war_tasks WHERE source_message_id=?", (row["message_id"],)).fetchone()
             if task:
-                con.execute("INSERT INTO war_task_calls(task_id,call_count,turn_count,updated_at) VALUES (?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET call_count=call_count+1,turn_count=turn_count+?,updated_at=?", (task["id"],1,1 if status=="responded" else 0,current,1 if status=="responded" else 0,current))
+                # Production Fast Gateway reserves admission in the approval
+                # transaction. Do not charge again on receipt/replay/failure.
+                call_delta = 0 if getattr(active_adapter, "reserves_call_budget", False) is True else 1
+                con.execute("INSERT INTO war_task_calls(task_id,call_count,turn_count,updated_at) VALUES (?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET call_count=call_count+?,turn_count=turn_count+?,updated_at=?", (task["id"],call_delta,1 if status=="responded" else 0,current,call_delta,1 if status=="responded" else 0,current))
                 if status == "responded":
                     pending = con.execute("SELECT COUNT(*) FROM war_deliveries WHERE message_id=? AND status!='responded'", (row["message_id"],)).fetchone()[0]
                     if pending == 0:

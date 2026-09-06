@@ -14,15 +14,18 @@ from .auth_broker import create_production_auth_broker
 
 def create_ubuntu_core_engine(
     *, core_db_path: str | Path | None = None, runs_path: str | Path | None = None, agents_path: str | Path,
-    models_path: str | Path, bindings_path: str | Path,
+    models_path: str | Path | None = None, bindings_path: str | Path,
 ) -> CoreEngine:
-    """Compose policy registries with the fixed Ubuntu OpenClaw transport."""
+    """Compose agent admission with the fixed Ubuntu OpenClaw transport.
+
+    models_path is retained for compatibility, but model configuration belongs
+    to OpenClaw and cannot be a prerequisite for this composition root.
+    """
 
     database = Path(runs_path or core_db_path or "runtime/fast-gateway-runs.jsonl")
     transport = create_ubuntu_worker_transport(bindings_path)
-    # Composition remains usable for read-only/local store tests without
-    # credentials.  The HTTP dispatch route is the production deny-by-default
-    # boundary and rejects requests before invoking this engine.
+    # Read-only composition is possible without credentials, but Core itself
+    # must deny dispatch without the broker, including non-HTTP callers.
     auth_broker = (
         create_production_auth_broker()
         if os.environ.get("PLACHEM_AUTH_BROKER_DB") and os.environ.get("PLACHEM_AUTH_BROKER_KEY_ID")
@@ -31,7 +34,8 @@ def create_ubuntu_core_engine(
     return CoreEngine(
         RunRegistry(database),
         AgentRegistry.load(agents_path),
-        ModelRegistry.load(models_path),
+        ModelRegistry({}),
         transport,
         auth_broker=auth_broker,
+        auth_required=True,
     )

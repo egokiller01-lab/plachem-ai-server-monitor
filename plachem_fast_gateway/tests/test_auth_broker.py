@@ -5,6 +5,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
@@ -164,14 +165,21 @@ class AuthBrokerTests(unittest.TestCase):
         self.assert_code("FORBIDDEN_FIELD", lambda: canonical_task_digest(bad))
 
     def test_forbidden_fields_are_rejected_recursively_before_database_write(self):
-        before = self.path.read_bytes()
-        for key in ("model", "provider", "endpoint", "credential", "token", "secret",
-                    "password", "api_key", "api-key", "apikey"):
-            with self.subTest(key=key):
-                scope = AuthScope("a", "b", "c", "d", {"outer": [{key: "marker"}]})
-                self.assert_code("FORBIDDEN_FIELD", lambda s=scope: self.broker.issue(
-                    s, ttl_seconds=1, created_by="main"))
-        self.assertEqual(before, self.path.read_bytes())
+        # WAL checkpointing can change the main file's bytes when an older
+        # connection is collected, even if these rejected requests write
+        # nothing. Check database contents and access, not storage layout.
+        with closing(sqlite3.connect(self.path)) as db:
+            before = tuple(db.iterdump())
+        with patch.object(self.broker, "_connect", wraps=self.broker._connect) as connect:
+            for key in ("model", "provider", "endpoint", "credential", "token", "secret",
+                        "password", "api_key", "api-key", "apikey"):
+                with self.subTest(key=key):
+                    scope = AuthScope("a", "b", "c", "d", {"outer": [{key: "marker"}]})
+                    self.assert_code("FORBIDDEN_FIELD", lambda s=scope: self.broker.issue(
+                        s, ttl_seconds=1, created_by="main"))
+            connect.assert_not_called()
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(before, tuple(db.iterdump()))
 
     def test_actor_identity_is_hashed_and_raw_markers_are_absent(self):
         creator = "creator-unique-marker"

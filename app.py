@@ -47,9 +47,14 @@ def provision_war_room_on_startup() -> None:
 
 @app.on_event("shutdown")
 def stop_war_room_runtime() -> None:
-    if os.environ.get("PLACHEM_WAR_ROOM_REAL_ADAPTER") == "1" and os.environ.get("PLACHEM_WAR_ROOM_TEST_ADAPTER") != "1":
-        from war_room_runtime import get_runtime
-        get_runtime().close()
+    from fast_gateway_service import close_persistent_harnesses
+    try:
+        if os.environ.get("PLACHEM_WAR_ROOM_REAL_ADAPTER") == "1" and os.environ.get("PLACHEM_WAR_ROOM_TEST_ADAPTER") != "1":
+            from war_room_runtime import get_runtime
+            get_runtime().close()
+    finally:
+        # Phase 2 can own a Harness even when the delivery worker is disabled.
+        close_persistent_harnesses()
 
 
 def _war_room_principal(request: Request) -> str | None:
