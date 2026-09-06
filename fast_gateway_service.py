@@ -228,11 +228,11 @@ def create_core_engine(*, run_path: str | Path | None = None,
     model_file = Path(models_path or os.environ.get("PLACHEM_FAST_GATEWAY_MODELS", ROOT / "plachem_fast_gateway" / "models.json"))
     agent_registry = AgentRegistry.load(agent_file)
     model_registry = ModelRegistry.load(model_file)
-    local_recovery_agents = {
-        agent_id
-        for agent_id in agent_registry.candidate_agent_ids()
-        if model_registry.resolve(agent_registry.require(agent_id)).runtime_class.value == "LOCAL"
-    }
+    # Recovery eligibility is an explicit service-level capability, not a
+    # consequence of an Agent's descriptive runtime_model_id.  Keep the
+    # configured candidate set neutral; the adapter's validator still gates
+    # whether a recovery result is accepted.
+    local_recovery_agents = set(agent_registry.candidate_agent_ids())
     gateway_adapter = adapter or OpenClawAdapter(
         EnvironmentSecretRef(), SQLiteRunBindingStore(binding_file),
         result_validator=production_result_validator(),

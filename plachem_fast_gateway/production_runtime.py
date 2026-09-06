@@ -6,7 +6,7 @@ from pathlib import Path
 import os
 
 from .core_engine import AgentRegistry, CoreEngine
-from .durable_core_store import DurableCoreStore
+from .core_engine import RunRegistry
 from .runtime_policy import ModelRegistry
 from .ubuntu_transport import create_ubuntu_worker_transport
 from .auth_broker import create_production_auth_broker
@@ -18,7 +18,7 @@ def create_ubuntu_core_engine(
 ) -> CoreEngine:
     """Compose policy registries with the fixed Ubuntu OpenClaw transport."""
 
-    database = Path(core_db_path or runs_path or "runtime/fast-gateway-core.sqlite3")
+    database = Path(runs_path or core_db_path or "runtime/fast-gateway-runs.jsonl")
     transport = create_ubuntu_worker_transport(bindings_path)
     # Composition remains usable for read-only/local store tests without
     # credentials.  The HTTP dispatch route is the production deny-by-default
@@ -29,7 +29,7 @@ def create_ubuntu_core_engine(
         else None
     )
     return CoreEngine(
-        DurableCoreStore(database),
+        RunRegistry(database),
         AgentRegistry.load(agents_path),
         ModelRegistry.load(models_path),
         transport,

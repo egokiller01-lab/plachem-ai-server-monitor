@@ -47,6 +47,17 @@ class RuntimeModelProfile:
                 object.__setattr__(self, "finalization_recovery_budget", 0.0)
 
 
+def neutral_runtime_profile() -> RuntimeModelProfile:
+    """Model-independent lifecycle policy used by Gateway admission."""
+    return RuntimeModelProfile(
+        model_id="__neutral__", runtime_class=RuntimeClass.LOCAL,
+        policy_profile="NEUTRAL", max_runtime=300.0, max_retries=1,
+        max_tool_calls=20, loop_guard={"consecutive_threshold": 3},
+        context_policy="FRESH_ON_LOOP", fallback_policy="MANUAL", max_context_resets=1,
+        execution_budget=240.0, finalization_recovery_budget=60.0,
+    )
+
+
 _CONTEXT_POLICIES = {"REUSE", "FRESH_ON_RETRY", "FRESH_ON_LOOP", "MANUAL"}
 _FALLBACK_POLICIES = {"NONE", "MANUAL", "ELIGIBLE"}
 _SENSITIVE_KEYS = {

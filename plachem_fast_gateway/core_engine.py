@@ -36,6 +36,7 @@ from .runtime_policy import (
     RuntimePolicyEngine,
     normalize_goal_contract,
     normalize_progress_checkpoint,
+    neutral_runtime_profile,
 )
 from .loop_detector import RunScope, RunScopedLoopDetector
 from .auth_broker import AuthBrokerError, AuthScope, SQLiteAuthBroker
@@ -597,6 +598,7 @@ class CoreEngine:
         self.registry = registry
         self.agents = agents
         self.models = models
+        self._neutral_profile = neutral_runtime_profile()
         self.adapter = adapter
         self.policy_engine = policy_engine or RuntimePolicyEngine()
         self.loop_detector = loop_detector or RunScopedLoopDetector()
@@ -677,32 +679,11 @@ class CoreEngine:
             actual_id = core_run_id or f"core-{uuid.uuid4().hex}"
             key = idempotency_key or actual_id
             contract = normalize_goal_contract(goal_contract)
-            try:
-                profile = self.models.resolve(registration)
-                policy = self._policy_metadata(profile)
-                effective_timeout = (
-                    profile.max_runtime
-                    if profile.runtime_class is RuntimeClass.LOCAL
-                    else float(timeout_seconds)
-                )
-                resolution_error = ""
-            except PolicyResolutionError:
-                # Agent model metadata is descriptive routing data, not an
-                # admission gate.  Keep the engine runnable for legacy or
-                # partially migrated registrations using the neutral cloud
-                # envelope; OpenClaw still receives only agentId.
-                profile = next(iter(self.models._models.values()), None)
-                if profile is None:
-                    raise ValueError("RUNTIME_POLICY_UNAVAILABLE")
-                effective_timeout = float(timeout_seconds)
-                policy = {
-                    "runtime_class": RuntimeClass.UNKNOWN.value,
-                    "model_profile": registration.runtime_model_id,
-                    "policy_profile": "UNKNOWN",
-                    "context_policy": "MANUAL",
-                    "fallback_policy": "NONE",
-                }
-                resolution_error = "MODEL_PROFILE_MISMATCH"
+            # Agent model metadata is descriptive routing data only.  Gateway
+            # lifecycle policy is deliberately a single neutral profile.
+            profile = self._neutral_profile
+            policy = self._policy_metadata(profile)
+            effective_timeout = float(timeout_seconds)
             digest = _request_hash(agent_id, message, effective_timeout, contract.goal_id,
                                    action, workspace_id, project_id)
             record, created = self.registry.create(
@@ -957,6 +938,10 @@ class CoreEngine:
                     return self._cancel_for_policy(core_run_id, profile, "RUNTIME_LIMIT")
                 if outcome.status != CoreRunStatus.TIMEOUT:
                     break
+                if profile.runtime_class is not RuntimeClass.LOCAL:
+                    # A caller-bounded cloud poll is observational only.  It
+                    # must not terminate the underlying run.
+                    return self._require(core_run_id)
                 if profile.runtime_class is not RuntimeClass.LOCAL or outcome.reason != "OPENCLAW_TIMEOUT":
                     break
                 # A LOCAL agent.wait window is not the run deadline. Continue
@@ -1264,12 +1249,12 @@ class CoreEngine:
 
     def _profile_for_record(self, record: Mapping[str, Any]) -> RuntimeModelProfile:
         model_id = record.get("model_profile")
-        if not isinstance(model_id, str):
-            raise ValueError("MODEL_PROFILE_MISMATCH")
-        profile = self.models.require(model_id)
-        if profile.policy_profile != record.get("policy_profile"):
-            raise ValueError("MODEL_PROFILE_MISMATCH")
-        return profile
+        if isinstance(model_id, str):
+            try:
+                return self.models.require(model_id)
+            except (KeyError, ValueError):
+                pass
+        return self._neutral_profile
 
     def _runtime_seconds(self, record: Mapping[str, Any]) -> float:
         started_at = record.get("started_at")
@@ -1348,18 +1333,7 @@ class CoreEngine:
             if record is None or CoreRunStatus(record["status"]) in _TERMINAL:
                 self._clear_runtime_deadline(core_run_id)
                 return
-            try:
-                profile = self._profile_for_record(record)
-            except ValueError:
-                self.registry.update_policy(
-                    core_run_id,
-                    event_code="MODEL_PROFILE_MISMATCH",
-                    cancel_reason="MODEL_PROFILE_MISMATCH",
-                    policy_status="BLOCKED",
-                )
-                self._clear_runtime_deadline(core_run_id)
-                self.registry.transition(core_run_id, CoreRunStatus.BLOCKED, reason="MODEL_PROFILE_MISMATCH")
-                return
+            profile = self._profile_for_record(record)
             if profile.runtime_class is RuntimeClass.LOCAL:
                 self.registry.update_policy(core_run_id, runtime_seconds=profile.execution_budget)
                 self._finalize_local_execution(core_run_id, profile)

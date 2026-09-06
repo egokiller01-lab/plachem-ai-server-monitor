@@ -71,7 +71,7 @@ class NegotiatingSocket:
         scope = request["params"]["scopes"][0]
         return __import__("json").dumps({
             "type": "res", "id": request["id"], "ok": True,
-            "payload": {"type": "hello-ok", "auth": {"role": "operator", "scopes": [scope]}, "features": {"methods": ["agent"]}},
+            "payload": {"type": "hello-ok", "auth": {"role": "operator", "scopes": [scope]}, "features": {"methods": ["agent", "agent.wait", "chat.history"]}},
         })
 
     def close(self):

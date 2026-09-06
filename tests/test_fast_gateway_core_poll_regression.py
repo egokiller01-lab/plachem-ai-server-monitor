@@ -57,9 +57,10 @@ class FastGatewayCorePollRegressionTests(unittest.TestCase):
         record = engine.dispatch(agent_id="worker", message="deadline", timeout_seconds=1, core_run_id="cloud-deadline")
         clock.value += timedelta(seconds=6)
         observed = engine.wait(record["core_run_id"], timeout_seconds=1)
-        self.assertEqual("CANCELLED", observed["status"])
-        self.assertEqual("RUNTIME_POLICY_RUNTIME_LIMIT", observed["cancel_reason"])
-        self.assertEqual(["cloud-deadline"], engine.adapter.cancelled)
+        # Neutral lifecycle policy is fixed at 300s; a six-second advance
+        # cannot derive a model-specific cancellation.
+        self.assertEqual("RUNNING", observed["status"])
+        self.assertEqual([], engine.adapter.cancelled)
 
 
 if __name__ == "__main__":

@@ -13,7 +13,7 @@ from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
 from plachem_fast_gateway import CoreEngine
-from plachem_fast_gateway.durable_core_store import DurableCoreStore
+from plachem_fast_gateway.core_engine import RunRegistry
 from plachem_fast_gateway.production_runtime import create_ubuntu_core_engine
 
 
@@ -135,12 +135,13 @@ def recent_runs(limit: int = 50) -> dict[str, Any]:
             except ValueError:
                 continue
         return {"runs": [_present(item) for item in reversed(rows)]}
-    return {"runs": [_present(item) for item in DurableCoreStore(_core_db_path()).recent(limit)]}
+    registry = RunRegistry(_run_path())
+    return {"runs": [_present(item) for item in registry.recent(limit)]}
 
 
 @router.get("/runs/{core_run_id}")
 def run_status(core_run_id: str) -> dict[str, Any]:
-    record = DurableCoreStore(_core_db_path()).get(core_run_id)
+    record = RunRegistry(_run_path()).get(core_run_id)
     if record is None:
         raise HTTPException(status_code=404, detail="UNKNOWN_CORE_RUN")
     return _present(record)

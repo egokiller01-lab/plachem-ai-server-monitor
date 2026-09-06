@@ -86,8 +86,9 @@ class AgentEventLoopObservationTests(unittest.TestCase):
             core_run_id="core-1", agent_id="local", message="bounded test", timeout_seconds=10,
             idempotency_key="idem-1",
         )
-        timer = engine._deadline_timers.pop("core-1")
-        timer.cancel()
+        timer = engine._deadline_timers.pop("core-1", None)
+        if timer is not None:
+            timer.cancel()
         return engine, socket
 
     @staticmethod
