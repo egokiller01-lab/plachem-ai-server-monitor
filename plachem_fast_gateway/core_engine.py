@@ -67,11 +67,14 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _request_hash(agent_id: str, message: str, timeout_seconds: float, goal_id: str,
+def _request_hash(agent_id: str, message: str, _timeout_seconds: float, goal_id: str,
                   action: str = "dispatch", workspace_id: str = "command-center",
                   project_id: str = "fast-gateway") -> str:
     raw = json.dumps(
-        {"agent_id": agent_id, "message": message, "timeout_seconds": timeout_seconds, "goal_id": goal_id,
+        # The caller timeout bounds an individual observation poll.  It is
+        # deliberately excluded from request identity so a retry with a
+        # different poll bound remains idempotent.
+        {"agent_id": agent_id, "message": message, "goal_id": goal_id,
          "action": action, "workspace_id": workspace_id, "project_id": project_id},
         ensure_ascii=False,
         sort_keys=True,
@@ -683,8 +686,8 @@ class CoreEngine:
             # lifecycle policy is deliberately a single neutral profile.
             profile = self._neutral_profile
             policy = self._policy_metadata(profile)
-            effective_timeout = float(timeout_seconds)
-            digest = _request_hash(agent_id, message, effective_timeout, contract.goal_id,
+            effective_timeout = profile.max_runtime
+            digest = _request_hash(agent_id, message, float(timeout_seconds), contract.goal_id,
                                    action, workspace_id, project_id)
             record, created = self.registry.create(
                 core_run_id=actual_id,

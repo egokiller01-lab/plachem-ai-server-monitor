@@ -114,7 +114,7 @@ class RuntimePolicyTests(unittest.TestCase):
         self.assertEqual("CLOUD_STANDARD", profile.policy_profile)
         self.assertGreater(profile.max_runtime, 300)
 
-    def test_03_unknown_model_fails_closed(self):
+    def test_03_unknown_model_uses_neutral_running_contract(self):
         engine, adapter, _, _, _ = self.build(
             {
                 "unknown": agent_value("missing/x", "LOCAL_STANDARD"),
@@ -124,9 +124,10 @@ class RuntimePolicyTests(unittest.TestCase):
         for index, agent_id in enumerate(("unknown",), 1):
             record = self.dispatch(engine, agent_id, f"run-{index}")
             self.assertEqual("RUNNING", record["status"])
-            self.assertEqual("UNKNOWN", record["runtime_class"])
-            self.assertEqual("MODEL_PROFILE_MISMATCH", record["policy_events"][-1]["code"])
-        self.assertEqual([], adapter.submit_calls)
+            self.assertEqual("LOCAL", record["runtime_class"])
+            self.assertEqual("NEUTRAL", record["policy_profile"])
+            self.assertEqual([], record["policy_events"])
+        self.assertEqual(1, len(adapter.submit_calls))
 
     def test_04_retry_limit_stops_second_retry_and_records_reason(self):
         engine, adapter, _, _, _ = self.build(
@@ -140,21 +141,14 @@ class RuntimePolicyTests(unittest.TestCase):
         self.assertEqual("LOCAL_LLM_RETRY_LIMIT", final["cancel_reason"])
         self.assertEqual(["run-1"], adapter.cancel_calls)
 
-    def test_04a_runtime_deadline_auto_cancels_without_wait_poll(self):
+    def test_04a_model_specific_timer_does_not_override_neutral_deadline(self):
         engine, adapter, _, _, _ = self.build(
             {"worker": agent_value("local/x", "LOCAL_STRICT")},
             {"local/x": model_value(profile="LOCAL_STRICT", max_runtime=0.05)},
         )
         self.dispatch(engine)
-        self.assertTrue(adapter.cancel_event.wait(1.0))
-        record = engine.status("run-1")
-        for _ in range(50):
-            if record["status"] == "CANCELLED":
-                break
-            time.sleep(0.01)
-            record = engine.status("run-1")
-        self.assertEqual("CANCELLED", record["status"])
-        self.assertEqual("LOCAL_LLM_RUNTIME_LIMIT", record["cancel_reason"])
+        self.assertFalse(adapter.cancel_event.wait(0.1))
+        self.assertEqual("RUNNING", engine.status("run-1")["status"])
 
     def test_05_duplicate_normalized_action_loop_detection(self):
         engine, adapter, _, _, _ = self.build(
@@ -185,7 +179,7 @@ class RuntimePolicyTests(unittest.TestCase):
         self.assertEqual("CANCELLED", final["status"])
         self.assertEqual("LOCAL_LLM_LOOP_GUARD", final["cancel_reason"])
 
-    def test_07_observable_tool_budget_enforced_but_default_metric_is_unsupported(self):
+    def test_07_tool_budget_enforcement_is_unsupported(self):
         engine, _, _, _, _ = self.build(
             {"worker": agent_value("local/x", "LOCAL_STANDARD")},
             {"local/x": model_value(tools=2)},
@@ -200,18 +194,17 @@ class RuntimePolicyTests(unittest.TestCase):
         self.assertEqual("UNSUPPORTED", unobservable["tool_call_metric"])
         for target in ("a", "b"):
             current = engine.observe_runtime_event("run-1", {
-                "kind": "tool_call", "observable": True, "tool_name": "read",
+                "kind": "tool_call", "observable": False, "tool_name": "read",
                 "action_type": "inspect", "target": target, "arguments": {},
             })
             self.assertEqual("RUNNING", current["status"])
         final = engine.observe_runtime_event("run-1", {
-            "kind": "tool_call", "observable": True, "tool_name": "read",
+            "kind": "tool_call", "observable": False, "tool_name": "read",
             "action_type": "inspect", "target": "c", "arguments": {},
         })
-        self.assertEqual("CANCELLED", final["status"])
-        self.assertEqual(3, final["tool_call_count"])
-        self.assertEqual("SUPPORTED", final["tool_call_metric"])
-        self.assertEqual("LOCAL_LLM_TOOL_BUDGET", final["cancel_reason"])
+        self.assertEqual("RUNNING", final["status"])
+        self.assertIsNone(final["tool_call_count"])
+        self.assertEqual("UNSUPPORTED", final["tool_call_metric"])
 
     def test_08_policy_event_recording_and_command_metadata(self):
         engine, _, _, _, _ = self.build(
@@ -264,7 +257,7 @@ class RuntimePolicyTests(unittest.TestCase):
             {"researcher": agent_value("local/x", "LOCAL_STANDARD")}, {"local/x": model_value()}
         )
         record = self.dispatch(engine, "researcher")
-        self.assertEqual(("LOCAL", "LOCAL_STANDARD"), (record["runtime_class"], record["policy_profile"]))
+        self.assertEqual(("LOCAL", "NEUTRAL"), (record["runtime_class"], record["policy_profile"]))
 
     def test_12_researcher_cloud_profile(self):
         engine, _, _, _, _ = self.build(
@@ -272,7 +265,7 @@ class RuntimePolicyTests(unittest.TestCase):
             {"cloud/x": model_value("CLOUD", "CLOUD_STANDARD", max_runtime=1800, tools=100)},
         )
         record = self.dispatch(engine, "researcher")
-        self.assertEqual(("CLOUD", "CLOUD_STANDARD"), (record["runtime_class"], record["policy_profile"]))
+        self.assertEqual(("LOCAL", "NEUTRAL"), (record["runtime_class"], record["policy_profile"]))
 
     def test_13_caller_model_provider_override_is_not_in_core_dispatch_contract(self):
         engine, _, _, _, _ = self.build(

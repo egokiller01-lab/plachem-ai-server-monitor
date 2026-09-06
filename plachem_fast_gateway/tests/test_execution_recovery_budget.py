@@ -210,7 +210,7 @@ class ExecutionRecoveryBudgetTests(unittest.TestCase):
         self.dispatch(run="run-cloud", agent="cloud", timeout=1)
         cloud = self.engine.wait("run-cloud", timeout_seconds=1)
         self.assertEqual("PASS", cloud["status"])
-        self.assertEqual(1.0, self.adapter.submits[1][1]["timeout"])
+        self.assertEqual(300.0, self.adapter.submits[1][1]["timeout"])
 
 
 if __name__ == "__main__":

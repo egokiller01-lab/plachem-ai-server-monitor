@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from plachem_fast_gateway.openclaw_adapter import GatewayRPCClient, REQUIRED_SCOPE
+from plachem_fast_gateway.openclaw_adapter import GatewayRPCClient, REQUIRED_SCOPES
 from war_room_fast_gateway import FastGatewayWarRoomAdapter, GatewayControlRPC
 
 
@@ -61,17 +61,22 @@ class NegotiatingSecret:
 class NegotiatingSocket:
     def __init__(self):
         self.calls = []
+        self.responses = [__import__("json").dumps({
+            "type": "event", "event": "connect.challenge",
+            "payload": {"nonce": "test-nonce"},
+        })]
         self.closed = False
 
     def send(self, frame):
         self.calls.append(__import__("json").loads(frame))
 
     def recv(self, timeout):
+        if self.responses:
+            return self.responses.pop(0)
         request = self.calls[-1]
-        scope = request["params"]["scopes"][0]
         return __import__("json").dumps({
             "type": "res", "id": request["id"], "ok": True,
-            "payload": {"type": "hello-ok", "auth": {"role": "operator", "scopes": [scope]}, "features": {"methods": ["agent", "agent.wait", "chat.history"]}},
+            "payload": {"type": "hello-ok", "auth": {"role": "operator", "scopes": list(REQUIRED_SCOPES)}, "features": {"methods": ["agent", "agent.wait", "chat.history"]}},
         })
 
     def close(self):
@@ -102,7 +107,7 @@ class WarRoomSessionsAbortTests(unittest.TestCase):
         ordinary_socket = NegotiatingSocket()
         ordinary = GatewayRPCClient(NegotiatingSecret(), socket_factory=lambda *_: ordinary_socket)
         ordinary.connect()
-        self.assertEqual([REQUIRED_SCOPE], ordinary_socket.calls[0]["params"]["scopes"])
+        self.assertEqual(list(REQUIRED_SCOPES), ordinary_socket.calls[0]["params"]["scopes"])
 
     def test_stop_resolves_actual_child_session_and_reconciles_user_cancel(self):
         control = FakeControlRPC()

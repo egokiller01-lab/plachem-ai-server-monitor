@@ -34,13 +34,15 @@ class EventSocket:
             }
         elif method == "agent":
             payload = {
-                "status": "accepted", "runId": "oc-1", "sessionKey": "agent:local:main",
+                "status": "accepted", "runId": "oc-1", "sessionKey": frame["params"]["sessionKey"],
                 "sessionId": "session-1",
             }
         elif method == "agent.wait":
             for item in self.event_payloads:
                 self.responses.append(json.dumps({"type": "event", "event": "agent", "payload": item}))
             payload = {"status": "pending"}
+        elif method == "chat.history":
+            payload = {"messages": []}
         else:
             raise AssertionError(f"unexpected RPC: {method}")
         self.responses.append(json.dumps({
@@ -104,7 +106,7 @@ class AgentEventLoopObservationTests(unittest.TestCase):
         engine, socket = self.make_engine([self.event()])
         record = engine.wait("core-1", timeout_seconds=0.01)
         self.assertEqual("RUNNING", record["status"])
-        self.assertEqual("LOOP_SUSPECTED", record["policy_events"][-1]["code"])
+        self.assertEqual([], record["policy_events"])
         methods = [call["method"] for call in socket.calls]
         self.assertNotIn("chat.abort", methods)
         self.assertNotIn("sessions.abort", methods)

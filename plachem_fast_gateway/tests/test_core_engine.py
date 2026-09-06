@@ -173,7 +173,7 @@ class CoreEngineTests(unittest.TestCase):
         self.assertEqual({"message", "agentId", "idempotencyKey", "timeout"}, set(sent))
         self.assertNotIn("runtime_model_id", sent)
         self.assertEqual("LOCAL", record["runtime_class"])
-        self.assertEqual("LOCAL_STANDARD", record["policy_profile"])
+        self.assertEqual("NEUTRAL", record["policy_profile"])
 
     def test_wait_success_transitions_to_pass(self):
         self.dispatch()
@@ -289,7 +289,7 @@ class CoreEngineTests(unittest.TestCase):
         self.dispatch()
         record = self.engine.wait("core-1", timeout_seconds=180)
         self.assertEqual("PASS", record["status"])
-        self.assertEqual([180.0, 120.0], [call[1] for call in self.adapter.wait_calls])
+        self.assertEqual([180.0, 60.0], [call[1] for call in self.adapter.wait_calls])
         self.assertEqual([], self.adapter.cancel_calls)
 
     def test_local_wait_timeout_at_policy_deadline_aborts(self):
@@ -305,16 +305,15 @@ class CoreEngineTests(unittest.TestCase):
         record = self.engine.wait("core-1", timeout_seconds=180)
         self.assertEqual("CANCELLED", record["status"])
         self.assertEqual("LOCAL_LLM_RUNTIME_LIMIT", record["cancel_reason"])
-        self.assertEqual([180.0, 120.0], [call[1] for call in self.adapter.wait_calls])
+        self.assertEqual([180.0, 60.0, 10.0], [call[1] for call in self.adapter.wait_calls])
         self.assertEqual(["core-1"], self.adapter.cancel_calls)
 
-    def test_cloud_wait_timeout_remains_terminal(self):
+    def test_cloud_bounded_wait_timeout_remains_running(self):
         self.adapter.wait_outcome = AdapterOutcome(CoreRunStatus.TIMEOUT, "OPENCLAW_TIMEOUT")
         self.dispatch(agent_id="cloudtest")
         record = self.engine.wait("core-1", timeout_seconds=180)
-        self.assertEqual("TIMEOUT", record["status"])
-        self.assertEqual("OPENCLAW_TIMEOUT", record["reason"])
-        self.assertEqual(["core-1"], self.adapter.cancel_calls)
+        self.assertEqual("RUNNING", record["status"])
+        self.assertEqual([], self.adapter.cancel_calls)
 
     def test_runtime_policy_limit_aborts_and_records_distinct_cancel_reason(self):
         self.adapter.wait_outcome = AdapterOutcome(CoreRunStatus.RUNNING, "RUN_STILL_ACTIVE")
@@ -326,12 +325,13 @@ class CoreEngineTests(unittest.TestCase):
         self.assertEqual(["core-1"], self.adapter.cancel_calls)
         self.assertEqual("RUNTIME_LIMIT", record["policy_events"][-1]["code"])
 
-    def test_missing_runtime_model_is_blocked_before_transport(self):
+    def test_missing_runtime_model_uses_running_neutral_contract(self):
         record = self.dispatch(agent_id="unknown-model")
         self.assertEqual("RUNNING", record["status"])
-        self.assertEqual("UNKNOWN", record["runtime_class"])
-        self.assertEqual("MODEL_PROFILE_MISMATCH", record["policy_events"][-1]["code"])
-        self.assertEqual([], self.adapter.submit_calls)
+        self.assertEqual("LOCAL", record["runtime_class"])
+        self.assertEqual("NEUTRAL", record["policy_profile"])
+        self.assertEqual([], record["policy_events"])
+        self.assertEqual(1, len(self.adapter.submit_calls))
 
     def test_invalid_agent_is_rejected_before_transport(self):
         with self.assertRaisesRegex(ValueError, "UNKNOWN_AGENT"):

@@ -197,7 +197,8 @@ class RuntimePolicyV2Tests(unittest.TestCase):
                                   ModelRegistry.load(root / "cloud-models.json"), Adapter())
         cloud = cloud_engine.dispatch(agent_id="researcher", message="safe", timeout_seconds=5,
                                       core_run_id="cloud", idempotency_key="cloud", goal_contract=GOAL)
-        self.assertEqual(("LOCAL", "CLOUD"), (local["runtime_class"], cloud["runtime_class"]))
+        self.assertEqual(("LOCAL", "LOCAL"), (local["runtime_class"], cloud["runtime_class"]))
+        self.assertEqual(("NEUTRAL", "NEUTRAL"), (local["policy_profile"], cloud["policy_profile"]))
 
     def test_goal_id_is_deterministic_and_caller_cannot_supply_it(self):
         self.assertEqual(normalize_goal_contract(GOAL), normalize_goal_contract(GOAL))

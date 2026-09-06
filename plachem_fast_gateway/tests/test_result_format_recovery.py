@@ -20,6 +20,7 @@ class FakeSecretRef:
 class FakeSocket:
     def __init__(self, handlers):
         self.handlers = handlers
+        self.history_calls = 0
         self.responses = []
         self.methods = []
 
@@ -34,7 +35,11 @@ class FakeSocket:
                 "features": {"methods": ["agent", "agent.wait", "chat.history"]},
             }
         else:
-            handler = self.handlers[method]
+            if method == "chat.history":
+                self.history_calls += 1
+                handler = {"messages": []} if self.history_calls == 1 else self.handlers.get(method, {"messages": []})
+            else:
+                handler = self.handlers.get(method, None)
             payload = handler(frame["params"]) if callable(handler) else handler
         self.responses.append(json.dumps({"type": "res", "id": frame["id"], "ok": True, "payload": payload}))
 
@@ -49,7 +54,7 @@ def accepted(params):
     return {
         "status": "accepted",
         "runId": "local-result-recovery-run",
-        "sessionKey": f"agent:{params['agentId']}:result-recovery-test",
+        "sessionKey": params.get("sessionKey", f"agent:{params['agentId']}:result-recovery-test"),
     }
 
 
@@ -100,7 +105,7 @@ class ResultFormatRecoveryTests(unittest.TestCase):
         outcome = adapter.wait("core-recovery-test", timeout_seconds=1)
 
         self.assertEqual(CoreRunStatus.FAIL, outcome.status)
-        self.assertEqual("MISSING_RESULT", outcome.reason)
+        self.assertEqual("MISSING_POST_SUBMIT_RESULT", outcome.reason)
         self.assertEqual(0, outcome.format_recovery_attempts)
         self.assertEqual([], calls)
 
@@ -114,6 +119,7 @@ class ResultFormatRecoveryTests(unittest.TestCase):
         adapter, _ = self.adapter({
             "agent": accepted,
             "agent.wait": {"status": "ok", "result": valid_result()},
+            "chat.history": {"messages": [{"role": "assistant", "content": valid_result()}]},
         }, recovery=recovery)
 
         outcome = adapter.wait("core-recovery-test", timeout_seconds=1)
@@ -142,12 +148,13 @@ class ResultFormatRecoveryTests(unittest.TestCase):
         self.assertEqual({"status", "summary", "evidence", "artifacts", "scope"}, set(outcome.result))
         self.assertEqual(1, socket.methods.count("agent"))
         self.assertEqual(1, socket.methods.count("agent.wait"))
-        self.assertEqual(1, socket.methods.count("chat.history"))
+        self.assertEqual(2, socket.methods.count("chat.history"))
 
     def test_missing_fields_are_recovered(self):
         adapter, _ = self.adapter({
             "agent": accepted,
             "agent.wait": {"status": "ok", "result": {"status": "completed", "summary": "done"}},
+            "chat.history": {"messages": [{"role": "assistant", "content": json.dumps({"status": "completed", "summary": "done"})}]},
         })
 
         outcome = adapter.wait("core-recovery-test", timeout_seconds=1)
@@ -179,6 +186,11 @@ class ResultFormatRecoveryTests(unittest.TestCase):
                 "evidence": [{"type": "tool_execution", "detail": "Tool execution was completed"}],
                 "artifacts": [],
             }},
+            "chat.history": {"messages": [{"role": "assistant", "content": json.dumps({
+                "status": "completed", "summary": "claimed work",
+                "evidence": [{"type": "tool_execution", "detail": "Tool execution was completed"}],
+                "artifacts": [],
+            })}]},
         })
 
         outcome = adapter.wait("core-recovery-test", timeout_seconds=1)
@@ -198,6 +210,7 @@ class ResultFormatRecoveryTests(unittest.TestCase):
         adapter, _ = self.adapter({
             "agent": accepted,
             "agent.wait": {"status": "ok", "result": "unstructured response"},
+            "chat.history": {"messages": [{"role": "assistant", "content": "unstructured response"}]},
         }, recovery=unavailable)
 
         first = adapter.wait("core-recovery-test", timeout_seconds=1)
