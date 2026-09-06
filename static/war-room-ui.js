@@ -92,6 +92,16 @@ function renderTaskDetail() {
   const state = task.state || task.status;
   document.getElementById("task-status").innerHTML = statusChip(state);
   target.innerHTML = `<div class="three-col"><div><small class="muted">목표·작업명</small><p>${esc(task.scope)}</p></div><div><small class="muted">금지·안전 경계</small><p>권한·승인 없는 실행 금지 · 서버 정책 적용</p></div><div><small class="muted">완료조건</small><p>결과 제출 → 필수 evidence → ERPqa PASS → 대표 승인</p></div></div><div class="muted">담당: ${esc(task.assignee_agent_id || "-")} · 대상: ${esc((task.agent_ids || []).join(", ") || "-")} · 상태 원인: ${state === "system_error" ? "전달/서버 오류. QA FAIL·REWORK와 독립 상태" : task.status === "rework_required" ? "QA FAIL/REWORK 또는 결과 검증 실패" : task.status === "stopped" ? "중지 요청" : "서버 상태 전이"}</div>`;
+  renderExecutionProjection(task);
+}
+
+function renderExecutionProjection(task) {
+  const target = document.getElementById("task-detail");
+  const rows = currentDeliveries.filter(row => row.task_id === task.id || row.message_id === task.source_message_id);
+  const fast = rows.filter(row => row.execution_mode === "FAST_GATEWAY" || row.core_run_id);
+  if (!fast.length) return;
+  const refs = value => { try { const parsed = JSON.parse(value || "[]"); return Array.isArray(parsed) ? parsed.map(item => typeof item === "string" ? item : (item?.path || item?.detail || JSON.stringify(item))).join(", ") : "-"; } catch (_) { return value || "-"; } };
+  target.insertAdjacentHTML("beforeend", `<div class="card" style="margin-top:12px"><strong>Fast Gateway 실행 투영</strong>${fast.map(row => `<div class="muted">Agent ${esc(row.agent_id)} · Core ${esc(row.core_run_id || "-")} · 실행 ${esc(row.run_status || row.status)} · runtime ${esc(row.runtime_seconds ?? "-")}s · policy ${esc(row.policy_status || "-")} · escalation ${row.escalation_required ? "required" : "no"}${row.cancel_reason ? ` · cancel ${esc(row.cancel_reason)}` : ""}<br>결과 요약: ${esc(row.result_summary || "-")}<br>Evidence: ${esc(refs(row.evidence_json))}<br>Artifacts: ${esc(refs(row.artifacts_json))}</div>`).join("")}</div>`);
 }
 
 async function renderReview() {
@@ -475,7 +485,7 @@ document.getElementById("task-form").addEventListener("submit", async event => {
   event.preventDefault(); const out = document.getElementById("task-result");
   try {
     const agent_ids=[...document.querySelectorAll('#task-agent-targets input:checked')].map(input=>input.value); const assignee_agent_id=document.getElementById("task-assignee").value; if(!agent_ids.includes(assignee_agent_id)) agent_ids.unshift(assignee_agent_id);
-    const body = {scope:document.getElementById("task-scope").value,assignee_agent_id,agent_ids,call_limit:Number(document.getElementById("task-call-limit").value),turn_limit:Number(document.getElementById("task-turn-limit").value),deadline_at:Math.floor(Date.now()/1000)+Number(document.getElementById("task-deadline").value),document_version:document.getElementById("task-document-version").value};
+    const body = {scope:document.getElementById("task-scope").value,assignee_agent_id,agent_ids,execution_mode:document.getElementById("task-execution-mode")?.value || "LEGACY",call_limit:Number(document.getElementById("task-call-limit").value),turn_limit:Number(document.getElementById("task-turn-limit").value),deadline_at:Math.floor(Date.now()/1000)+Number(document.getElementById("task-deadline").value),document_version:document.getElementById("task-document-version").value};
     const result = await post(`/api/war-room/projects/${encodeURIComponent(selectedProjectId)}/tasks`, body);
     out.textContent = `생성됨 ${result.task_id.slice(0,8)}`; document.getElementById("task-scope").value = ""; await load();
   } catch (error) { out.textContent = error.message; }
@@ -493,6 +503,7 @@ document.getElementById("quick-task-form").addEventListener("submit", async even
     const base = `/api/war-room/projects/${encodeURIComponent(selectedProjectId)}`;
     const task = await post(`${base}/prepare`, {
       instruction,
+      execution_mode: document.getElementById("quick-execution-mode")?.value || "LEGACY",
       agent_ids,
       deadline_at: Math.floor(Date.now() / 1000) + 1800,
       document_version: selectedDocumentVersion,
@@ -504,6 +515,17 @@ document.getElementById("quick-task-form").addEventListener("submit", async even
     out.textContent = `${agent_ids.join(", ")}에게 작업을 시작했습니다. 결과 검토 단계에서 충돌과 다음 행동을 확인하세요.`;
   } catch (error) { out.textContent = `준비 실패: ${error.message}`; }
 });
+
+function ensureExecutionModeControls() {
+  [["quick-task-form", "quick-execution-mode", "빠른 시작 실행 모드"], ["task-form", "task-execution-mode", "작업 실행 모드"]].forEach(([formId, id, labelText]) => {
+    const form = document.getElementById(formId);
+    if (!form || document.getElementById(id)) return;
+    const label = document.createElement("label"); label.textContent = `${labelText} `;
+    const select = document.createElement("select"); select.id = id;
+    select.innerHTML = '<option value="LEGACY">Legacy</option><option value="FAST_GATEWAY">Fast Gateway</option>';
+    label.appendChild(select); form.insertBefore(label, form.firstChild);
+  });
+}
 
 async function quickApproveAndRun() {
   const out = document.getElementById("quick-result");
@@ -603,5 +625,5 @@ document.getElementById("message-form").addEventListener("submit", async event =
 async function bindDemoSession(){const agent=document.getElementById("demo-session-agent").value; await post(`/api/war-room/projects/${encodeURIComponent(selectedProjectId)}/participants/${agent}/test-session`,{session_key:document.getElementById("demo-session-key").value,session_id:document.getElementById("demo-session-id").value},"PUT"); await load();}
 async function processDemoQueue(){await post('/api/war-room/demo/process',{}); await load();}
 async function retryDemoDelivery(id){await post(`/api/war-room/deliveries/${id}/retry`,{}); await load();}
-get('/api/war-room/demo-mode').then(()=>{demoMode=true;document.getElementById('demo-controls').hidden=false;}).catch(()=>{}).finally(load);
+ensureExecutionModeControls(); get('/api/war-room/demo-mode').then(()=>{demoMode=true;document.getElementById('demo-controls').hidden=false;}).catch(()=>{}).finally(load);
 setInterval(() => { if (!document.querySelector("form:focus-within")) load(); }, 15000);

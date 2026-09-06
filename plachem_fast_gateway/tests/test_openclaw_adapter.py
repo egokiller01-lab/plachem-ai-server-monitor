@@ -5,7 +5,7 @@ import inspect
 import tempfile
 import time
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 from pathlib import Path
 
 from plachem_fast_gateway.openclaw_adapter import (
@@ -344,6 +344,7 @@ class OpenClawAdapterTests(unittest.TestCase):
             "agent.wait",
             {"runId": "openclaw-run-1", "timeoutMs": 1000},
             timeout=6.0,
+            event_handler=ANY,
         )
 
     def test_abort_empty_run_ids_is_idempotent_for_finished_run(self):

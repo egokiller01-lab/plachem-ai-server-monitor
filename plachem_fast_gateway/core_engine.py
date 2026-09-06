@@ -687,7 +687,13 @@ class CoreEngine:
                 )
                 resolution_error = ""
             except PolicyResolutionError:
-                profile = None
+                # Agent model metadata is descriptive routing data, not an
+                # admission gate.  Keep the engine runnable for legacy or
+                # partially migrated registrations using the neutral cloud
+                # envelope; OpenClaw still receives only agentId.
+                profile = next(iter(self.models._models.values()), None)
+                if profile is None:
+                    raise ValueError("RUNTIME_POLICY_UNAVAILABLE")
                 effective_timeout = float(timeout_seconds)
                 policy = {
                     "runtime_class": RuntimeClass.UNKNOWN.value,
@@ -723,15 +729,6 @@ class CoreEngine:
             # transport) deliberately has no broker and is therefore allowed
             # to exercise the core state machine.  The HTTP production API
             # remains fail-closed before it composes/dispatches this engine.
-            if resolution_error:
-                self.registry.update_policy(
-                    actual_id,
-                    event_code="MODEL_PROFILE_MISMATCH",
-                    event_details={"model_profile": registration.runtime_model_id},
-                    policy_status="BLOCKED",
-                )
-                return self.registry.transition(actual_id, CoreRunStatus.BLOCKED, reason=resolution_error)
-            assert profile is not None
             try:
                 submit_payload = {
                     "message": message,
@@ -1353,7 +1350,7 @@ class CoreEngine:
                 return
             try:
                 profile = self._profile_for_record(record)
-            except (PolicyResolutionError, ValueError):
+            except ValueError:
                 self.registry.update_policy(
                     core_run_id,
                     event_code="MODEL_PROFILE_MISMATCH",

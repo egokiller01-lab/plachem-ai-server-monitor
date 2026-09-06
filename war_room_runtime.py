@@ -15,6 +15,8 @@ from typing import Any
 from war_room_adapter import OpenClawSessionAdapter, SessionAdapter
 from war_room_worker import process_due_deliveries, recover_received_deliveries, request_project_stop
 import war_room
+from fast_gateway_service import create_core_engine
+from war_room_fast_gateway import FastGatewayWarRoomAdapter
 
 
 def provision_disposable_sessions(*, db_path: str | Path, adapter: Any, project_id: str, agent_ids: list[str]) -> list[dict[str, Any]]:
@@ -54,13 +56,21 @@ def provision_disposable_sessions(*, db_path: str | Path, adapter: Any, project_
 class WarRoomRuntime:
     def __init__(self, adapter: SessionAdapter | None = None) -> None:
         self.adapter = adapter or OpenClawSessionAdapter()
+        self._fast_adapter: FastGatewayWarRoomAdapter | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
     def tick(self, *, db_path: str | Path, now: int | None = None) -> list[dict[str, Any]]:
-        delivered = process_due_deliveries(db_path=db_path, adapter=self.adapter, now=now)
-        recovered = recover_received_deliveries(db_path=db_path, gateway=self.adapter, now=now)
+        delivered = process_due_deliveries(db_path=db_path, adapter=self.adapter, adapter_selector=self.adapter_for, now=now)
+        recovered = recover_received_deliveries(db_path=db_path, gateway=self.adapter, gateway_selector=self.adapter_for, now=now)
         return delivered + recovered
+
+    def adapter_for(self, execution_mode: str, db_path: str | Path) -> SessionAdapter:
+        if execution_mode != "FAST_GATEWAY":
+            return self.adapter
+        if self._fast_adapter is None:
+            self._fast_adapter = FastGatewayWarRoomAdapter(create_core_engine(), db_path)
+        return self._fast_adapter
 
     def stop_project(self, *, db_path: str | Path, project_id: str, actor_id: str, now: int | None = None) -> dict[str, Any]:
         return request_project_stop(db_path=db_path, project_id=project_id, actor_id=actor_id, adapter=self.adapter, now=now)
@@ -87,6 +97,9 @@ class WarRoomRuntime:
         closer = getattr(self.adapter, "close", None)
         if closer:
             closer()
+        if self._fast_adapter is not None:
+            self._fast_adapter.control_rpc.close()
+            self._fast_adapter.engine.adapter.close()
 
 
 _RUNTIME: WarRoomRuntime | None = None

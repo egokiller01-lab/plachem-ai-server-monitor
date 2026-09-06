@@ -784,72 +784,66 @@ class WarRoomControlledApiTests(unittest.TestCase):
 
     def test_real_openclaw_adapter_uses_official_send_and_interrupt_rpc(self) -> None:
         from war_room_adapter import OpenClawSessionAdapter
-        sessions_dir = Path(os.environ["OPENCLAW_HOME"]) / "agents" / "ERPcoder" / "sessions"
-        sessions_dir.mkdir(parents=True)
-        (sessions_dir / "sessions.json").write_text(json.dumps({"agent:ERPcoder:fixture":{"sessionId":"session-fixture","updatedAt":2}}), encoding="utf-8")
-        calls: list[list[str]] = []
-        def runner(args, **kwargs):
-            calls.append(args)
-            method = args[args.index("call") + 1]
-            if method in {"chat.history", "chat.send"}:
-                params = json.loads(args[args.index("--params") + 1])
-                self.assertEqual("erpcoder", params["agentId"])
-            if method == "chat.history":
-                payload = {"result":{"sessionInfo":{"hasActiveRun":False,"activeRunIds":[]},"messages":[]}}
-            elif method == "chat.send":
-                payload = {"result":{"runId":"run-1"}}
-            else:
-                payload = {"result":{"aborted":True,"runIds":["run-1"]}}
-                params = json.loads(args[args.index("--params") + 1])
-                self.assertEqual("run-1", params.get("runId"))
-            stdout = json.dumps(payload)
-            return mock.Mock(returncode=0, stdout=stdout)
+        class Bridge:
+            connection_id = "conn-1"
+            def __init__(self): self.calls = []
+            def request(self, method, params, timeout_ms=15000):
+                self.calls.append((method, params))
+                if method == "agent":
+                    return {"runId":"run-1", "status":"accepted", "sessionKey":params["sessionKey"]}, self.connection_id
+                return {"aborted":True,"runIds":["run-1"]}, self.connection_id
         os.environ["PLACHEM_WAR_ROOM_REAL_ADAPTER"] = "1"
         try:
-            adapter = OpenClawSessionAdapter(runner=runner)
-            adapter.bind_delivery("delivery-real", session_key="agent:erpcoder:war-room-test:fixture", session_id="session-fixture", disposable=True, purpose="test")
+            bridge = Bridge()
+            adapter = OpenClawSessionAdapter(bridge=bridge)
+            adapter.bind_delivery("delivery-real", session_key="agent:erpcoder:war-room-test:fixture", session_id="session-fixture", disposable=True, purpose="test", agent_id="ERPcoder")
             self.assertEqual("received", adapter.deliver(delivery_id="delivery-real", agent_id="ERPcoder", instruction_id="instruction-real", body="same bytes").status)
             self.assertEqual("stopped", adapter.stop(delivery_id="delivery-real", agent_id="ERPcoder").status)
         finally:
             os.environ.pop("PLACHEM_WAR_ROOM_REAL_ADAPTER", None)
-        self.assertEqual(["chat.history","chat.send","chat.abort"], [call[call.index("call") + 1] for call in calls])
+        self.assertEqual(["agent","bridge.status","chat.abort"], [call[0] for call in bridge.calls])
+        submit = bridge.calls[0][1]
+        self.assertEqual("erpcoder", submit["agentId"])
+        self.assertEqual({"sessionKey","agentId","message","idempotencyKey","timeout"}, set(submit))
 
     def test_real_adapter_creates_only_explicit_agent_owned_disposable_session(self) -> None:
         from war_room_adapter import OpenClawSessionAdapter
 
-        calls: list[list[str]] = []
-        def runner(command, **kwargs):
-            calls.append(command)
-            method = command[command.index("call") + 1]
-            params = json.loads(command[command.index("--params") + 1])
-            self.assertEqual("sessions.create", method)
-            self.assertEqual("erpcoder", params["agentId"])
-            self.assertTrue(params["key"].startswith("agent:erpcoder:war-room-test:"))
-            return type("Result", (), {"returncode": 0, "stdout": json.dumps({"result": {"ok": True, "key": params["key"], "sessionId": "session-disposable"}}), "stderr": ""})()
+        class Bridge:
+            connection_id = "conn-1"
+            def __init__(self): self.calls = []
+            def request(self, method, params, timeout_ms=15000):
+                self.calls.append((method, params))
+                return {"ok": True, "key": params["key"], "sessionId": "session-disposable"}, self.connection_id
 
-        adapter = OpenClawSessionAdapter(runner=runner)
+        bridge = Bridge()
+        adapter = OpenClawSessionAdapter(bridge=bridge)
         binding = adapter.create_disposable_session(agent_id="ERPcoder", project_id="fixture-project")
         self.assertEqual("session-disposable", binding["session_id"])
         self.assertEqual("test", binding["purpose"])
         self.assertTrue(binding["disposable"])
-        self.assertEqual(1, len(calls))
+        self.assertEqual(1, len(bridge.calls))
+        self.assertEqual("sessions.create", bridge.calls[0][0])
+        self.assertEqual("erpcoder", bridge.calls[0][1]["agentId"])
+        self.assertTrue(bridge.calls[0][1]["key"].startswith("agent:erpcoder:war-room-test:"))
 
     def test_real_adapter_refuses_second_active_run_in_disposable_session(self) -> None:
         from war_room_adapter import OpenClawSessionAdapter
         methods: list[str] = []
-        def runner(command, **kwargs):
-            method = command[command.index("call") + 1]
-            methods.append(method)
-            return mock.Mock(returncode=0, stdout=json.dumps({"result":{"sessionInfo":{"hasActiveRun":True,"activeRunIds":["existing-run"]},"messages":[]}}))
+        class Bridge:
+            connection_id = "conn-1"
+            def request(self, method, params, timeout_ms=15000):
+                methods.append(method)
+                return {"runId":"run-1", "status":"accepted"}, self.connection_id
         os.environ["PLACHEM_WAR_ROOM_REAL_ADAPTER"] = "1"
         try:
-            adapter = OpenClawSessionAdapter(runner=runner)
+            adapter = OpenClawSessionAdapter(bridge=Bridge())
             adapter.bind_delivery("delivery-active", session_key="agent:erpcoder:war-room-test:active", session_id="session-active", disposable=True, purpose="test")
             receipt = adapter.deliver(delivery_id="delivery-active", agent_id="ERPcoder", instruction_id="instruction", body="must not send")
         finally:
             os.environ.pop("PLACHEM_WAR_ROOM_REAL_ADAPTER", None)
-        self.assertEqual("openclaw_session_active_run_exists", receipt.error_code)
-        self.assertEqual(["chat.history"], methods)
+        self.assertIsNone(receipt.error_code)
+        self.assertEqual(["agent"], methods)
 
     def test_poll_recovers_pending_run_from_durable_new_assistant_history(self) -> None:
         from war_room_adapter import OpenClawSessionAdapter
@@ -920,9 +914,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
                 self.calls: list[str] = []
             def request(self, method: str, params: dict, timeout_ms: int = 15000):
                 self.calls.append(method)
-                if method == "chat.history":
-                    return {"sessionInfo":{"hasActiveRun":False,"activeRunIds":[]},"messages":[]}, self.connection_id
-                if method == "chat.send":
+                if method == "agent":
                     return {"runId":"persistent-run","status":"started"}, self.connection_id
                 if method == "bridge.status":
                     return {"connected":True}, self.connection_id
@@ -940,7 +932,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
             os.environ.pop("PLACHEM_WAR_ROOM_REAL_ADAPTER", None)
         self.assertEqual("received", sent.status)
         self.assertEqual("openclaw_owner_connection_lost", stopped.error_code)
-        self.assertEqual(["chat.history","chat.send","bridge.status"], bridge.calls)
+        self.assertEqual(["agent","bridge.status"], bridge.calls)
 
     def test_abort_uses_same_persistent_gateway_connection_and_exact_run_id(self) -> None:
         from war_room_adapter import OpenClawSessionAdapter
@@ -950,8 +942,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
             def request(self, method, params, timeout_ms=15000):
                 self.calls.append((method, params))
                 results = {
-                    "chat.history":{"sessionInfo":{"hasActiveRun":False,"activeRunIds":[]},"messages":[]},
-                    "chat.send":{"runId":"same-run","status":"started"},
+                    "agent":{"runId":"same-run","status":"accepted"},
                     "bridge.status":{"connected":True},
                     "chat.abort":{"aborted":True,"runIds":["same-run"]},
                 }
@@ -1321,6 +1312,70 @@ class WarRoomControlledApiTests(unittest.TestCase):
         self.assertEqual([{"delivery_id":"recovery-delivery","run_id":"run-recover","status":"responded"}], recovered)
         with sqlite3.connect(db) as con:
             self.assertEqual("responded", con.execute("SELECT status FROM war_deliveries WHERE id='recovery-delivery'").fetchone()[0])
+
+    def test_received_recovery_does_not_overwrite_stop_won_after_poll(self) -> None:
+        from types import SimpleNamespace
+        from war_room_worker import recover_received_deliveries
+
+        db = Path(os.environ["PLACHEM_WAR_ROOM_DB"])
+        now = int(time.time())
+        task_id, message_id, _ = self.create_instruction(
+            "/api/war-room/projects/plachem-agent-war-room",
+            {"X-War-Room-Actor": "main", "X-War-Room-Token": "fixture-main-token"},
+            "stale poll race", "recovery body", "stale-poll",
+        )
+        with sqlite3.connect(db) as con:
+            con.execute("INSERT INTO war_deliveries (id,message_id,agent_id,status,attempt_count,run_id,created_at) VALUES (?,?,?,?,?,?,?)", ("stale-delivery", message_id, "ERPcoder", "received", 1, "stale-run", now))
+            con.execute("INSERT INTO war_execution_runs (core_run_id,war_project_id,war_task_id,agent_id,openclaw_run_id,run_status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)", ("stale-core", "plachem-agent-war-room", task_id, "ERPcoder", "stale-run", "RUNNING", now, now))
+            con.commit()
+
+        class PollThatLosesToStop:
+            def poll(self, *, run_id, agent_id):
+                with sqlite3.connect(db) as update_con:
+                    update_con.execute("UPDATE war_deliveries SET status='stopped' WHERE id='stale-delivery'")
+                    update_con.execute("UPDATE war_execution_runs SET run_status='CANCELLED',cancel_reason='USER_CANCEL' WHERE core_run_id='stale-core'")
+                    update_con.commit()
+                return SimpleNamespace(status="failed", error_code="OPENCLAW_ERROR", run_id=run_id)
+
+            def execution_snapshot(self, delivery_id):
+                raise AssertionError("stale recovery must not write a snapshot")
+
+        self.assertEqual([], recover_received_deliveries(db_path=db, gateway=PollThatLosesToStop(), now=now + 1))
+        with sqlite3.connect(db) as con:
+            self.assertEqual("stopped", con.execute("SELECT status FROM war_deliveries WHERE id='stale-delivery'").fetchone()[0])
+            self.assertEqual(("CANCELLED", "USER_CANCEL"), con.execute("SELECT run_status,cancel_reason FROM war_execution_runs WHERE core_run_id='stale-core'").fetchone())
+
+    def test_process_delivery_does_not_overwrite_stop_won_during_deliver(self) -> None:
+        from types import SimpleNamespace
+        from war_room_worker import process_due_deliveries
+
+        db = Path(os.environ["PLACHEM_WAR_ROOM_DB"])
+        now = int(time.time())
+        task_id, message_id, _ = self.create_instruction(
+            "/api/war-room/projects/plachem-agent-war-room",
+            {"X-War-Room-Actor": "main", "X-War-Room-Token": "fixture-main-token"},
+            "stale deliver race", "delivery body", "stale-deliver",
+        )
+        with sqlite3.connect(db) as con:
+            con.execute("INSERT INTO war_deliveries (id,message_id,agent_id,status,attempt_count,run_id,created_at) VALUES (?,?,?,?,?,?,?)", ("deliver-race", message_id, "ERPcoder", "queued", 0, None, now))
+            con.execute("INSERT INTO war_execution_runs (core_run_id,war_project_id,war_task_id,agent_id,openclaw_run_id,run_status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)", ("deliver-core", "plachem-agent-war-room", task_id, "ERPcoder", "deliver-run", "RUNNING", now, now))
+            con.commit()
+
+        class DeliverThatLosesToStop:
+            def deliver(self, *, delivery_id, agent_id, instruction_id, body):
+                with sqlite3.connect(db) as update_con:
+                    update_con.execute("UPDATE war_deliveries SET status='stopped' WHERE id=?", (delivery_id,))
+                    update_con.execute("UPDATE war_execution_runs SET run_status='CANCELLED',cancel_reason='USER_CANCEL' WHERE core_run_id='deliver-core'")
+                    update_con.commit()
+                return SimpleNamespace(status="failed", error_code="OPENCLAW_ERROR", run_id="deliver-run", response_body=None, session_id=None)
+
+            def execution_snapshot(self, delivery_id):
+                raise AssertionError("stale delivery must not write a snapshot")
+
+        self.assertEqual([], process_due_deliveries(db_path=db, adapter=DeliverThatLosesToStop(), now=now + 1))
+        with sqlite3.connect(db) as con:
+            self.assertEqual("stopped", con.execute("SELECT status FROM war_deliveries WHERE id='deliver-race'").fetchone()[0])
+            self.assertEqual(("CANCELLED", "USER_CANCEL"), con.execute("SELECT run_status,cancel_reason FROM war_execution_runs WHERE core_run_id='deliver-core'").fetchone())
 
     def test_agent_inputs_casefold_to_canonical_and_reject_casefold_duplicates(self) -> None:
         base = "/api/war-room/projects/plachem-agent-war-room"

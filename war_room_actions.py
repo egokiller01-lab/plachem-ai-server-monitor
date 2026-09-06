@@ -5,6 +5,7 @@ import json
 import os
 import hmac
 import sqlite3
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -24,6 +25,7 @@ CREATE TABLE IF NOT EXISTS war_tasks (
  assignee_agent_id TEXT, scope TEXT NOT NULL CHECK(length(scope) BETWEEN 1 AND 4096), status TEXT NOT NULL
  CHECK(status IN ('draft','awaiting_approval','approved','running','qa','completed','stopped','stop_unconfirmed','rework_required')),
  manyfast_version TEXT NOT NULL, document_version TEXT, call_limit INTEGER, turn_limit INTEGER,
+ execution_mode TEXT NOT NULL DEFAULT 'LEGACY' CHECK(execution_mode IN ('LEGACY','FAST_GATEWAY')),
  deadline_at INTEGER, revision INTEGER NOT NULL DEFAULT 1, qa_cycle INTEGER NOT NULL DEFAULT 0,
  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
 );
@@ -105,6 +107,21 @@ CREATE TABLE IF NOT EXISTS war_manyfast_snapshots (
  id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES war_projects(id), document_version TEXT NOT NULL,
  snapshot_json TEXT NOT NULL, is_last_good INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS war_execution_runs (
+ core_run_id TEXT PRIMARY KEY, war_project_id TEXT NOT NULL REFERENCES war_projects(id),
+ war_task_id TEXT NOT NULL REFERENCES war_tasks(id), agent_id TEXT NOT NULL,
+ openclaw_run_id TEXT UNIQUE, session_key TEXT, run_status TEXT NOT NULL,
+ runtime_seconds REAL, result_summary TEXT, result_json TEXT, evidence_json TEXT, artifacts_json TEXT,
+ policy_status TEXT, cancel_reason TEXT, escalation_required INTEGER NOT NULL DEFAULT 0,
+ created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS war_execution_units (
+ execution_id TEXT PRIMARY KEY, war_project_id TEXT NOT NULL REFERENCES war_projects(id),
+ war_task_id TEXT NOT NULL REFERENCES war_tasks(id), correlation_id TEXT NOT NULL,
+ agent_id TEXT NOT NULL, depends_on_execution_ids TEXT NOT NULL DEFAULT '[]',
+ core_run_id TEXT, created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_war_execution_units_task ON war_execution_units(war_project_id,war_task_id);
 CREATE INDEX IF NOT EXISTS idx_war_tasks_project_status ON war_tasks(project_id, status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_war_audit_project_created ON war_audit_events(project_id, created_at DESC, id DESC);
 CREATE TRIGGER IF NOT EXISTS war_audit_no_update BEFORE UPDATE ON war_audit_events BEGIN SELECT RAISE(ABORT, 'audit events are append-only'); END;
@@ -124,6 +141,8 @@ ROLE_PERMISSIONS = {
     "observer": {"read"},
 }
 WRITE_ACTIONS = {"comment", "approve", "execute", "manage"}
+_EXECUTION_ORCHESTRATORS: dict[str, Any] = {}
+_EXECUTION_ORCHESTRATOR_LOCK = threading.RLock()
 
 
 def _delivery_state(row: sqlite3.Row | dict[str, Any]) -> str:
@@ -215,7 +234,7 @@ def provision_action_schema(path: str | None = None) -> str:
         if "original_body" not in message_columns:
             con.execute("ALTER TABLE war_messages ADD COLUMN original_body TEXT")
         task_columns = {row[1] for row in con.execute("PRAGMA table_info(war_tasks)")}
-        for column, definition in (("document_version", "TEXT"), ("call_limit", "INTEGER"), ("turn_limit", "INTEGER"), ("deadline_at", "INTEGER"), ("revision", "INTEGER NOT NULL DEFAULT 1"), ("qa_cycle", "INTEGER NOT NULL DEFAULT 0")):
+        for column, definition in (("document_version", "TEXT"), ("call_limit", "INTEGER"), ("turn_limit", "INTEGER"), ("execution_mode", "TEXT NOT NULL DEFAULT 'LEGACY'"), ("deadline_at", "INTEGER"), ("revision", "INTEGER NOT NULL DEFAULT 1"), ("qa_cycle", "INTEGER NOT NULL DEFAULT 0")):
             if column not in task_columns:
                 con.execute(f"ALTER TABLE war_tasks ADD COLUMN {column} {definition}")
         for table in ("war_evidence", "war_qa_verdicts"):
@@ -223,6 +242,9 @@ def provision_action_schema(path: str | None = None) -> str:
             for column, definition in (("task_revision", "INTEGER NOT NULL DEFAULT 1"), ("scope_hash", "TEXT NOT NULL DEFAULT ''"), ("document_version", "TEXT NOT NULL DEFAULT ''"), ("qa_cycle", "INTEGER NOT NULL DEFAULT 0")):
                 if column not in columns:
                     con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        execution_columns = {row[1] for row in con.execute("PRAGMA table_info(war_execution_runs)")}
+        if "result_summary" not in execution_columns:
+            con.execute("ALTER TABLE war_execution_runs ADD COLUMN result_summary TEXT")
         approval_columns = {row[1] for row in con.execute("PRAGMA table_info(war_approvals)")}
         if "target_set_hash" not in approval_columns:
             con.execute("ALTER TABLE war_approvals ADD COLUMN target_set_hash TEXT NOT NULL DEFAULT ''")
@@ -245,6 +267,20 @@ def _adapter() -> TestSessionAdapter | OpenClawSessionAdapter:
         return TestSessionAdapter()
     from war_room_runtime import get_runtime
     return get_runtime().adapter
+
+
+def _adapter_for_mode(mode: str, db_path: str) -> Any:
+    if mode != "FAST_GATEWAY":
+        return _adapter()
+    from war_room_runtime import get_runtime
+    return get_runtime().adapter_for(mode, db_path)
+
+
+def _execution_mode(value: Any) -> str:
+    mode = str(value or "LEGACY").strip().upper()
+    if mode not in {"LEGACY", "FAST_GATEWAY"}:
+        raise HTTPException(422, "execution_mode must be LEGACY or FAST_GATEWAY")
+    return mode
 
 
 def _control(con: sqlite3.Connection, project_id: str) -> sqlite3.Row:
@@ -364,6 +400,143 @@ async def _body(request: Request) -> dict[str, Any]:
     return value
 
 
+def _execution_orchestrator() -> Any:
+    from fast_gateway_service import get_persistent_harness
+    from war_room_execution_units import ExecutionUnitStore
+    from war_room_orchestration import WarRoomOrchestrator
+    db_path = war_room._db_path()
+    cache_key = str(db_path.expanduser().resolve())
+    with _EXECUTION_ORCHESTRATOR_LOCK:
+        existing = _EXECUTION_ORCHESTRATORS.get(cache_key)
+        if existing is not None:
+            return existing
+        harness = get_persistent_harness()
+        engine = harness.engine
+        store = ExecutionUnitStore(db_path)
+        store.ensure_schema()
+        orchestrator = WarRoomOrchestrator(core_engine=engine, execution_store=store)
+        subscriber = getattr(orchestrator, "on_core_run_terminal", None)
+        if callable(subscriber):
+            harness.set_terminal_completion_subscriber(subscriber)
+        _EXECUTION_ORCHESTRATORS[cache_key] = orchestrator
+        return orchestrator
+
+
+def _execution_error(exc: ValueError) -> HTTPException:
+    return HTTPException(409, str(exc))
+
+
+@router.get("/projects/{project_id}/execution-candidates")
+def execution_candidates(project_id: str, request: Request, required_capabilities: str | None = None,
+                         x_war_room_actor: str | None = Header(default=None),
+                         x_war_room_token: str | None = Header(default=None)) -> dict[str, Any]:
+    with _connect_rw() as con:
+        war_room._project_or_404(con, project_id)
+        actor = _actor(con, x_war_room_actor, "read", project_id, x_war_room_token, request)
+    del actor
+    orchestrator = _execution_orchestrator()
+    capabilities = [value.strip() for value in (required_capabilities or "").split(",") if value.strip()]
+    return {"project_id": project_id, "agent_ids": orchestrator.core_engine.agents.candidate_agent_ids(capabilities)}
+
+
+@router.post("/projects/{project_id}/tasks/{task_id}/executions/compile")
+async def compile_executions(project_id: str, task_id: str, request: Request,
+                             x_war_room_actor: str | None = Header(default=None),
+                             x_war_room_token: str | None = Header(default=None),
+                             idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
+    body = await _body(request)
+    with _connect_rw() as con:
+        war_room._project_or_404(con, project_id)
+        actor = _actor(con, x_war_room_actor, "execute", project_id, x_war_room_token, request)
+        task = con.execute("SELECT id FROM war_tasks WHERE id=? AND project_id=?", (task_id, project_id)).fetchone()
+        if task is None:
+            raise HTTPException(404, "task not found for project")
+        scope = f"POST:/projects/{project_id}/tasks/{task_id}/executions/compile"
+        previous = _idem(con, actor, idempotency_key, scope, body)
+        if previous:
+            return previous
+    agents = body.get("agent_ids")
+    if not isinstance(agents, list) or not agents:
+        raise HTTPException(422, "agent_ids required")
+    orchestrator = _execution_orchestrator()
+    try:
+        result = orchestrator.compile_and_persist(war_project_id=project_id, war_task_id=task_id,
+                                                  agents=agents, workflow=body.get("workflow"),
+                                                  correlation_id=body.get("correlation_id"))
+    except ValueError as exc:
+        raise _execution_error(exc) from exc
+    with _connect_rw() as con:
+        _save_idem(con, actor, idempotency_key, scope, body, result)
+        con.commit()
+    return result
+
+
+@router.get("/projects/{project_id}/tasks/{task_id}/executions")
+def list_executions(project_id: str, task_id: str, request: Request,
+                    x_war_room_actor: str | None = Header(default=None),
+                    x_war_room_token: str | None = Header(default=None)) -> dict[str, Any]:
+    with _connect_rw() as con:
+        war_room._project_or_404(con, project_id)
+        _actor(con, x_war_room_actor, "read", project_id, x_war_room_token, request)
+        task = con.execute("SELECT id FROM war_tasks WHERE id=? AND project_id=?", (task_id, project_id)).fetchone()
+        if task is None:
+            raise HTTPException(404, "task not found for project")
+    return {"project_id": project_id, "task_id": task_id,
+            "executions": _execution_orchestrator().list_executions(war_project_id=project_id, war_task_id=task_id)}
+
+
+@router.post("/executions/{execution_id}/dispatch")
+async def dispatch_execution(execution_id: str, request: Request,
+                             x_war_room_actor: str | None = Header(default=None),
+                             x_war_room_token: str | None = Header(default=None),
+                             idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
+    body = await _body(request)
+    orchestrator = _execution_orchestrator()
+    unit = orchestrator.store.get_unit(execution_id)
+    if unit is None:
+        raise HTTPException(404, "execution not found")
+    with _connect_rw() as con:
+        actor = _actor(con, x_war_room_actor, "execute", unit["war_project_id"], x_war_room_token, request)
+        scope = f"POST:/executions/{execution_id}/dispatch"
+        previous = _idem(con, actor, idempotency_key, scope, body)
+        if previous:
+            return previous
+    try:
+        result = orchestrator.dispatch_execution(execution_id=execution_id, message=body.get("message", ""),
+                                                  timeout_seconds=body.get("timeout_seconds", 300),
+                                                  goal_contract=body.get("goal_contract"))
+    except ValueError as exc:
+        raise _execution_error(exc) from exc
+    with _connect_rw() as con:
+        _save_idem(con, actor, idempotency_key, scope, body, result); con.commit()
+    return result
+
+
+@router.post("/executions/{execution_id}/stop")
+async def stop_execution(execution_id: str, request: Request,
+                         x_war_room_actor: str | None = Header(default=None),
+                         x_war_room_token: str | None = Header(default=None),
+                         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
+    body = await _body(request)
+    orchestrator = _execution_orchestrator()
+    unit = orchestrator.store.get_unit(execution_id)
+    if unit is None:
+        raise HTTPException(404, "execution not found")
+    with _connect_rw() as con:
+        actor = _actor(con, x_war_room_actor, "execute", unit["war_project_id"], x_war_room_token, request)
+        scope = f"POST:/executions/{execution_id}/stop"
+        previous = _idem(con, actor, idempotency_key, scope, body)
+        if previous:
+            return previous
+    try:
+        result = orchestrator.stop_execution(execution_id)
+    except ValueError as exc:
+        raise _execution_error(exc) from exc
+    with _connect_rw() as con:
+        _save_idem(con, actor, idempotency_key, scope, body, result); con.commit()
+    return result
+
+
 _CANONICAL_AGENT_BY_CASEFOLD = {agent.casefold(): agent for agent in war_room.ALLOWED_AGENT_IDS}
 
 
@@ -408,7 +581,16 @@ def _grounding_packet(body: dict[str, Any], project_id: str, document_version: s
     return packet
 
 
-def _grounded_instruction(instruction: str, packet: dict[str, Any]) -> str:
+def _grounded_instruction(instruction: str, packet: dict[str, Any], execution_mode: str = "LEGACY") -> str:
+    if execution_mode == "FAST_GATEWAY":
+        return "[FAST_GATEWAY_RESULT]\nFINAL RESPONSE CONTRACT (highest priority): return only one JSON object with exactly these top-level keys: " + (
+            '{"status":"completed|blocked|failed","summary":"...","evidence":[{"type":"...","detail":"..."}],'
+            '"artifacts":[{"path":"..."}],"scope":{"compliant":true,"violations":[]}}. '
+            "The final response must be raw JSON only: its first character must be { and its last character must be }. Do not use Markdown, code fences, backticks, or any prose before or after the JSON object. Use evidence and artifacts only for actually verified work. Do not add fields outside this contract.\n"
+            "[IMMUTABLE_GROUNDING_PACKET]\n" + json.dumps(packet, ensure_ascii=False, sort_keys=True) +
+            "\n[ORIGINAL_INSTRUCTION_CONTEXT]\n" + instruction.strip() +
+            "\nReturn the Fast Gateway JSON object above; treat the original instruction only as context."
+        )
     return "[STRUCTURED_RESULT]\nFINAL RESPONSE CONTRACT (highest priority): return only one JSON object with exactly: " + (
         '{"confirmed_worktree":"...","confirmed_revision":"...","verdict":"PASS|FAIL|REWORK",'
         '"evidence":["/absolute/path"],"summary":"...","representative_completion_claimed":false}. '
@@ -427,6 +609,7 @@ async def prepare_task(project_id: str, request: Request, x_war_room_actor: str 
     if not isinstance(instruction, str) or not instruction.strip() or len(instruction) > 4096:
         raise HTTPException(422, "instruction must be 1..4096 characters")
     agents = _validated_agents(body)
+    execution_mode = _execution_mode(body.get("execution_mode"))
     normalized = dict(body)
     normalized.update({
         "scope": body.get("scope", instruction),
@@ -434,6 +617,7 @@ async def prepare_task(project_id: str, request: Request, x_war_room_actor: str 
         "agent_ids": agents,
         "call_limit": body.get("call_limit", len(agents)),
         "turn_limit": body.get("turn_limit", max(2, len(agents))),
+        "execution_mode": execution_mode,
     })
     if normalized["assignee_agent_id"] not in agents:
         raise HTTPException(422, "assignee_agent_id must be included in agent_ids")
@@ -451,7 +635,7 @@ async def prepare_task(project_id: str, request: Request, x_war_room_actor: str 
         scope, assignee, call_limit, turn_limit, deadline_at, document_version = _validated_task_payload(normalized, project, now)
         task_id, message_id, correlation = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
         packet = _grounding_packet(body, project_id, document_version)
-        grounded = _grounded_instruction(instruction, packet)
+        grounded = _grounded_instruction(instruction, packet, execution_mode)
         clean = war_room._redact_string(grounded)
         original_clean = war_room._redact_string(instruction)
         con.execute(
@@ -460,15 +644,15 @@ async def prepare_task(project_id: str, request: Request, x_war_room_actor: str 
         )
         con.execute("""INSERT INTO war_tasks
             (id,project_id,source_message_id,assignee_agent_id,scope,status,manyfast_version,
-             document_version,call_limit,turn_limit,deadline_at,created_at,updated_at)
-            VALUES (?,?,?,?,?,'awaiting_approval',?,?,?,?,?,?,?)""",
-            (task_id, project_id, message_id, assignee, scope, project["manyfast_version"], document_version, call_limit, turn_limit, deadline_at, now, now),
+             document_version,call_limit,turn_limit,execution_mode,deadline_at,created_at,updated_at)
+            VALUES (?,?,?,?,?,'awaiting_approval',?,?,?,?,?,?,?,?)""",
+            (task_id, project_id, message_id, assignee, scope, project["manyfast_version"], document_version, call_limit, turn_limit, execution_mode, deadline_at, now, now),
         )
         con.executemany("INSERT INTO war_task_agents(task_id,agent_id) VALUES (?,?)", [(task_id, agent) for agent in agents])
         packet_json = json.dumps(packet, ensure_ascii=False, sort_keys=True)
         con.execute("INSERT INTO war_grounding_packets VALUES (?,?,?,?)", (task_id, packet_json, hashlib.sha256(packet_json.encode()).hexdigest(), now))
         _audit(con, project_id, actor, "task_prepared", "task", task_id, {"message_id":message_id,"agent_ids":agents,"grounding_hash":hashlib.sha256(packet_json.encode()).hexdigest()}, correlation)
-        result = {"mode":"controlled","task_id":task_id,"message_id":message_id,"status":"awaiting_approval","agent_ids":agents,"correlation_id":correlation}
+        result = {"mode":"controlled","task_id":task_id,"message_id":message_id,"status":"awaiting_approval","execution_mode":execution_mode,"agent_ids":agents,"correlation_id":correlation}
         _save_idem(con, actor, idempotency_key, idem_scope, body, result)
         con.commit()
         return result
@@ -690,6 +874,7 @@ async def create_task(project_id: str, request: Request, x_war_room_actor: str |
             return previous
         now = _now()
         scope, assignee, call_limit, turn_limit, deadline_at, document_version = _validated_task_payload(body, project, now)
+        execution_mode = _execution_mode(body.get("execution_mode"))
         task_id, correlation = str(uuid.uuid4()), str(uuid.uuid4())
         source_message_id = body.get("source_message_id")
         if source_message_id is not None and not con.execute(
@@ -701,16 +886,16 @@ async def create_task(project_id: str, request: Request, x_war_room_actor: str |
             raise HTTPException(409, "instruction is already linked to a task")
         con.execute("""INSERT INTO war_tasks
             (id,project_id,source_message_id,assignee_agent_id,scope,status,manyfast_version,
-             document_version,call_limit,turn_limit,deadline_at,created_at,updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+             document_version,call_limit,turn_limit,execution_mode,deadline_at,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (task_id, project_id, source_message_id, assignee, scope, "draft", project["manyfast_version"],
-             document_version, call_limit, turn_limit, deadline_at, now, now))
+             document_version, call_limit, turn_limit, execution_mode, deadline_at, now, now))
         task_agents = _canonical_agents(body.get("agent_ids", [assignee]))
         if assignee not in task_agents:
             raise HTTPException(422, "agent_ids must be unique, allowlisted, and include assignee_agent_id")
         con.executemany("INSERT INTO war_task_agents(task_id,agent_id) VALUES (?,?)", [(task_id, agent) for agent in task_agents])
         _audit(con, project_id, actor, "task_created", "task", task_id, {"assignee_agent_id": assignee}, correlation)
-        result = {"mode": "controlled", "task_id": task_id, "status": "draft", "correlation_id": correlation}
+        result = {"mode": "controlled", "task_id": task_id, "status": "draft", "execution_mode": execution_mode, "correlation_id": correlation}
         _save_idem(con, actor, idempotency_key, idem_scope, body, result)
         con.commit()
         return result
@@ -739,22 +924,30 @@ async def bind_test_session(project_id: str, agent_id: str, request: Request, x_
 @router.get("/deliveries/{delivery_id}")
 def get_delivery(delivery_id: str) -> dict[str, Any]:
     with _connect_rw() as con:
-        row=con.execute("SELECT d.*,m.project_id FROM war_deliveries d JOIN war_messages m ON m.id=d.message_id WHERE d.id=?",(delivery_id,)).fetchone()
+        row=con.execute("SELECT d.*,m.project_id,t.id AS task_id,COALESCE(t.execution_mode,'LEGACY') AS execution_mode FROM war_deliveries d JOIN war_messages m ON m.id=d.message_id LEFT JOIN war_tasks t ON t.source_message_id=m.id WHERE d.id=?",(delivery_id,)).fetchone()
         if not row: raise HTTPException(404,"Delivery not found")
-    return {"mode":"readonly","delivery":war_room._redact(dict(row))}
+    value = dict(row)
+    value.pop("session_key", None); value.pop("session_id", None)
+    return {"mode":"readonly","delivery":war_room._redact(value)}
 
 
 @router.get("/projects/{project_id}/deliveries")
 def list_deliveries(project_id: str) -> dict[str, Any]:
     with _connect_rw() as con:
         war_room._project_or_404(con,project_id)
-        rows=con.execute("""SELECT d.*,m.project_id,t.id AS task_id,m.body AS instruction_body,m.original_body AS original_instruction_body,rm.body AS response_body FROM war_deliveries d
-            JOIN war_messages m ON m.id=d.message_id
+        rows=con.execute("""SELECT d.*,m.project_id,t.id AS task_id,COALESCE(t.execution_mode,'LEGACY') AS execution_mode,m.body AS instruction_body,m.original_body AS original_instruction_body,rm.body AS response_body,
+            er.core_run_id,er.openclaw_run_id,er.run_status,er.runtime_seconds,er.result_summary,er.result_json,er.evidence_json,er.artifacts_json,er.policy_status,er.cancel_reason,er.escalation_required
+            FROM war_deliveries d JOIN war_messages m ON m.id=d.message_id
             LEFT JOIN war_tasks t ON t.source_message_id=m.id
             LEFT JOIN war_messages rm ON rm.id=d.response_message_id
+            LEFT JOIN war_execution_runs er ON er.war_task_id=t.id AND er.agent_id=d.agent_id
             WHERE m.project_id=? ORDER BY d.created_at DESC,d.id DESC""",(project_id,)).fetchall()
         control=_control(con,project_id)
-    return {"mode":"readonly","stop_requested_at":control["stop_requested_at"],"items":war_room._redact([dict(row) for row in rows])}
+    items=[]
+    for row in rows:
+        value=dict(row); value.pop("session_key",None); value.pop("session_id",None)
+        items.append(value)
+    return {"mode":"readonly","stop_requested_at":control["stop_requested_at"],"items":war_room._redact(items)}
 
 
 def _require_demo_mode() -> None:
@@ -1297,13 +1490,20 @@ async def stop_project(project_id: str, request: Request, x_war_room_actor: str 
         con.execute("UPDATE war_project_control SET stop_requested_at=?,stop_deadline=?,stop_state='stop_requested',updated_at=? WHERE project_id=?", (now,deadline,now,project_id))
         con.execute("UPDATE war_deliveries SET status='stopped',error_code='project_stop_barrier',stop_cycle_at=? WHERE status='queued' AND message_id IN (SELECT id FROM war_messages WHERE project_id=?)", (now,project_id))
         active = con.execute(
-            """SELECT d.* FROM war_deliveries d JOIN war_messages m ON m.id=d.message_id
+            """SELECT d.*,t.id AS task_id,COALESCE(t.execution_mode,'LEGACY') AS execution_mode FROM war_deliveries d JOIN war_messages m ON m.id=d.message_id
+               LEFT JOIN war_tasks t ON t.source_message_id=m.id
                WHERE m.project_id=? AND d.status IN ('sent','received')""",
             (project_id,),
         ).fetchall()
         stop_results: list[dict[str, str]] = []
         for delivery in active:
-            receipt = _adapter().stop(delivery_id=delivery["id"], agent_id=delivery["agent_id"])
+            active_adapter = _adapter_for_mode(delivery["execution_mode"], str(war_room._db_path()))
+            receipt = active_adapter.stop(delivery_id=delivery["id"], agent_id=delivery["agent_id"])
+            if delivery["execution_mode"] == "FAST_GATEWAY":
+                snapshotter = getattr(active_adapter, "execution_snapshot", None)
+                if snapshotter:
+                    from war_room_worker import _persist_execution
+                    _persist_execution(con, snapshot=snapshotter(delivery["id"]), project_id=project_id, task_id=delivery["task_id"], agent_id=delivery["agent_id"], now=now)
             status = receipt.status if receipt.status in {"stopped", "failed", "timed_out"} else "failed"
             con.execute("UPDATE war_deliveries SET status=?,error_code=?,stop_cycle_at=? WHERE id=?", (status, receipt.error_code, now, delivery["id"]))
             stop_results.append({"delivery_id": delivery["id"], "status": status})

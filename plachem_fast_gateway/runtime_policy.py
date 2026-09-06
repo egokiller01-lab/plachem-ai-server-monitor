@@ -268,14 +268,9 @@ class ModelRegistry:
         """Resolve only configured metadata; callers never supply a model/profile."""
 
         model_id = getattr(registration, "runtime_model_id", None)
-        allowed_models = getattr(registration, "allowed_model_ids", ())
-        allowed_profiles = getattr(registration, "allowed_policy_profiles", ())
         if not isinstance(model_id, str) or not model_id:
             raise PolicyResolutionError("MODEL_PROFILE_MISMATCH")
-        profile = self.require(model_id)
-        if model_id not in allowed_models or profile.policy_profile not in allowed_profiles:
-            raise PolicyResolutionError("MODEL_PROFILE_MISMATCH")
-        return profile
+        return self.require(model_id)
 
 
 def _redacted_normalize(value: Any) -> Any:

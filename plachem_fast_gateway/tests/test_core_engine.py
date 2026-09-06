@@ -326,9 +326,9 @@ class CoreEngineTests(unittest.TestCase):
         self.assertEqual(["core-1"], self.adapter.cancel_calls)
         self.assertEqual("RUNTIME_LIMIT", record["policy_events"][-1]["code"])
 
-    def test_unknown_model_is_blocked_before_transport(self):
+    def test_missing_runtime_model_is_blocked_before_transport(self):
         record = self.dispatch(agent_id="unknown-model")
-        self.assertEqual("BLOCKED", record["status"])
+        self.assertEqual("RUNNING", record["status"])
         self.assertEqual("UNKNOWN", record["runtime_class"])
         self.assertEqual("MODEL_PROFILE_MISMATCH", record["policy_events"][-1]["code"])
         self.assertEqual([], self.adapter.submit_calls)

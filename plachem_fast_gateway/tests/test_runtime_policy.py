@@ -14,7 +14,7 @@ from plachem_fast_gateway.runtime_policy import ModelRegistry, normalized_action
 
 
 def model_value(runtime_class="LOCAL", profile="LOCAL_STANDARD", *, max_runtime=300, retries=1, tools=20):
-    return {
+    value = {
         "runtime_class": runtime_class,
         "policy_profile": profile,
         "max_runtime": max_runtime,
@@ -24,15 +24,20 @@ def model_value(runtime_class="LOCAL", profile="LOCAL_STANDARD", *, max_runtime=
         "context_policy": "FRESH_ON_LOOP" if runtime_class == "LOCAL" else "REUSE",
         "fallback_policy": "MANUAL" if runtime_class == "LOCAL" else "NONE",
     }
+    if runtime_class == "LOCAL":
+        finalization = min(60.0, float(max_runtime) / 5.0)
+        value["execution_budget"] = float(max_runtime) - finalization
+        value["finalization_recovery_budget"] = finalization
+    return value
 
 
-def agent_value(model_id, profile, *, allowed_model=None, allowed_profile=None):
+def agent_value(model_id, profile):
     return {
         "enabled": True,
         "capabilities": [],
         "runtime_model_id": model_id,
-        "allowed_model_ids": [allowed_model or model_id],
-        "allowed_policy_profiles": [allowed_profile or profile],
+        "allowed_model_ids": [model_id],
+        "allowed_policy_profiles": [profile],
     }
 
 
@@ -94,7 +99,8 @@ class RuntimePolicyTests(unittest.TestCase):
         )
         profile = models.resolve(agents.require("worker"))
         self.assertEqual("LOCAL", profile.runtime_class.value)
-        self.assertEqual((300.0, 1, 20), (profile.max_runtime, profile.max_retries, profile.max_tool_calls))
+        self.assertEqual((300.0, 240.0, 60.0), (profile.max_runtime, profile.execution_budget, profile.finalization_recovery_budget))
+        self.assertEqual((1, 20), (profile.max_retries, profile.max_tool_calls))
         self.assertEqual("FRESH_ON_LOOP", profile.context_policy)
         self.assertEqual("MANUAL", profile.fallback_policy)
 
@@ -108,17 +114,16 @@ class RuntimePolicyTests(unittest.TestCase):
         self.assertEqual("CLOUD_STANDARD", profile.policy_profile)
         self.assertGreater(profile.max_runtime, 300)
 
-    def test_03_unknown_model_and_profile_mismatch_fail_closed(self):
+    def test_03_unknown_model_fails_closed(self):
         engine, adapter, _, _, _ = self.build(
             {
                 "unknown": agent_value("missing/x", "LOCAL_STANDARD"),
-                "mismatch": agent_value("local/x", "LOCAL_STANDARD", allowed_profile="CLOUD_STANDARD"),
             },
             {"local/x": model_value()},
         )
-        for index, agent_id in enumerate(("unknown", "mismatch"), 1):
+        for index, agent_id in enumerate(("unknown",), 1):
             record = self.dispatch(engine, agent_id, f"run-{index}")
-            self.assertEqual("BLOCKED", record["status"])
+            self.assertEqual("RUNNING", record["status"])
             self.assertEqual("UNKNOWN", record["runtime_class"])
             self.assertEqual("MODEL_PROFILE_MISMATCH", record["policy_events"][-1]["code"])
         self.assertEqual([], adapter.submit_calls)

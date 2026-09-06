@@ -46,11 +46,14 @@ class Adapter:
 
 
 def model(runtime="LOCAL", context="FRESH_ON_LOOP"):
-    return {
+    value = {
         "runtime_class": runtime, "policy_profile": f"{runtime}_STANDARD", "max_runtime": 300,
         "max_retries": 1, "max_tool_calls": 20, "loop_guard": {"consecutive_threshold": 3},
         "context_policy": context, "fallback_policy": "MANUAL", "max_context_resets": 1,
     }
+    if runtime == "LOCAL":
+        value.update(execution_budget=240, finalization_recovery_budget=60)
+    return value
 
 
 def agent(model_id, runtime="LOCAL"):
