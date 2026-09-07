@@ -15,13 +15,22 @@ from typing import Any
 from war_room_adapter import OpenClawSessionAdapter, SessionAdapter
 from war_room_worker import process_due_deliveries, recover_received_deliveries, request_project_stop
 import war_room
+from war_room_agents import canonical_agent_id, load_agent_catalog
+from fast_gateway_service import get_persistent_harness
+from war_room_fast_gateway import FastGatewayWarRoomAdapter
 
 
 def provision_disposable_sessions(*, db_path: str | Path, adapter: Any, project_id: str, agent_ids: list[str]) -> list[dict[str, Any]]:
     """Provision and bind explicit test-only sessions without touching work sessions."""
-    if (not agent_ids or len(agent_ids) != len(set(agent_ids))
-            or any(agent not in war_room.ALLOWED_AGENT_IDS or agent == "main" for agent in agent_ids)):
+    canonical_ids = [canonical_agent_id(agent) for agent in agent_ids]
+    if (not agent_ids or any(agent is None for agent in canonical_ids)
+            or len(canonical_ids) != len(set(canonical_ids))
+            or any(agent == "main" for agent in canonical_ids)):
         raise ValueError("unique non-main allowlisted agent_ids required")
+    agent_ids = [agent for agent in canonical_ids if agent is not None]
+    catalog = load_agent_catalog()
+    if any(not catalog[agent].execution_eligible for agent in agent_ids):
+        raise ValueError("all agents must be enabled Gateway execution candidates")
     with sqlite3.connect(Path(db_path)) as con:
         placeholders = ",".join("?" for _ in agent_ids)
         if not con.execute("SELECT 1 FROM war_projects WHERE id=?", (project_id,)).fetchone():
@@ -50,13 +59,23 @@ def provision_disposable_sessions(*, db_path: str | Path, adapter: Any, project_
 class WarRoomRuntime:
     def __init__(self, adapter: SessionAdapter | None = None) -> None:
         self.adapter = adapter or OpenClawSessionAdapter()
+        self._fast_adapter: FastGatewayWarRoomAdapter | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
     def tick(self, *, db_path: str | Path, now: int | None = None) -> list[dict[str, Any]]:
-        delivered = process_due_deliveries(db_path=db_path, adapter=self.adapter, now=now)
-        recovered = recover_received_deliveries(db_path=db_path, gateway=self.adapter, now=now)
+        delivered = process_due_deliveries(db_path=db_path, adapter=self.adapter, adapter_selector=self.adapter_for, now=now)
+        recovered = recover_received_deliveries(db_path=db_path, gateway=self.adapter, gateway_selector=self.adapter_for, now=now)
         return delivered + recovered
+
+    def adapter_for(self, execution_mode: str, db_path: str | Path) -> SessionAdapter:
+        if execution_mode != "FAST_GATEWAY":
+            return self.adapter
+        if self._fast_adapter is None:
+            # Delivery and Phase 2 must share the observer and Gateway owner.
+            # Adapter.poll() is a projection and does not collect completion.
+            self._fast_adapter = FastGatewayWarRoomAdapter(get_persistent_harness().engine, db_path)
+        return self._fast_adapter
 
     def stop_project(self, *, db_path: str | Path, project_id: str, actor_id: str, now: int | None = None) -> dict[str, Any]:
         return request_project_stop(db_path=db_path, project_id=project_id, actor_id=actor_id, adapter=self.adapter, now=now)
@@ -83,6 +102,9 @@ class WarRoomRuntime:
         closer = getattr(self.adapter, "close", None)
         if closer:
             closer()
+        # The application owns shared Harness shutdown. Closing this worker
+        # must not disconnect a Phase 2 execution using the same owner.
+        self._fast_adapter = None
 
 
 _RUNTIME: WarRoomRuntime | None = None

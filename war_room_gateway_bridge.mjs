@@ -1,52 +1,80 @@
 import readline from "node:readline";
-import { GatewayClient } from "file:///home/plachem-sever/.npm-global/lib/node_modules/openclaw/dist/plugin-sdk/gateway-runtime.js";
-import { loadConfig } from "file:///home/plachem-sever/.npm-global/lib/node_modules/openclaw/dist/plugin-sdk/config-runtime.js";
 
-const allowed = new Set(["bridge.status", "sessions.create", "sessions.resolve", "chat.history", "chat.send", "agent.wait", "chat.abort"]);
-const cfg = loadConfig();
-const port = cfg.gateway?.port ?? 18789;
-const token = typeof cfg.gateway?.auth?.token === "string" ? cfg.gateway.auth.token : process.env.OPENCLAW_GATEWAY_TOKEN;
+// This process is deliberately a tiny raw WebSocket RPC client.  The token is
+// injected by the service's SecretRef handling and is never read from output
+// or logged here.  Do not replace this with an OpenClaw bundled/dist import.
+const port = process.env.OPENCLAW_GATEWAY_PORT || "18789";
+const token = process.env.OPENCLAW_GATEWAY_TOKEN;
+if (!token) throw new Error("openclaw_gateway_token_missing");
+
+const socket = new WebSocket(`ws://127.0.0.1:${port}`);
+let nextId = 0;
 let connectionId = null;
-let sequence = 0;
-let readyResolve;
-let readyReject;
-const ready = new Promise((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
-const client = new GatewayClient({
-  url: `ws://127.0.0.1:${port}`,
-  token,
-  clientName: "gateway-client",
-  clientDisplayName: "PLACHEM War Room persistent adapter",
-  mode: "backend",
+const pending = new Map();
+
+function frame(id, method, params) {
+  return JSON.stringify({ type: "req", id, method, params });
+}
+
+function request(method, params, timeoutMs = 15000) {
+  const id = `war-room-${++nextId}`;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pending.delete(id);
+      reject(new Error("openclaw_gateway_timeout"));
+    }, timeoutMs);
+    pending.set(id, { resolve, reject, timer });
+    socket.send(frame(id, method, params));
+  });
+}
+
+socket.addEventListener("message", (event) => {
+  let value;
+  try { value = JSON.parse(String(event.data)); } catch { return; }
+  if (value?.type !== "res") return;
+  const waiter = pending.get(value.id);
+  if (!waiter) return;
+  pending.delete(value.id);
+  clearTimeout(waiter.timer);
+  if (value.ok === true && value.payload && typeof value.payload === "object") waiter.resolve(value.payload);
+  else waiter.reject(new Error(String(value.error?.message || value.error || "openclaw_gateway_rejected")));
+});
+
+socket.addEventListener("error", () => {
+  for (const waiter of pending.values()) { clearTimeout(waiter.timer); waiter.reject(new Error("openclaw_gateway_transport_failure")); }
+  pending.clear();
+});
+
+await new Promise((resolve, reject) => {
+  socket.addEventListener("open", resolve, { once: true });
+  socket.addEventListener("error", () => reject(new Error("openclaw_gateway_transport_failure")), { once: true });
+});
+const hello = await request("connect", {
+  minProtocol: 4,
+  maxProtocol: 4,
+  client: { id: "gateway-client", version: "plachem-war-room", platform: "linux", mode: "backend" },
   role: "operator",
   scopes: ["operator.read", "operator.write"],
-  onHelloOk: () => { connectionId = `connection-${++sequence}`; readyResolve(); },
-  onConnectError: (error) => readyReject(error),
-  onClose: () => { connectionId = null; },
+  auth: { token },
 });
-client.start();
-
-function testKey(params) {
-  return params?.sessionKey ?? params?.key ?? "";
-}
-
-await ready;
+connectionId = String(hello?.connectionId || "connected");
 process.stdout.write(JSON.stringify({ ready: true, connectionId }) + "\n");
+
+const allowed = new Set(["agent", "agent.wait", "chat.history", "chat.abort", "sessions.create", "bridge.status"]);
 const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 for await (const line of lines) {
-  let request;
+  let input;
   try {
-    request = JSON.parse(line);
-    if (!allowed.has(request.method)) throw new Error("method_not_allowed");
-    const key = testKey(request.params);
+    input = JSON.parse(line);
+    if (!allowed.has(input.method)) throw new Error("method_not_allowed");
+    const key = input.params?.sessionKey || input.params?.key || "";
     if (key && !/^agent:[a-z0-9_-]+:war-room-test:[a-z0-9-]+$/i.test(key)) throw new Error("non_disposable_session_rejected");
-    if (!connectionId) throw new Error("gateway_connection_unavailable");
-    const responseConnectionId = connectionId;
-    const result = request.method === "bridge.status"
-      ? { connected: true }
-      : await client.request(request.method, request.params, { timeoutMs: request.timeoutMs ?? 15000 });
-    process.stdout.write(JSON.stringify({ id: request.id, ok: true, result, connectionId: responseConnectionId }) + "\n");
+    const result = input.method === "bridge.status" ? { connected: socket.readyState === WebSocket.OPEN } : await request(input.method, input.params || {}, input.timeoutMs || 15000);
+    process.stdout.write(JSON.stringify({ id: input.id, ok: true, result, connectionId }) + "\n");
   } catch (error) {
-    process.stdout.write(JSON.stringify({ id: request?.id, ok: false, error: String(error?.message ?? error), connectionId }) + "\n");
+    // Never relay Gateway error text: a provider or auth layer must not be
+    // able to echo the SecretRef value into the monitor process or its logs.
+    process.stdout.write(JSON.stringify({ id: input?.id, ok: false, error: "openclaw_gateway_rejected", connectionId }) + "\n");
   }
 }
-await client.stopAndWait().catch(() => client.stop());
+socket.close();

@@ -1,0 +1,1 @@
+"""Fast Gateway tests."""

@@ -687,7 +687,7 @@
     .gpu-grid, .agent-grid { grid-template-columns: 1fr; gap: 8px; }
     .codex-card { padding: 10px 12px; }
     .codex-percent { font-size: 28px; }
-    .services { grid-template-columns: 105px repeat(3, 1fr); min-height: 52px; padding: 10px 14px; gap: 10px; margin-bottom: 8px; }
+    .services { grid-template-columns: 105px repeat(4, 1fr); min-height: 52px; padding: 10px 14px; gap: 10px; margin-bottom: 8px; }
     .service-title { font-size: 18px; gap: 7px; }
     .service-title .icon { font-size: 14px; }
     .service { font-size: 12px; gap: 6px; }
@@ -700,7 +700,7 @@
     @media (max-width: 1350px) {
       .kpis { grid-template-columns: repeat(6, minmax(76px, 1fr)); }
       .main-grid { grid-template-columns: 0.94fr 1.06fr; }
-      .services { grid-template-columns: 105px repeat(3, 1fr); }
+      .services { grid-template-columns: 105px repeat(4, 1fr); }
       .service { border-left: 1px solid rgba(154, 179, 214, 0.26); justify-content: center; }
     }
 
@@ -850,6 +850,83 @@
     .detail-table th, .detail-table td { padding: 5px 4px; border-bottom: 1px solid rgba(154, 179, 214, 0.14); text-align: left; }
     .detail-table th { color: var(--muted); font-weight: 650; }
     .detail-table td { color: var(--text); }
+
+    .auth-dashboard { grid-column: 1 / -1; display: grid; grid-template-columns: 208px minmax(0, 1fr); min-height: 820px; overflow: hidden; border: 1px solid rgba(36, 153, 207, .26); border-radius: 16px; background: rgba(3, 14, 27, .82); box-shadow: 0 22px 70px rgba(0,0,0,.30); }
+    .auth-sidebar { display: flex; flex-direction: column; padding: 18px 12px 14px; border-right: 1px solid rgba(36, 153, 207, .19); background: linear-gradient(180deg, rgba(7, 31, 54, .96), rgba(3, 18, 33, .98)); }
+    .auth-side-nav { display: grid; gap: 6px; }
+    .auth-side-item { display: flex; align-items: center; gap: 11px; width: 100%; min-height: 42px; padding: 0 12px; border: 0; border-radius: 8px; color: #c4d2e7; background: transparent; font: inherit; font-size: 12px; font-weight: 650; text-align: left; cursor: pointer; }
+    .auth-side-item i { width: 18px; color: #b9c9df; font-size: 15px; font-style: normal; text-align: center; }
+    .auth-side-item.active { color: #35d8ff; background: linear-gradient(90deg, rgba(0, 125, 196, .30), rgba(0, 94, 154, .13)); box-shadow: inset 3px 0 #18c7f4; }
+    .auth-side-item.active i { color: #35d8ff; }
+    .auth-side-foot { margin-top: auto; display: grid; gap: 10px; }
+    .auth-manager-pill { display: flex; align-items: center; justify-content: space-between; padding: 11px 12px; border: 1px solid rgba(48, 161, 207, .24); border-radius: 8px; color: #d7e7f8; background: rgba(10, 39, 62, .72); font-size: 11px; }
+    .auth-manager-pill b { color: var(--green); font-size: 9px; }
+    .auth-system-state { display: flex; align-items: center; gap: 7px; color: var(--green); font-size: 10px; }
+    .auth-system-state::before { content:""; width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 9px var(--green); }
+    .auth-main { min-width: 0; padding: 21px 22px 24px; }
+    .auth-hero { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 0 2px 18px; }
+    .auth-eyebrow { color: var(--cyan); font-size: 9px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase; }
+    .auth-hero h2 { margin: 3px 0 5px; font-size: 23px; }
+    .auth-hero p { margin: 0; max-width: 650px; color: var(--muted); font-size: 11px; line-height: 1.5; }
+    .auth-console-link { flex: 0 0 auto; padding: 10px 14px; border: 1px solid rgba(32, 217, 246, .42); border-radius: 8px; color: #edfaff; background: linear-gradient(135deg, rgba(11, 46, 73, .92), rgba(5, 25, 43, .92)); font-size: 11px; font-weight: 750; text-decoration: none; }
+    .auth-tabs { display: none; }
+    .auth-tab { padding: 7px 10px; border-radius: 6px; color: var(--muted); font-size: 10px; white-space: nowrap; }
+    .auth-tab.active { color: white; background: linear-gradient(135deg, rgba(43, 119, 245, .7), rgba(20, 185, 210, .42)); box-shadow: 0 0 14px rgba(32, 217, 246, .16); }
+    .auth-kpis { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; margin-bottom: 18px; }
+    .auth-kpi { min-height: 112px; padding: 16px 15px; border: 1px solid rgba(75, 148, 210, .28); border-radius: 11px; background: linear-gradient(145deg, rgba(10, 36, 60, .93), rgba(5, 20, 36, .95)); box-shadow: inset 0 0 30px rgba(28, 151, 198, .035); }
+    .auth-kpi span { display: block; color: #b8cae1; font-size: 11px; }
+    .auth-kpi strong { display: block; margin-top: 11px; font-size: 28px; line-height: 1; }
+    .auth-kpi small { display: block; margin-top: 8px; color: var(--muted); font-size: 9px; }
+    .auth-kpi.good strong { color: var(--green); } .auth-kpi.warn strong { color: var(--amber); } .auth-kpi.bad strong { color: var(--red); } .auth-kpi.info strong { color: var(--cyan); }
+    .auth-instruments { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)) minmax(210px, .92fr); gap: 12px; margin-bottom: 18px; }
+    .auth-dial-card, .auth-situation { min-height: 214px; border: 1px solid rgba(75, 148, 210, .30); border-radius: 12px; background: linear-gradient(150deg, rgba(10, 36, 60, .96), rgba(4, 18, 33, .97)); box-shadow: inset 0 0 34px rgba(28, 151, 198, .045), 0 12px 30px rgba(0,0,0,.18); }
+    .auth-dial-card { display: grid; justify-items: center; align-content: center; padding: 15px 10px 13px; }
+    .auth-dial-title { margin-bottom: 10px; color: #b8cae1; font-size: 10px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; }
+    .auth-dial { --dial-value: 0; --dial-color: var(--cyan); position: relative; width: 132px; aspect-ratio: 1; display: grid; place-items: center; border-radius: 50%; background: conic-gradient(from 220deg, var(--dial-color) calc(var(--dial-value) * .78%), rgba(50, 76, 105, .26) 0 78%, transparent 78% 100%); filter: drop-shadow(0 0 13px color-mix(in srgb, var(--dial-color) 28%, transparent)); }
+    .auth-dial::before { content: ""; position: absolute; inset: 11px; border-radius: 50%; border: 1px solid rgba(123, 177, 218, .20); background: radial-gradient(circle at 50% 38%, rgba(17, 54, 82, .96), rgba(3, 15, 28, .99) 70%); box-shadow: inset 0 0 22px rgba(0,0,0,.42); }
+    .auth-dial::after { content: ""; position: absolute; left: 50%; bottom: 3px; width: 44px; height: 20px; transform: translateX(-50%); background: #061323; }
+    .auth-dial-center { position: relative; z-index: 1; margin-top: -2px; text-align: center; }
+    .auth-dial-value { display: block; color: #f5fbff; font-size: 31px; font-weight: 850; line-height: 1; }
+    .auth-dial-value small { font-size: 13px; color: #9eb3cc; }
+    .auth-dial-state { display: block; margin-top: 7px; color: var(--dial-color); font-size: 8px; font-weight: 850; letter-spacing: .10em; text-transform: uppercase; }
+    .auth-dial-foot { margin-top: 7px; color: var(--muted); font-size: 8px; text-align: center; }
+    .auth-situation { padding: 15px; }
+    .auth-situation h3 { margin: 0 0 5px; font-size: 13px; }
+    .auth-situation > p { margin: 0 0 13px; color: var(--muted); font-size: 9px; }
+    .auth-state-list { display: grid; gap: 7px; }
+    .auth-state-row { display: grid; grid-template-columns: 8px 1fr auto; align-items: center; gap: 8px; padding: 7px 8px; border: 1px solid rgba(100, 150, 195, .14); border-radius: 7px; background: rgba(4, 17, 31, .58); font-size: 9px; }
+    .auth-state-row i { width: 7px; height: 7px; border-radius: 50%; background: var(--state-color); box-shadow: 0 0 8px var(--state-color); }
+    .auth-state-row span { color: #b9cbe0; }
+    .auth-state-row strong { color: var(--state-color); font-size: 13px; }
+    .auth-verdict { margin-top: 10px; padding: 8px 9px; border-left: 2px solid var(--verdict-color); color: #d7e5f4; background: color-mix(in srgb, var(--verdict-color) 7%, transparent); font-size: 9px; line-height: 1.45; }
+    .auth-panel { overflow: hidden; border: 1px solid rgba(75, 148, 210, .27); border-radius: 11px; background: linear-gradient(145deg, rgba(8, 30, 51, .92), rgba(4, 18, 33, .94)); }
+    .auth-panel-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 15px 16px; border-bottom: 1px solid rgba(75, 148, 210, .18); }
+    .auth-panel-head h3 { margin: 0; font-size: 14px; }
+    .auth-panel-head span { color: var(--muted); font-size: 10px; }
+    .auth-table-wrap { width: 100%; overflow-x: auto; }
+    .auth-table { width: 100%; min-width: 760px; border-collapse: collapse; font-size: 11px; }
+    .auth-table th { padding: 11px 14px; color: #8da4c2; background: rgba(8, 35, 56, .66); font-size: 9px; letter-spacing: .04em; text-align: left; text-transform: uppercase; }
+    .auth-table td { padding: 12px 14px; border-top: 1px solid rgba(154, 179, 214, .1); color: #e3edf9; }
+    .auth-service { font-weight: 750; text-transform: capitalize; }
+    .auth-action { max-width: 210px; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 8px; overflow-wrap: anywhere; }
+    .auth-badge { display: inline-flex; align-items: center; gap: 5px; padding: 3px 7px; border: 1px solid currentColor; border-radius: 999px; font-size: 8px; font-weight: 800; text-transform: uppercase; }
+    .auth-badge::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor; box-shadow: 0 0 8px currentColor; }
+    .auth-badge.healthy, .auth-badge.pass { color: var(--green); } .auth-badge.warning, .auth-badge.unverified { color: var(--amber); } .auth-badge.error, .auth-badge.fail { color: var(--red); }
+    .auth-two-col { display: grid; grid-template-columns: 1.2fr .8fr; gap: 12px; margin-top: 12px; }
+    .auth-empty { padding: 18px 13px; color: var(--green); font-size: 10px; }
+    .auth-scope-note { margin-top: 12px; padding: 12px 14px; border-left: 2px solid var(--amber); color: var(--muted); background: rgba(255, 178, 28, .05); font-size: 10px; line-height: 1.5; }
+    .auth-view[hidden] { display: none !important; }
+    .auth-view-title { display: flex; align-items: end; justify-content: space-between; gap: 12px; margin: 1px 0 14px; }
+    .auth-view-title h3 { margin: 0; font-size: 18px; }
+    .auth-view-title p { margin: 4px 0 0; color: var(--muted); font-size: 10px; }
+    .auth-insights { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 10px; margin-bottom: 12px; }
+    .auth-insight { padding: 13px 14px; border: 1px solid rgba(75,148,210,.24); border-left: 3px solid var(--insight-color); border-radius: 9px; background: rgba(6,24,42,.78); }
+    .auth-insight strong { display: block; margin-bottom: 5px; color: var(--insight-color); font-size: 11px; }
+    .auth-insight span { color: #b8c8dc; font-size: 9px; line-height: 1.5; }
+    .auth-mobile-tabs { display: none; gap: 6px; overflow-x: auto; margin-bottom: 12px; padding-bottom: 3px; }
+    .auth-mobile-tabs button { flex: 0 0 auto; padding: 7px 10px; border: 1px solid rgba(75,148,210,.25); border-radius: 7px; color: #aebed3; background: rgba(5,23,40,.82); font-size: 9px; }
+    .auth-mobile-tabs button.active { color: var(--cyan); border-color: var(--cyan); }
+    body.auth-control-open #detail-view > .detail-header { display: none; }
     .wide { grid-column: 1 / -1; }
     .status-normal, .status-running, .status-ok { color: var(--green); }
     .status-warning, .status-unknown, .status-stopped { color: var(--amber); }
@@ -866,6 +943,20 @@
       .detail-header { align-items: flex-start; flex-direction: column; }
       .detail-kv { grid-template-columns: 1fr; }
       .detail-table { font-size: 10px; }
+      .auth-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .auth-instruments { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .auth-two-col { grid-template-columns: 1fr; }
+      .auth-hero { flex-direction: column; }
+      .auth-dashboard { grid-template-columns: 1fr; }
+      .auth-sidebar { display: none; }
+      .auth-main { padding: 14px 10px 18px; }
+      .auth-mobile-tabs { display: flex; }
+      .auth-insights { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 480px) {
+      .auth-instruments { grid-template-columns: 1fr; }
+      .auth-dial-card { min-height: 188px; }
+      .auth-dial { width: 124px; }
     }
 
     /* Premium PLACHEM dashboard refresh */
@@ -926,7 +1017,7 @@
     .net-value { font-size: 26px; }
     .net-arrow { font-size: 32px; }
     .divider { background: rgba(148,163,184,0.20); height: 96px; }
-    .services { grid-template-columns: 250px repeat(3, 1fr); min-height: 72px; padding: 18px 26px; gap: 22px; margin-bottom: 16px; border-radius: 16px; }
+    .services { grid-template-columns: 250px repeat(4, 1fr); min-height: 72px; padding: 18px 26px; gap: 22px; margin-bottom: 16px; border-radius: 16px; }
     .service-title { font-size: 24px; }
     .service { justify-content: flex-start; gap: 12px; font-size: 18px; border-left-color: rgba(148,163,184,0.18); padding-left: 28px; }
     .pill { width: 12px; height: 12px; }
@@ -1010,7 +1101,7 @@
     .oc-segment span { font-size: 7px; }
     .oc-segment strong { font-size: 9px; }
     .openclaw-control-button { min-height: 24px; padding: 0 8px; border-radius: 7px; font-size: 8px; }
-    .services { grid-template-columns: 110px repeat(3, 1fr); min-height: 32px; padding: 7px 10px; gap: 8px; margin-bottom: 7px; }
+    .services { grid-template-columns: 110px repeat(4, 1fr); min-height: 32px; padding: 7px 10px; gap: 8px; margin-bottom: 7px; }
     .service-title { font-size: 12px; gap: 5px; }
     .service { gap: 5px; font-size: 9px; padding-left: 8px; }
     .pill { width: 6px; height: 6px; }
@@ -1062,6 +1153,10 @@
     @media (min-width: 900px) {
       .gpu-grid, .agent-grid, .codex-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
+    body.auth-control-open .shell { width: min(1400px, calc(100vw - 32px)); max-width: none; }
+    @media (max-width: 720px) {
+      body.auth-control-open .shell { width: calc(100vw - 20px); }
+    }
   </style>
 </head>
 <body>
@@ -1092,10 +1187,7 @@
       <div class="kpi amber"><span class="icon">🌡</span><span class="label">CPU TEMP</span><span id="kpi-cpu-temp" class="value">--</span></div>
     </section>
 
-    <section class="gpu-grid">
-      <article class="card gpu-unit-card clickable" data-detail="gpu" id="gpu-card-0"></article>
-      <article class="card gpu-unit-card clickable" data-detail="gpu" id="gpu-card-1"></article>
-    </section>
+    <section class="gpu-grid" id="gpu-grid"></section>
 
     <section class="codex-grid">
       <article class="card codex-card" id="codex-weekly-card">
@@ -1149,6 +1241,7 @@
       <div id="svc-openclaw" class="service unknown"><span class="pill"></span><span>OpenClaw</span><span class="service-state">Unknown</span></div>
       <div id="svc-ollama" class="service unknown"><span class="pill"></span><span>Ollama</span><span class="service-state">Unknown</span></div>
       <div id="svc-tailscale" class="service unknown"><span class="pill"></span><span>Tailscale</span><span class="service-state">Unknown</span></div>
+      <div id="svc-openconnector" class="service unknown"><span class="pill"></span><span>OpenConnector</span><span class="service-state">Unknown</span></div>
     </section>
     </section>
 
@@ -1190,6 +1283,8 @@
   <script>
     const maxPoints = 42;
     const kpiHistory = { cpu: [], ram: [], download: [], upload: [], disk: [], temperature: [] };
+    const gpuLoadHistory = new Map();
+    const gpuPeakWindowMs = 10000;
 
     function ensureKpiSparks() {
       document.querySelectorAll(".kpi").forEach((node, index) => {
@@ -1223,6 +1318,15 @@
       return Math.max(0, Math.min(100, value));
     }
 
+    function recentGpuPeak(index, value) {
+      const now = Date.now();
+      const samples = gpuLoadHistory.get(index) || [];
+      if (Number.isFinite(value)) samples.push({ time: now, value: clampPercent(value) });
+      const recent = samples.filter(sample => now - sample.time <= gpuPeakWindowMs);
+      gpuLoadHistory.set(index, recent);
+      return recent.length ? Math.max(...recent.map(sample => sample.value)) : 0;
+    }
+
     function formatBps(bytes) {
       if (!Number.isFinite(bytes)) return "Unknown";
       if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB/s`;
@@ -1235,8 +1339,16 @@
     }
 
     function renderGpuCard(index, gpu) {
-      const card = document.getElementById(`gpu-card-${index}`);
-      if (!card) return;
+      const grid = document.getElementById("gpu-grid");
+      if (!grid) return;
+      let card = document.getElementById(`gpu-card-${index}`);
+      if (!card) {
+        card = document.createElement("article");
+        card.className = "card gpu-unit-card clickable";
+        card.dataset.detail = "gpu";
+        card.id = `gpu-card-${index}`;
+        grid.appendChild(card);
+      }
       if (!gpu) {
         card.innerHTML = `<div class="card-title"><span class="icon">▧</span><span>GPU ${index}</span></div><div class="gpu-unit-name">Unavailable</div>`;
         return;
@@ -1244,20 +1356,20 @@
       const gen = Number.isFinite(gpu.pcie_gen_max) ? `PCIe ${gpu.pcie_gen_max}.0` : "PCIe --";
       const width = Number.isFinite(gpu.pcie_width_current) ? `x${gpu.pcie_width_current}` : "x--";
       const maxWidth = Number.isFinite(gpu.pcie_width_max) ? `x${gpu.pcie_width_max}` : "x--";
-      const load = clampPercent(gpu.usage_percent);
+      const load = recentGpuPeak(index, gpu.usage_percent);
       const powerPercent = Number.isFinite(gpu.power_draw_w) && Number.isFinite(gpu.power_limit_w) && gpu.power_limit_w > 0
         ? Math.round(gpu.power_draw_w / gpu.power_limit_w * 100) : null;
       card.innerHTML = `
         <div class="card-title"><span class="icon">▧</span><span>GPU ${index}</span></div>
         <div class="gpu-unit-name">${escapeHtml(gpu.name || "Unknown")}</div>
         <div class="gpu-dashboard">
-          <div class="gpu-gauge" style="--p:${load}"><div class="gpu-gauge-center"><div class="gpu-gauge-value">${percent(gpu.usage_percent)}</div><div class="gpu-gauge-label">GPU LOAD</div></div></div>
+          <div class="gpu-gauge" style="--p:${load}"><div class="gpu-gauge-center"><div class="gpu-gauge-value">${percent(load)}</div><div class="gpu-gauge-label">GPU LOAD · 10s PEAK</div></div></div>
           <div class="gpu-unit-metrics">
-            <div class="gpu-unit-metric vram"><span>VRAM</span><strong>${formatGpuValue(gpu.vram_used_gb)} / ${formatGpuValue(gpu.vram_total_gb)} GB · ${percent(gpu.vram_usage_percent)}</strong></div>
+            <div class="gpu-unit-metric vram"><span>VRAM / headroom</span><strong>${formatGpuValue(gpu.vram_used_gb)} / ${formatGpuValue(gpu.vram_total_gb)} GB · ${percent(gpu.vram_usage_percent)} · ${formatGpuValue(gpu.vram_headroom_gb, " GB")}</strong></div>
             <div class="gpu-unit-metric temp"><span>Temperature</span><strong>${formatGpuValue(gpu.temperature_c, "°C")}</strong></div>
             <div class="gpu-unit-metric power"><span>Power</span><strong>${formatGpuValue(gpu.power_draw_w)} / ${formatGpuValue(gpu.power_limit_w)} W · ${powerPercent === null ? "--" : powerPercent + "%"}</strong></div>
             <div class="gpu-unit-metric fan"><span>Fan</span><strong>${percent(gpu.fan_speed_percent)}</strong></div>
-            <div class="gpu-unit-pcie">${gen} ${width} · Max ${maxWidth}</div>
+            <div class="gpu-unit-pcie">${gen} ${width} · Max ${maxWidth} · ${escapeHtml(gpu.vram_headroom_state || "unknown")}</div>
           </div>
         </div>`;
     }
@@ -1478,8 +1590,11 @@
         document.getElementById("kpi-disk").textContent = percent(disk.usage_percent);
         document.getElementById("kpi-cpu-temp").textContent = valueOrUnknown(cpu.temperature_c, "°C");
 
-        renderGpuCard(0, gpus[0]);
-        renderGpuCard(1, gpus[1]);
+        const gpuGrid = document.getElementById("gpu-grid");
+        if (gpuGrid) {
+          gpuGrid.querySelectorAll(".gpu-unit-card").forEach(node => { if (!gpus[Number(node.id.replace("gpu-card-", ""))]) node.remove(); });
+          gpus.forEach((item, index) => renderGpuCard(index, item));
+        }
         pushKpi("cpu", cpu.usage_percent);
         pushKpi("ram", mem.usage_percent);
         pushKpi("download", net.download_bps);
@@ -1496,6 +1611,7 @@
         setService("svc-openclaw", data.services?.openclaw);
         setService("svc-ollama", data.services?.ollama);
         setService("svc-tailscale", data.services?.tailscale);
+        setService("svc-openconnector", data.services?.openconnector);
 
         document.getElementById("server-name").textContent = data.server?.name || "PLACHEM-AI-01";
         document.getElementById("server-os").textContent = data.server?.os || "Unknown OS";
@@ -1516,6 +1632,7 @@
       services: "Services Diagnostics"
     };
     let currentDetail = null;
+    let currentAuthView = "overview";
 
     function escapeHtml(value) {
       return String(value ?? "Unknown").replace(/[&<>'"]/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;","\"":"&quot;"}[char]));
@@ -1541,6 +1658,127 @@
       return `<div class="core-grid">${(values || []).map((value, i) => `<div class="core-tile">Core ${i}<strong style="float:right">${percent(value)}</strong><div class="mini-bar"><span style="width:${clampPercent(value)}%"></span></div></div>`).join("")}</div>`;
     }
 
+    function authDate(value) {
+      if (!value) return "Never";
+      const date = new Date(value);
+      return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString([], { month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+    }
+
+    function authBadge(state, label = null) {
+      const safeState = ["healthy", "warning", "error", "unverified", "pass", "fail"].includes(state) ? state : "unverified";
+      return `<span class="auth-badge ${safeState}">${escapeHtml(label || safeState)}</span>`;
+    }
+
+    function authDial(title, value, state, foot, color) {
+      const safeValue = Math.max(0, Math.min(100, Number.isFinite(Number(value)) ? Number(value) : 0));
+      const shown = value == null ? "—" : `${Math.round(safeValue)}<small>%</small>`;
+      return `<article class="auth-dial-card"><div class="auth-dial-title">${escapeHtml(title)}</div><div class="auth-dial" style="--dial-value:${safeValue};--dial-color:${color}"><div class="auth-dial-center"><span class="auth-dial-value">${shown}</span><span class="auth-dial-state">${escapeHtml(state)}</span></div></div><div class="auth-dial-foot">${escapeHtml(foot)}</div></article>`;
+    }
+
+    function setAuthView(button, view) {
+      const dashboard = button.closest(".auth-dashboard");
+      if (!dashboard) return;
+      currentAuthView = view;
+      dashboard.querySelectorAll("[data-auth-view]").forEach(node => { node.hidden = node.dataset.authView !== view; });
+      dashboard.querySelectorAll("[data-auth-target]").forEach(node => node.classList.toggle("active", node.dataset.authTarget === view));
+    }
+
+    function renderAuthDashboard(dashboard, connector, serviceRows) {
+      const summary = dashboard.summary || {};
+      const services = dashboard.services || [];
+      const alerts = dashboard.alerts || [];
+      const activity = dashboard.recent_activity || [];
+      const serviceUsage = dashboard.service_usage_24h || [];
+      const callerUsage = dashboard.caller_usage_24h || [];
+      const insights = dashboard.operational_insights || [];
+      const authStateLabel = state => ({healthy:"정상", warning:"주의", error:"장애", unverified:"미검증", pass:"성공", fail:"실패"}[state] || state);
+      const authStateReasonLabel = reason => ({recent_read_ok:"최근 READ 성공", recent_read_failed:"최근 READ 실패", not_configured:"연결 미설정", no_run_record:"검증 기록 없음", stale_verification:"검증 24시간 초과"}[reason] || (reason ? String(reason) : "미확인"));
+      const authMetadataSourceLabel = source => ({"openconnector_admin_api+local_read_only_db":"OpenConnector Admin API + Read-only DB"}[source] || (source ? String(source).replace(/_/g, " ") : "미확인"));
+      const authMetadataCollectedAt = (services) => services && services.length ? services[0].metadata_collected_at : null;
+      const serviceTable = services.map(item => `<tr>
+        <td class="auth-service">${escapeHtml(item.service.replace(/_/g, " "))}</td>
+        <td>${escapeHtml(item.manager)}</td>
+        <td>${authBadge(item.state, authStateLabel(item.state))}</td>
+        <td>${escapeHtml(authDate(item.last_verified_at))}</td>
+        <td>${escapeHtml(item.last_duration_ms == null ? "—" : `${item.last_duration_ms} ms`)}</td>
+        <td class="auth-action">${escapeHtml(item.verification_action)}</td>
+      </tr>`).join("");
+      const alertBody = alerts.length ? `<div class="auth-table-wrap"><table class="auth-table"><thead><tr><th>등급</th><th>서비스</th><th>문제</th><th>필요 조치</th></tr></thead><tbody>${alerts.map(item => `<tr><td>${authBadge(item.severity === "error" ? "error" : "warning", item.severity === "error" ? "장애" : "주의")}</td><td class="auth-service">${escapeHtml(item.service.replace(/_/g, " "))}</td><td>${escapeHtml(item.message)}</td><td>${escapeHtml(item.action)}</td></tr>`).join("")}</tbody></table></div>` : `<div class="auth-empty">● 현재 인증 경보가 없습니다</div>`;
+      const activityTable = activity.map(item => `<tr>
+        <td>${escapeHtml(authDate(item.completed_at))}</td><td class="auth-service">${escapeHtml(item.service || "미확인")}</td>
+        <td class="auth-action">${escapeHtml(item.action || "미확인")}</td><td>${escapeHtml(item.caller || "미확인")}</td>
+        <td>${authBadge(item.ok ? "pass" : "fail", item.ok ? "성공" : "실패")}</td><td>${escapeHtml(item.duration_ms == null ? "—" : `${item.duration_ms} ms`)}</td>
+      </tr>`).join("");
+      const usageTable = serviceUsage.map((item, index) => `<tr><td>${index + 1}</td><td class="auth-service">${escapeHtml((item.service || "미확인").replace(/_/g, " "))}</td><td>${escapeHtml(item.runs)}</td><td>${escapeHtml(item.success_rate)}%</td><td>${escapeHtml(item.failures)}</td><td>${item.average_duration_ms == null ? "—" : `${escapeHtml(item.average_duration_ms)} ms`}</td><td>${item.max_duration_ms == null ? "—" : `${escapeHtml(item.max_duration_ms)} ms`}</td></tr>`).join("");
+      const callerTable = callerUsage.map((item, index) => `<tr><td>${index + 1}</td><td>${escapeHtml(item.caller)}</td><td>${escapeHtml(item.runs)}</td><td>${escapeHtml(item.success_rate)}%</td><td>${escapeHtml(item.failures)}</td><td>${item.average_duration_ms == null ? "—" : `${escapeHtml(item.average_duration_ms)} ms`}</td></tr>`).join("");
+      const credentialTable = services.map(item => `<tr><td class="auth-service">${escapeHtml(item.service.replace(/_/g, " "))}</td><td>${escapeHtml(item.auth_type || "미확인")}</td><td>${authBadge(item.state, authStateLabel(item.state))}</td><td>${escapeHtml(authStateReasonLabel(item.state_reason))}</td><td>${escapeHtml(item.token_expiry)}</td><td>${item.last_read_at ? escapeHtml(authDate(item.last_read_at)) : "미확인"}</td><td>${item.connection_last_modified_at ? escapeHtml(authDate(item.connection_last_modified_at)) : "미확인"}</td><td>${item.oauth_client_last_modified_at ? escapeHtml(authDate(item.oauth_client_last_modified_at)) : "미확인"}</td><td>${escapeHtml(item.verification_action)}</td></tr>`).join("");
+      const insightBody = insights.length ? `<div class="auth-insights">${insights.map(item => `<div class="auth-insight" style="--insight-color:${item.level === "warning" ? "var(--amber)" : item.level === "error" ? "var(--red)" : "var(--cyan)"}"><strong>${escapeHtml(item.title)}</strong><span>${escapeHtml(item.message)}</span></div>`).join("")}</div>` : "";
+      const runtimeState = connector.api_ok && connector.container_health === "healthy" ? "healthy" : connector.api_ok ? "warning" : "error";
+      const managed = Number(summary.managed || 0);
+      const healthy = Number(summary.healthy || 0);
+      const warning = Number(summary.warning || 0);
+      const unverified = Number(summary.unverified || 0);
+      const errors = Number(summary.error || 0);
+      const healthRate = managed ? healthy / managed * 100 : 0;
+      const verifiedRate = managed ? (managed - unverified) / managed * 100 : 0;
+      const successRate = summary.success_rate_24h;
+      const healthColor = errors ? "var(--red)" : warning || unverified ? "var(--amber)" : "var(--green)";
+      const successColor = successRate == null ? "#64748b" : successRate >= 95 ? "var(--green)" : successRate >= 80 ? "var(--amber)" : "var(--red)";
+      const verifiedColor = unverified ? "var(--amber)" : "var(--cyan)";
+      const verdict = errors ? `연결 장애 ${errors}건을 즉시 확인해야 합니다.` : warning || unverified ? `주의가 필요한 연결이 ${warning + unverified}건 있습니다.` : "모든 중앙 연결이 정상이며 최근 검증을 완료했습니다.";
+      return `<div class="auth-dashboard">
+        <aside class="auth-sidebar">
+          <nav class="auth-side-nav" aria-label="Authentication control sections">
+            <button class="auth-side-item active" data-auth-target="overview" onclick="setAuthView(this,'overview')"><i>⌂</i>Overview</button>
+            <button class="auth-side-item" data-auth-target="credentials" onclick="setAuthView(this,'credentials')"><i>◉</i>Credentials</button>
+            <button class="auth-side-item" data-auth-target="services" onclick="setAuthView(this,'services')"><i>⚙</i>Services</button>
+            <button class="auth-side-item" data-auth-target="agents" onclick="setAuthView(this,'agents')"><i>◆</i>Agents</button>
+            <button class="auth-side-item" data-auth-target="alerts" onclick="setAuthView(this,'alerts')"><i>♧</i>Alerts</button>
+            <button class="auth-side-item" data-auth-target="activity" onclick="setAuthView(this,'activity')"><i>▤</i>Activity</button>
+            <button class="auth-side-item" data-auth-target="permissions" onclick="setAuthView(this,'permissions')"><i>♢</i>Permissions</button>
+            <button class="auth-side-item" data-auth-target="settings" onclick="setAuthView(this,'settings')"><i>⚙</i>Settings</button>
+          </nav>
+          <div class="auth-side-foot">
+            <div class="auth-manager-pill"><span>◉ OpenConnector</span><b>LIVE</b></div>
+            <div class="auth-system-state">시스템 정상</div>
+            <small>최종 갱신 ${escapeHtml(authDate(dashboard.generated_at))}</small>
+          </div>
+        </aside>
+        <main class="auth-main">
+          <section class="auth-hero"><div><div class="auth-eyebrow">PLACHEM 보안 운영</div><h2>인증 통합 관제센터</h2><p>중앙 인증, 연결 상태와 READ 검증 활동을 실시간으로 확인합니다.</p></div><a class="auth-console-link" href="${escapeHtml(connector.console_url || dashboard.console_url)}" target="_blank" rel="noopener noreferrer">관리 콘솔 열기&nbsp; ›</a></section>
+          <nav class="auth-mobile-tabs">${["overview","credentials","services","agents","alerts","activity","permissions","settings"].map((view,index)=>`<button class="${index===0?"active":""}" data-auth-target="${view}" onclick="setAuthView(this,'${view}')">${view[0].toUpperCase()+view.slice(1)}</button>`).join("")}</nav>
+          <div class="auth-view" data-auth-view="overview">
+          ${insightBody}
+          <section class="auth-instruments">
+            ${authDial("연결 건강도", healthRate, errors ? "긴급" : warning || unverified ? "주의" : "정상", `전체 ${managed}개 중 ${healthy}개 정상`, healthColor)}
+            ${authDial("24시간 실행 성공률", successRate, successRate == null ? "표본 없음" : successRate >= 95 ? "안정" : successRate >= 80 ? "관찰" : "저하", `인증 실행 ${summary.runs_24h || 0}건 기준`, successColor)}
+            ${authDial("검증 완료율", verifiedRate, unverified ? "미완료" : "검증 완료", `전체 ${managed}개 중 ${managed - unverified}개 READ 결과 보유`, verifiedColor)}
+            <article class="auth-situation"><h3>현재 상황 요약</h3><p>중앙 인증 연결의 실시간 구성</p><div class="auth-state-list">
+              <div class="auth-state-row" style="--state-color:var(--green)"><i></i><span>정상</span><strong>${healthy}</strong></div>
+              <div class="auth-state-row" style="--state-color:var(--amber)"><i></i><span>주의</span><strong>${warning + unverified}</strong></div>
+              <div class="auth-state-row" style="--state-color:var(--red)"><i></i><span>장애</span><strong>${errors}</strong></div>
+              <div class="auth-state-row" style="--state-color:var(--cyan)"><i></i><span>전체 관리</span><strong>${managed}</strong></div>
+            </div><div class="auth-verdict" style="--verdict-color:${healthColor}">${escapeHtml(verdict)}</div></article>
+          </section>
+          <section class="auth-panel"><div class="auth-panel-head"><h3>연결 목록</h3><span>실제 연결 · 비밀값 미표시 · ${authBadge(runtimeState, connector.api_ok ? "온라인" : "오프라인")}</span></div><div class="auth-table-wrap"><table class="auth-table"><thead><tr><th>서비스</th><th>관리자</th><th>연결 가능/configured</th><th>상태</th><th>최근 READ 검증</th><th>최근 READ 성공</th><th>소요시간</th><th>검증 작업</th></tr></thead><tbody>${services.map(item => `<tr><td class="auth-service">${escapeHtml(item.service.replace(/_/g, " "))}</td><td>${escapeHtml(item.manager)}</td><td>${item.configured ? "예" : "아니오"}</td><td>${authBadge(item.state, authStateLabel(item.state))}<br><small>${escapeHtml(authStateReasonLabel(item.state_reason))}</small></td><td>${escapeHtml(authDate(item.last_verified_at))}</td><td>${escapeHtml(authDate(item.last_read_at))}</td><td>${escapeHtml(item.last_duration_ms == null ? "—" : `${item.last_duration_ms} ms`)}</td><td class="auth-action">${escapeHtml(item.verification_action)}</td></tr>`).join("")}</tbody></table></div></section>
+          <div class="auth-two-col">
+            <section class="auth-panel"><div class="auth-panel-head"><h3>경보 및 필요 조치</h3><span>${escapeHtml(alerts.length)}건 활성</span></div>${alertBody}</section>
+            <section class="auth-panel"><div class="auth-panel-head"><h3>실행 환경 상태</h3><span>OpenConnector 인프라</span></div>${kv([["API 상태", connector.api_ok ? "정상" : "실패"], ["응답시간", connector.response_ms == null ? "미확인" : `${connector.response_ms} ms`], ["컨테이너", connector.container_status || "미확인"], ["Docker 상태", connector.container_health || "미확인"], ["재시작 횟수", connector.restart_count ?? "미확인"]])}</section>
+          </div>
+          <section class="auth-panel" style="margin-top:12px"><div class="auth-panel-head"><h3>최근 인증 활동</h3><span>최근 실행 표본</span></div><div class="auth-table-wrap"><table class="auth-table"><thead><tr><th>완료시각</th><th>서비스</th><th>작업</th><th>호출자</th><th>결과</th><th>소요시간</th></tr></thead><tbody>${activityTable}</tbody></table></div></section>
+          <div class="auth-scope-note">ManyFast, Postiz SNS 채널과 Producer YouTube는 전용 인증 관리자를 사용합니다. ack/담당자/조치이력 쓰기와 토큰 만료일은 현재 미구현·Provider 미제공이며, 인증 없는 HTTP에 저장하지 않습니다.</div>
+          </div>
+          <div class="auth-view" data-auth-view="credentials" hidden><div class="auth-view-title"><div><h3>인증 수명주기</h3><p>유효기간 확인, 최근 검증과 갱신 준비 상태</p></div>${authBadge(summary.expiry_unknown ? "warning" : "healthy", `유효기간 미확인 ${summary.expiry_unknown || 0}건`)}</div><section class="auth-panel"><div class="auth-table-wrap"><table class="auth-table"><thead><tr><th>서비스</th><th>인증 유형</th><th>상태</th><th>상태 원인</th><th>유효기간 확인</th><th>마지막 READ</th><th>연결 설정 수정</th><th>OAuth Client 설정 수정</th><th>검증 작업</th></tr></thead><tbody>${credentialTable}</tbody></table></div></section><div class="auth-scope-note">메타데이터 출처: ${authMetadataSourceLabel(services[0] && services[0].metadata_source)} · 수집시각: ${authMetadataCollectedAt(services) ? escapeHtml(authDate(authMetadataCollectedAt(services))) : "미확인"}. 유효기간 미확인은 정상이 아니라 관제 공백입니다.</div></div>
+          <div class="auth-view" data-auth-view="services" hidden><div class="auth-view-title"><div><h3>서비스 사용 순위</h3><p>최근 24시간 · 인증 실행 최대 100건 표본</p></div><span>사용 서비스 ${serviceUsage.length}개</span></div><section class="auth-panel"><div class="auth-table-wrap"><table class="auth-table"><thead><tr><th>순위</th><th>서비스</th><th>실행</th><th>성공률</th><th>실패</th><th>평균</th><th>최대</th></tr></thead><tbody>${usageTable}</tbody></table></div></section></div>
+          <div class="auth-view" data-auth-view="agents" hidden><div class="auth-view-title"><div><h3>에이전트 및 호출자 사용 현황</h3><p>OpenConnector 실행 로그의 호출자 식별 정보</p></div></div><section class="auth-panel"><div class="auth-table-wrap"><table class="auth-table"><thead><tr><th>순위</th><th>호출자</th><th>실행</th><th>성공률</th><th>실패</th><th>평균</th></tr></thead><tbody>${callerTable}</tbody></table></div></section><div class="auth-scope-note">호출자가 “http”로만 표시되면 런타임에서 에이전트 식별정보를 아직 전달하지 않는 상태입니다. 추정한 에이전트 이름을 배정하지 않고 식별 공백을 그대로 표시합니다.</div></div>
+          <div class="auth-view" data-auth-view="alerts" hidden><div class="auth-view-title"><div><h3>경보 및 필요 조치</h3><p>현재 장애, 오래된 점검과 관제 공백</p></div>${authBadge(alerts.length ? "warning" : "healthy", `활성 ${alerts.length}건`)}</div>${insightBody}<section class="auth-panel">${alertBody}</section></div>
+          <div class="auth-view" data-auth-view="activity" hidden><div class="auth-view-title"><div><h3>인증 활동</h3><p>비밀값을 제외한 최근 실행 이력</p></div></div><section class="auth-panel"><div class="auth-table-wrap"><table class="auth-table"><thead><tr><th>완료시각</th><th>서비스</th><th>작업</th><th>호출자</th><th>결과</th><th>소요시간</th></tr></thead><tbody>${activityTable}</tbody></table></div></section></div>
+          <div class="auth-view" data-auth-view="permissions" hidden><div class="auth-view-title"><div><h3>권한 현황</h3><p>런타임 범위와 최소 권한 확인</p></div>${authBadge("warning","목록 연동 대기")}</div><section class="auth-panel"><div class="auth-empty" style="color:var(--amber)">OpenConnector가 아직 권한 대여 이벤트를 제공하지 않습니다. 현재 작업 사용량은 Activity에서 확인할 수 있으며, 검증 가능한 감사 데이터가 연결되기 전까지 WRITE 및 ADMIN 권한은 표시되지 않습니다.</div></section></div>
+          <div class="auth-view" data-auth-view="settings" hidden><div class="auth-view-title"><div><h3>관제 정책</h3><p>현재 적용 중인 읽기 전용 운영 기준</p></div></div><section class="auth-panel" style="padding:15px">${kv([["최신 검증","24시간 이내"],["주의","24시간 초과 또는 미검증"],["긴급","연결 누락 또는 최근 READ 실패"],["유효기간 경보","Provider 메타데이터 연동 대기"],["표본 범위","최근 100건 / 24시간"],["비밀값 표시","항상 비활성"]])}</section></div>
+        </main>
+      </div>`;
+    }
+
     function renderDetail(type, data) {
       if (data.status === "error") return card("Error", kv([["Message", data.error || "Unknown"]]), true);
       if (type === "cpu") {
@@ -1561,8 +1799,8 @@
       if (type === "gpu") {
         const g = data.summary || {};
         return [
-          card("GPU", kv([["Name", g.name], ["Usage", percent(g.usage_percent)], ["VRAM", `${fmt(g.vram_used_gb)} / ${fmt(g.vram_total_gb)} GB`], ["VRAM usage", percent(g.vram_usage_percent)], ["Temperature", fmt(g.temperature_c, "°C")], ["Source", g.source || "Unknown"]])),
-          card("GPU Processes", table(["PID", "Name", "VRAM MB"], (data.processes || []).map(p => [p.pid, p.name, p.vram_mb])), true),
+          card("GPU", kv([["Name", g.name], ["Usage", percent(g.usage_percent)], ["VRAM", `${fmt(g.vram_used_gb)} / ${fmt(g.vram_total_gb)} GB`], ["VRAM usage", percent(g.vram_usage_percent)], ["Headroom", fmt(g.vram_headroom_gb, " GB")], ["Headroom state", g.vram_headroom_state || "Unknown"], ["Temperature", fmt(g.temperature_c, "°C")], ["Source", g.source || "Unknown"]])),
+          card("GPU Processes / model occupancy", table(["GPU", "PID", "Process / model", "VRAM MB"], (data.processes || []).map(p => [p.gpu_index ?? "Unknown", p.pid, p.name, p.vram_mb])), true),
         ].join("");
       }
       if (type === "disk") {
@@ -1581,7 +1819,20 @@
       }
       if (type === "services") {
         const rows = Object.entries(data.services || {}).map(([name, svc]) => [name.replace(/_/g, " "), svc.label, svc.state]);
-        return card("Service States", table(["Service", "Label", "State"], rows), true);
+        const connector = data.services?.openconnector || {};
+        const dashboard = data.openconnector_dashboard;
+        const connectorDetails = card("OpenConnector Runtime", kv([
+          ["API health", connector.api_ok ? "PASS" : "FAIL"],
+          ["Response", connector.response_ms == null ? "Unknown" : `${connector.response_ms} ms`],
+          ["Container", connector.container_status || "unknown"],
+          ["Docker health", connector.container_health || "unknown"],
+          ["Image", connector.image || "unknown"],
+          ["Restarts", connector.restart_count ?? "unknown"],
+        ]) + `<a class="openclaw-control-button" href="${connector.console_url || "https://openclaw.tail8eba4b.ts.net:3001/"}" target="_blank" rel="noopener noreferrer">Open OpenConnector Console →</a>`, true);
+        if (!dashboard) {
+          return card("Service States", table(["Service", "Label", "State"], rows), true) + connectorDetails + card("Authentication Control", kv([["Status", data.openconnector_dashboard_error || "Unavailable"]]), true);
+        }
+        return renderAuthDashboard(dashboard, connector, rows);
       }
       return card("Unknown", kv([["Type", type]]), true);
     }
@@ -1597,6 +1848,10 @@
         const data = await response.json();
         meta.textContent = `Last updated ${data.last_updated || "Unknown"}`;
         content.innerHTML = renderDetail(currentDetail, data);
+        if (currentDetail === "services") {
+          const selected = content.querySelector(`[data-auth-target="${currentAuthView}"]`);
+          if (selected) setAuthView(selected, currentAuthView);
+        }
       } catch (error) {
         meta.textContent = "Error";
         content.innerHTML = card("Error", kv([["Message", "Failed to load detail"]]), true);
@@ -1686,6 +1941,7 @@
       const hash = pathMode ? "openclaw" : window.location.hash.replace("#", "").replace("/", "");
       currentOpenclaw = hash === "openclaw";
       currentDetail = !currentOpenclaw && ["cpu", "memory", "gpu", "disk", "network", "services"].includes(hash) ? hash : null;
+      document.body.classList.toggle("auth-control-open", currentDetail === "services");
       document.getElementById("main-view").classList.toggle("hidden", Boolean(currentDetail) || currentOpenclaw);
       document.getElementById("detail-view").classList.toggle("hidden", !currentDetail);
       document.getElementById("openclaw-view").classList.toggle("hidden", !currentOpenclaw);

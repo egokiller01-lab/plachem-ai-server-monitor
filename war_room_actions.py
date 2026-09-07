@@ -5,15 +5,16 @@ import json
 import os
 import hmac
 import sqlite3
+import threading
 import time
 import uuid
-from contextlib import contextmanager
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Header, HTTPException, Request
 
 import war_room
+from war_room_agents import canonical_agent_id, load_agent_catalog
 from war_room_adapter import OpenClawSessionAdapter, TestSessionAdapter
 
 
@@ -22,9 +23,10 @@ router = APIRouter(prefix="/api/war-room", tags=["war-room-actions"])
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS war_tasks (
  id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES war_projects(id), source_message_id TEXT UNIQUE,
- assignee_agent_id TEXT, scope TEXT NOT NULL CHECK(length(scope) BETWEEN 1 AND 4096), status TEXT NOT NULL
+ assignee_agent_id TEXT, reviewer_agent_id TEXT, scope TEXT NOT NULL CHECK(length(scope) BETWEEN 1 AND 4096), status TEXT NOT NULL
  CHECK(status IN ('draft','awaiting_approval','approved','running','qa','completed','stopped','stop_unconfirmed','rework_required')),
  manyfast_version TEXT NOT NULL, document_version TEXT, call_limit INTEGER, turn_limit INTEGER,
+ execution_mode TEXT NOT NULL DEFAULT 'LEGACY' CHECK(execution_mode IN ('LEGACY','FAST_GATEWAY')),
  deadline_at INTEGER, revision INTEGER NOT NULL DEFAULT 1, qa_cycle INTEGER NOT NULL DEFAULT 0,
  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
 );
@@ -51,16 +53,21 @@ CREATE TABLE IF NOT EXISTS war_idempotency_keys (
 );
 CREATE TABLE IF NOT EXISTS war_deliveries (
  id TEXT PRIMARY KEY, message_id TEXT NOT NULL REFERENCES war_messages(id), agent_id TEXT NOT NULL,
+ task_revision INTEGER NOT NULL DEFAULT 1,
  status TEXT NOT NULL CHECK(status IN ('queued','sent','received','responded','failed','timed_out','stopped')),
  attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0), max_attempts INTEGER NOT NULL DEFAULT 3 CHECK(max_attempts BETWEEN 1 AND 20),
  sent_at INTEGER, received_at INTEGER,
  responded_at INTEGER, error_code TEXT, run_id TEXT, response_message_id TEXT,
+ session_key TEXT, session_id TEXT, correlation_id TEXT,
  next_attempt_at INTEGER, deadline_at INTEGER,
- created_at INTEGER NOT NULL, UNIQUE(message_id, agent_id)
+ retry_count INTEGER NOT NULL DEFAULT 0, error_class TEXT, last_error_at INTEGER,
+ created_at INTEGER NOT NULL, UNIQUE(message_id, agent_id, task_revision)
 );
 CREATE TABLE IF NOT EXISTS war_task_calls (
- task_id TEXT PRIMARY KEY REFERENCES war_tasks(id), call_count INTEGER NOT NULL DEFAULT 0,
+ task_id TEXT NOT NULL REFERENCES war_tasks(id), task_revision INTEGER NOT NULL DEFAULT 1,
+ call_count INTEGER NOT NULL DEFAULT 0,
  turn_count INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL
+ ,PRIMARY KEY(task_id,task_revision)
 );
 CREATE TABLE IF NOT EXISTS war_task_agents (
  task_id TEXT NOT NULL REFERENCES war_tasks(id), agent_id TEXT NOT NULL,
@@ -98,12 +105,28 @@ CREATE TABLE IF NOT EXISTS war_representative_approvals (
 CREATE TABLE IF NOT EXISTS war_manyfast_refs (
  id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES war_projects(id), task_id TEXT,
  manyfast_project_id TEXT NOT NULL, document_version TEXT NOT NULL, linked_by TEXT NOT NULL,
- created_at INTEGER NOT NULL, drift_status TEXT NOT NULL DEFAULT 'current'
+ created_at INTEGER NOT NULL, drift_status TEXT NOT NULL DEFAULT 'current', previous_document_version TEXT
 );
 CREATE TABLE IF NOT EXISTS war_manyfast_snapshots (
  id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES war_projects(id), document_version TEXT NOT NULL,
  snapshot_json TEXT NOT NULL, is_last_good INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS war_execution_runs (
+ core_run_id TEXT PRIMARY KEY, war_project_id TEXT NOT NULL REFERENCES war_projects(id),
+ war_task_id TEXT NOT NULL REFERENCES war_tasks(id), agent_id TEXT NOT NULL,
+ openclaw_run_id TEXT UNIQUE, session_key TEXT, run_status TEXT NOT NULL,
+ runtime_seconds REAL, result_summary TEXT, result_json TEXT, evidence_json TEXT, artifacts_json TEXT,
+ raw_response TEXT, rejected_result_json TEXT, validation_error TEXT,
+ policy_status TEXT, cancel_reason TEXT, escalation_required INTEGER NOT NULL DEFAULT 0,
+ created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS war_execution_units (
+ execution_id TEXT PRIMARY KEY, war_project_id TEXT NOT NULL REFERENCES war_projects(id),
+ war_task_id TEXT NOT NULL REFERENCES war_tasks(id), correlation_id TEXT NOT NULL,
+ agent_id TEXT NOT NULL, depends_on_execution_ids TEXT NOT NULL DEFAULT '[]',
+ core_run_id TEXT, created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_war_execution_units_task ON war_execution_units(war_project_id,war_task_id);
 CREATE INDEX IF NOT EXISTS idx_war_tasks_project_status ON war_tasks(project_id, status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_war_audit_project_created ON war_audit_events(project_id, created_at DESC, id DESC);
 CREATE TRIGGER IF NOT EXISTS war_audit_no_update BEFORE UPDATE ON war_audit_events BEGIN SELECT RAISE(ABORT, 'audit events are append-only'); END;
@@ -123,12 +146,37 @@ ROLE_PERMISSIONS = {
     "observer": {"read"},
 }
 WRITE_ACTIONS = {"comment", "approve", "execute", "manage"}
+_EXECUTION_ORCHESTRATORS: dict[str, Any] = {}
+_EXECUTION_ORCHESTRATOR_LOCK = threading.RLock()
+
+
+def _delivery_state(row: sqlite3.Row | dict[str, Any]) -> str:
+    value = row["error_class"] if isinstance(row, sqlite3.Row) and "error_class" in row.keys() else row.get("error_class")
+    status = row["status"] if isinstance(row, sqlite3.Row) else row.get("status")
+    return "system_error" if value == "system_error" else str(status or "unknown")
+
+
+def _delivery_next_action(row: sqlite3.Row | dict[str, Any]) -> str:
+    state = _delivery_state(row)
+    if state == "system_error":
+        attempts = int((row["retry_count"] if isinstance(row, sqlite3.Row) and "retry_count" in row.keys() else row.get("retry_count", row.get("attempt_count", 0))) or 0)
+        maximum = int((row["max_attempts"] if isinstance(row, sqlite3.Row) and "max_attempts" in row.keys() else row.get("max_attempts", 3)) or 3)
+        status = row["status"] if isinstance(row, sqlite3.Row) else row.get("status")
+        return "재시도 대기" if attempts < maximum and status == "queued" else "원인 확인 후 수동 재전송 또는 담당자 교체"
+    if state == "responded":
+        return "결과와 QA 판정 비교"
+    if state == "stopped":
+        return "중지 확인"
+    return "처리 완료 대기"
+
+
 TRANSITIONS = {
     "draft": {"awaiting_approval"},
     "awaiting_approval": {"approved", "draft"},
     "approved": {"running", "stopped"},
     "running": {"qa", "stopped", "stop_unconfirmed"},
     "stopped": {"awaiting_approval"},
+    "stop_unconfirmed": {"awaiting_approval"},
     "qa": {"completed", "rework_required"},
     "rework_required": {"awaiting_approval"},
 }
@@ -138,40 +186,56 @@ def _now() -> int:
     return int(time.time())
 
 
-@contextmanager
-def _transaction_connection(path):
-    con = sqlite3.connect(path)
-    try:
-        with con:
-            yield con
-    finally:
-        con.close()
-
-
-@contextmanager
-def _connect_rw():
+def _connect_rw() -> sqlite3.Connection:
     path = war_room._db_path()
     if not path.is_file():
         raise HTTPException(503, "War Room data unavailable")
     con = sqlite3.connect(path)
-    try:
-        con.row_factory = sqlite3.Row
-        con.execute("PRAGMA foreign_keys = ON")
-        con.execute("PRAGMA busy_timeout = 2000")
-        with con:
-            yield con
-    finally:
-        con.close()
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA foreign_keys = ON")
+    con.execute("PRAGMA busy_timeout = 2000")
+    return con
 
 
 def provision_action_schema(path: str | None = None) -> str:
     target = path or str(war_room._db_path())
-    with _transaction_connection(target) as con:
+    with sqlite3.connect(target) as con:
         con.executescript(SCHEMA)
         participant_columns = {row[1] for row in con.execute("PRAGMA table_info(war_participants)")}
         if "active" not in participant_columns:
             con.execute("ALTER TABLE war_participants ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
         delivery_columns = {row[1] for row in con.execute("PRAGMA table_info(war_deliveries)")}
+        delivery_sql_row = con.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='war_deliveries'"
+        ).fetchone()
+        delivery_sql = str(delivery_sql_row[0] or "") if delivery_sql_row else ""
+        if "task_revision" not in delivery_columns or "UNIQUE(message_id, agent_id)" in delivery_sql:
+            # Rework requires a fresh delivery without rewriting the previous
+            # attempt.  Rebuild the table once to version deliveries by task
+            # revision while preserving every historical row and identifier.
+            con.execute("ALTER TABLE war_deliveries RENAME TO war_deliveries_legacy_generation")
+            con.execute("""CREATE TABLE war_deliveries (
+                id TEXT PRIMARY KEY, message_id TEXT NOT NULL REFERENCES war_messages(id), agent_id TEXT NOT NULL,
+                task_revision INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL CHECK(status IN ('queued','sent','received','responded','failed','timed_out','stopped')),
+                attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+                max_attempts INTEGER NOT NULL DEFAULT 3 CHECK(max_attempts BETWEEN 1 AND 20),
+                sent_at INTEGER, received_at INTEGER, responded_at INTEGER, error_code TEXT,
+                run_id TEXT, response_message_id TEXT, session_key TEXT, session_id TEXT,
+                correlation_id TEXT, next_attempt_at INTEGER, deadline_at INTEGER,
+                retry_count INTEGER NOT NULL DEFAULT 0, error_class TEXT, last_error_at INTEGER,
+                claim_token TEXT, claim_expires_at INTEGER, stop_cycle_at INTEGER,
+                created_at INTEGER NOT NULL, UNIQUE(message_id, agent_id, task_revision)
+            )""")
+            legacy_columns = {row[1] for row in con.execute("PRAGMA table_info(war_deliveries_legacy_generation)")}
+            target_columns = [row[1] for row in con.execute("PRAGMA table_info(war_deliveries)")]
+            copy_columns = [column for column in target_columns if column in legacy_columns]
+            column_list = ",".join(copy_columns)
+            con.execute(
+                f"INSERT INTO war_deliveries ({column_list}) SELECT {column_list} FROM war_deliveries_legacy_generation"
+            )
+            con.execute("DROP TABLE war_deliveries_legacy_generation")
+            delivery_columns = {row[1] for row in con.execute("PRAGMA table_info(war_deliveries)")}
         if "max_attempts" not in delivery_columns:
             con.execute("ALTER TABLE war_deliveries ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 3")
         if "next_attempt_at" not in delivery_columns:
@@ -188,11 +252,46 @@ def provision_action_schema(path: str | None = None) -> str:
             con.execute("ALTER TABLE war_deliveries ADD COLUMN claim_expires_at INTEGER")
         if "stop_cycle_at" not in delivery_columns:
             con.execute("ALTER TABLE war_deliveries ADD COLUMN stop_cycle_at INTEGER")
+        if "retry_count" not in delivery_columns:
+            con.execute("ALTER TABLE war_deliveries ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0")
+        if "error_class" not in delivery_columns:
+            con.execute("ALTER TABLE war_deliveries ADD COLUMN error_class TEXT")
+        if "last_error_at" not in delivery_columns:
+            con.execute("ALTER TABLE war_deliveries ADD COLUMN last_error_at INTEGER")
+        for column, definition in (("session_key", "TEXT"), ("session_id", "TEXT"), ("correlation_id", "TEXT")):
+            if column not in delivery_columns:
+                con.execute(f"ALTER TABLE war_deliveries ADD COLUMN {column} {definition}")
+        con.execute("UPDATE war_deliveries SET retry_count=attempt_count WHERE retry_count=0 AND attempt_count>0")
+        call_columns = {row[1] for row in con.execute("PRAGMA table_info(war_task_calls)")}
+        if "task_revision" not in call_columns:
+            # Legacy counters are aggregate-only. Preserve them as revision 1
+            # history, then account for every subsequent execution generation
+            # independently.
+            con.execute("ALTER TABLE war_task_calls RENAME TO war_task_calls_legacy_generation")
+            con.execute("""CREATE TABLE war_task_calls (
+                task_id TEXT NOT NULL REFERENCES war_tasks(id),
+                task_revision INTEGER NOT NULL DEFAULT 1,
+                call_count INTEGER NOT NULL DEFAULT 0,
+                turn_count INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(task_id,task_revision)
+            )""")
+            con.execute("""INSERT INTO war_task_calls(task_id,task_revision,call_count,turn_count,updated_at)
+                           SELECT task_id,1,call_count,turn_count,updated_at
+                           FROM war_task_calls_legacy_generation""")
+            con.execute("DROP TABLE war_task_calls_legacy_generation")
         reference_columns = {row[1] for row in con.execute("PRAGMA table_info(war_manyfast_refs)")}
         if "drift_status" not in reference_columns:
             con.execute("ALTER TABLE war_manyfast_refs ADD COLUMN drift_status TEXT NOT NULL DEFAULT 'current'")
+        if "previous_document_version" not in reference_columns:
+            con.execute("ALTER TABLE war_manyfast_refs ADD COLUMN previous_document_version TEXT")
+        message_columns = {row[1] for row in con.execute("PRAGMA table_info(war_messages)")}
+        if "original_body" not in message_columns:
+            con.execute("ALTER TABLE war_messages ADD COLUMN original_body TEXT")
         task_columns = {row[1] for row in con.execute("PRAGMA table_info(war_tasks)")}
-        for column, definition in (("document_version", "TEXT"), ("call_limit", "INTEGER"), ("turn_limit", "INTEGER"), ("deadline_at", "INTEGER"), ("revision", "INTEGER NOT NULL DEFAULT 1"), ("qa_cycle", "INTEGER NOT NULL DEFAULT 0")):
+        if "reviewer_agent_id" not in task_columns:
+            con.execute("ALTER TABLE war_tasks ADD COLUMN reviewer_agent_id TEXT")
+        for column, definition in (("document_version", "TEXT"), ("call_limit", "INTEGER"), ("turn_limit", "INTEGER"), ("execution_mode", "TEXT NOT NULL DEFAULT 'LEGACY'"), ("deadline_at", "INTEGER"), ("revision", "INTEGER NOT NULL DEFAULT 1"), ("qa_cycle", "INTEGER NOT NULL DEFAULT 0")):
             if column not in task_columns:
                 con.execute(f"ALTER TABLE war_tasks ADD COLUMN {column} {definition}")
         for table in ("war_evidence", "war_qa_verdicts"):
@@ -200,6 +299,13 @@ def provision_action_schema(path: str | None = None) -> str:
             for column, definition in (("task_revision", "INTEGER NOT NULL DEFAULT 1"), ("scope_hash", "TEXT NOT NULL DEFAULT ''"), ("document_version", "TEXT NOT NULL DEFAULT ''"), ("qa_cycle", "INTEGER NOT NULL DEFAULT 0")):
                 if column not in columns:
                     con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        execution_columns = {row[1] for row in con.execute("PRAGMA table_info(war_execution_runs)")}
+        for column in ("raw_response", "rejected_result_json", "validation_error"):
+            if column not in execution_columns:
+                con.execute(f"ALTER TABLE war_execution_runs ADD COLUMN {column} TEXT")
+        execution_columns = {row[1] for row in con.execute("PRAGMA table_info(war_execution_runs)")}
+        if "result_summary" not in execution_columns:
+            con.execute("ALTER TABLE war_execution_runs ADD COLUMN result_summary TEXT")
         approval_columns = {row[1] for row in con.execute("PRAGMA table_info(war_approvals)")}
         if "target_set_hash" not in approval_columns:
             con.execute("ALTER TABLE war_approvals ADD COLUMN target_set_hash TEXT NOT NULL DEFAULT ''")
@@ -222,6 +328,20 @@ def _adapter() -> TestSessionAdapter | OpenClawSessionAdapter:
         return TestSessionAdapter()
     from war_room_runtime import get_runtime
     return get_runtime().adapter
+
+
+def _adapter_for_mode(mode: str, db_path: str) -> Any:
+    if mode != "FAST_GATEWAY":
+        return _adapter()
+    from war_room_runtime import get_runtime
+    return get_runtime().adapter_for(mode, db_path)
+
+
+def _execution_mode(value: Any) -> str:
+    mode = str(value or "FAST_GATEWAY").strip().upper()
+    if mode not in {"LEGACY", "FAST_GATEWAY"}:
+        raise HTTPException(422, "execution_mode must be LEGACY or FAST_GATEWAY")
+    return mode
 
 
 def _control(con: sqlite3.Connection, project_id: str) -> sqlite3.Row:
@@ -252,8 +372,56 @@ def _qa_signature(payload: str) -> str:
 
 
 def _representative_principals() -> set[str]:
-    configured = os.environ.get("PLACHEM_WAR_ROOM_REPRESENTATIVE_PRINCIPALS", "main")
-    return {value.strip() for value in configured.split(",") if value.strip()}
+    return war_room.representative_principals()
+
+
+def _require_representative(actor: str) -> None:
+    if actor not in _representative_principals():
+        raise HTTPException(403, "representative principal required; server-side identity mapping is not configured")
+
+
+def _eligible_agent_ids(con: sqlite3.Connection, project_id: str, required_capabilities: list[str] | None = None) -> list[str]:
+    required = {item.casefold() for item in (required_capabilities or []) if item}
+    participants = {
+        row[0] for row in con.execute(
+            "SELECT principal_id FROM war_participants WHERE project_id=? AND active=1 AND can_comment=1",
+            (project_id,),
+        )
+    }
+    return sorted(
+        agent_id for agent_id, entry in load_agent_catalog().items()
+        if entry.execution_eligible
+        and agent_id in participants
+        and required.issubset({item.casefold() for item in entry.capabilities})
+    )
+
+
+def _require_execution_agents(con: sqlite3.Connection, project_id: str, agents: list[str]) -> None:
+    eligible = set(_eligible_agent_ids(con, project_id))
+    if not agents or any(agent not in eligible for agent in agents):
+        raise HTTPException(409, "every execution agent must be registered, enabled, Gateway-allowed, capable, and an active project participant")
+
+
+def _require_independent_reviewer(reviewer: str | None, agents: list[str], *, required: bool = True) -> None:
+    """Keep the approved reviewer outside the complete execution target set."""
+    if (required and reviewer is None) or reviewer in set(agents):
+        raise HTTPException(422, "reviewer must be independent from every execution agent")
+
+
+def _stop_cycle_state(con: sqlite3.Connection, project_id: str, cycle_at: int) -> str:
+    """Aggregate every delivery touched by one project stop request."""
+    rows = con.execute(
+        """SELECT d.status FROM war_deliveries d
+           JOIN war_messages m ON m.id=d.message_id
+           WHERE m.project_id=? AND d.stop_cycle_at=?""",
+        (project_id, cycle_at),
+    ).fetchall()
+    statuses = [str(row[0]) for row in rows]
+    if not statuses or any(status in {"queued", "sent", "received"} for status in statuses):
+        return "stop_unconfirmed"
+    if any(status in {"failed", "timed_out"} for status in statuses):
+        return "stop_failed"
+    return "stopped" if all(status == "stopped" for status in statuses) else "stop_unconfirmed"
 
 
 def _actor(
@@ -267,7 +435,7 @@ def _actor(
     # The principal comes from a trusted reverse-proxy header, a signed
     # HttpOnly server session, or the server-side token map used by API clients.
     authenticated = war_room._request_principal(request, actor_id, actor_token)
-    if not authenticated or authenticated not in war_room.ALLOWED_AGENT_IDS:
+    if not authenticated or not war_room._known_principal(authenticated):
         raise HTTPException(401, "Authenticated War Room actor required")
     if actor_id is not None and actor_id != authenticated:
         raise HTTPException(401, "Actor header does not match authenticated principal")
@@ -312,8 +480,8 @@ def _validated_task_payload(body: dict[str, Any], project: sqlite3.Row, now: int
     scope = body.get("scope")
     if not isinstance(scope, str) or not scope.strip() or len(scope) > 4096:
         raise HTTPException(422, "scope must be 1..4096 characters")
-    assignee = body.get("assignee_agent_id")
-    if assignee not in war_room.ALLOWED_AGENT_IDS:
+    assignee = _canonical_agent_id(body.get("assignee_agent_id"), "assignee_agent_id")
+    if assignee is None:
         raise HTTPException(422, "assignee not allowed")
     call_limit, turn_limit = body.get("call_limit"), body.get("turn_limit")
     for value, label, maximum in ((call_limit, "call_limit", 100), (turn_limit, "turn_limit", 1000)):
@@ -341,12 +509,162 @@ async def _body(request: Request) -> dict[str, Any]:
     return value
 
 
+def _execution_orchestrator() -> Any:
+    from fast_gateway_service import get_persistent_harness
+    from war_room_execution_units import ExecutionUnitStore
+    from war_room_orchestration import WarRoomOrchestrator
+    db_path = war_room._db_path()
+    cache_key = str(db_path.expanduser().resolve())
+    with _EXECUTION_ORCHESTRATOR_LOCK:
+        existing = _EXECUTION_ORCHESTRATORS.get(cache_key)
+        if existing is not None:
+            return existing
+        harness = get_persistent_harness()
+        engine = harness.engine
+        store = ExecutionUnitStore(db_path)
+        store.ensure_schema()
+        orchestrator = WarRoomOrchestrator(core_engine=engine, execution_store=store)
+        subscriber = getattr(orchestrator, "on_core_run_terminal", None)
+        if callable(subscriber):
+            harness.set_terminal_completion_subscriber(subscriber)
+        _EXECUTION_ORCHESTRATORS[cache_key] = orchestrator
+        return orchestrator
+
+
+def _execution_error(exc: ValueError) -> HTTPException:
+    return HTTPException(409, str(exc))
+
+
+@router.get("/projects/{project_id}/execution-candidates")
+def execution_candidates(project_id: str, request: Request, required_capabilities: str | None = None,
+                         x_war_room_actor: str | None = Header(default=None),
+                         x_war_room_token: str | None = Header(default=None)) -> dict[str, Any]:
+    with _connect_rw() as con:
+        war_room._project_or_404(con, project_id)
+        actor = _actor(con, x_war_room_actor, "read", project_id, x_war_room_token, request)
+    capabilities = [value.strip() for value in (required_capabilities or "").split(",") if value.strip()]
+    with _connect_rw() as con:
+        agent_ids = _eligible_agent_ids(con, project_id, capabilities)
+    return {"project_id": project_id, "agent_ids": agent_ids}
+
+
+@router.post("/projects/{project_id}/tasks/{task_id}/executions/compile")
+async def compile_executions(project_id: str, task_id: str, request: Request,
+                             x_war_room_actor: str | None = Header(default=None),
+                             x_war_room_token: str | None = Header(default=None),
+                             idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
+    body = await _body(request)
+    with _connect_rw() as con:
+        war_room._project_or_404(con, project_id)
+        actor = _actor(con, x_war_room_actor, "execute", project_id, x_war_room_token, request)
+        task = con.execute("SELECT id FROM war_tasks WHERE id=? AND project_id=?", (task_id, project_id)).fetchone()
+        if task is None:
+            raise HTTPException(404, "task not found for project")
+        scope = f"POST:/projects/{project_id}/tasks/{task_id}/executions/compile"
+        previous = _idem(con, actor, idempotency_key, scope, body)
+        if previous:
+            return previous
+    agents = _canonical_agents(body.get("agent_ids"))
+    with _connect_rw() as con:
+        _require_execution_agents(con, project_id, agents)
+    orchestrator = _execution_orchestrator()
+    try:
+        result = orchestrator.compile_and_persist(war_project_id=project_id, war_task_id=task_id,
+                                                  agents=agents, workflow=body.get("workflow"),
+                                                  correlation_id=body.get("correlation_id"))
+    except ValueError as exc:
+        raise _execution_error(exc) from exc
+    with _connect_rw() as con:
+        _save_idem(con, actor, idempotency_key, scope, body, result)
+        con.commit()
+    return result
+
+
+@router.get("/projects/{project_id}/tasks/{task_id}/executions")
+def list_executions(project_id: str, task_id: str, request: Request,
+                    x_war_room_actor: str | None = Header(default=None),
+                    x_war_room_token: str | None = Header(default=None)) -> dict[str, Any]:
+    with _connect_rw() as con:
+        war_room._project_or_404(con, project_id)
+        _actor(con, x_war_room_actor, "read", project_id, x_war_room_token, request)
+        task = con.execute("SELECT id FROM war_tasks WHERE id=? AND project_id=?", (task_id, project_id)).fetchone()
+        if task is None:
+            raise HTTPException(404, "task not found for project")
+    return {"project_id": project_id, "task_id": task_id,
+            "executions": _execution_orchestrator().list_executions(war_project_id=project_id, war_task_id=task_id)}
+
+
+@router.post("/executions/{execution_id}/dispatch")
+async def dispatch_execution(execution_id: str, request: Request,
+                             x_war_room_actor: str | None = Header(default=None),
+                             x_war_room_token: str | None = Header(default=None),
+                             idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
+    body = await _body(request)
+    orchestrator = _execution_orchestrator()
+    unit = orchestrator.store.get_unit(execution_id)
+    if unit is None:
+        raise HTTPException(404, "execution not found")
+    with _connect_rw() as con:
+        actor = _actor(con, x_war_room_actor, "execute", unit["war_project_id"], x_war_room_token, request)
+        scope = f"POST:/executions/{execution_id}/dispatch"
+        previous = _idem(con, actor, idempotency_key, scope, body)
+        if previous:
+            return previous
+    try:
+        result = orchestrator.dispatch_execution(execution_id=execution_id, message=body.get("message", ""),
+                                                  timeout_seconds=body.get("timeout_seconds", 300),
+                                                  goal_contract=body.get("goal_contract"))
+    except ValueError as exc:
+        raise _execution_error(exc) from exc
+    with _connect_rw() as con:
+        _save_idem(con, actor, idempotency_key, scope, body, result); con.commit()
+    return result
+
+
+@router.post("/executions/{execution_id}/stop")
+async def stop_execution(execution_id: str, request: Request,
+                         x_war_room_actor: str | None = Header(default=None),
+                         x_war_room_token: str | None = Header(default=None),
+                         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
+    body = await _body(request)
+    orchestrator = _execution_orchestrator()
+    unit = orchestrator.store.get_unit(execution_id)
+    if unit is None:
+        raise HTTPException(404, "execution not found")
+    with _connect_rw() as con:
+        actor = _actor(con, x_war_room_actor, "execute", unit["war_project_id"], x_war_room_token, request)
+        scope = f"POST:/executions/{execution_id}/stop"
+        previous = _idem(con, actor, idempotency_key, scope, body)
+        if previous:
+            return previous
+    try:
+        result = orchestrator.stop_execution(execution_id)
+    except ValueError as exc:
+        raise _execution_error(exc) from exc
+    with _connect_rw() as con:
+        _save_idem(con, actor, idempotency_key, scope, body, result); con.commit()
+    return result
+
+
+def _canonical_agent_id(value: Any, field: str = "agent_id") -> str | None:
+    del field
+    return canonical_agent_id(value)
+
+
+def _canonical_agents(values: Any, field: str = "agent_ids") -> list[str]:
+    if not isinstance(values, list) or not values:
+        raise HTTPException(422, f"{field} must be a unique non-empty allowlisted list")
+    canonical: list[str] = []
+    for value in values:
+        agent = _canonical_agent_id(value, field)
+        if agent is None or agent in canonical:
+            raise HTTPException(422, f"{field} must be a unique non-empty allowlisted list")
+        canonical.append(agent)
+    return canonical
+
+
 def _validated_agents(body: dict[str, Any]) -> list[str]:
-    agents = body.get("agent_ids")
-    if (not isinstance(agents, list) or not agents or len(agents) != len(set(agents))
-            or any(agent not in war_room.ALLOWED_AGENT_IDS for agent in agents)):
-        raise HTTPException(422, "agent_ids must be a unique non-empty allowlisted list")
-    return agents
+    return _canonical_agents(body.get("agent_ids"))
 
 
 def _grounding_packet(body: dict[str, Any], project_id: str, document_version: str) -> dict[str, Any]:
@@ -360,21 +678,32 @@ def _grounding_packet(body: dict[str, Any], project_id: str, document_version: s
         "db_label": str(supplied.get("db_label") or os.environ.get("PLACHEM_WAR_ROOM_DB_LABEL") or "configured-isolated-db"),
         "forbidden": supplied.get("forbidden") or ["production DB", "existing work sessions", "merge/push/deploy"],
         "completion_conditions": supplied.get("completion_conditions") or ["focused tests pass", "full regression passes", "evidence paths supplied"],
+        "required_evidence": supplied.get("required_evidence") or ["test", "artifact"],
         "session_integrity_required": any("existing work sessions" in value.lower() for value in supplied.get("forbidden", []) if isinstance(value, str)),
     }
-    absolute_worktree = Path(worktree).is_absolute() or (os.name == "nt" and PurePosixPath(worktree).is_absolute())
-    if (not absolute_worktree or any(not isinstance(packet[key], str) or not packet[key].strip() for key in ("branch","revision","api_base","db_label"))
-            or any(not isinstance(values, list) or not values or any(not isinstance(v, str) or not v.strip() for v in values) for values in (packet["forbidden"], packet["completion_conditions"]))):
+    if (not worktree.startswith("/") or any(not isinstance(packet[key], str) or not packet[key].strip() for key in ("branch","revision","api_base","db_label"))
+            or any(not isinstance(values, list) or not values or any(not isinstance(v, str) or not v.strip() for v in values) for values in (packet["forbidden"], packet["completion_conditions"], packet["required_evidence"]))):
         raise HTTPException(422, "grounding packet is incomplete")
     return packet
 
 
-def _grounded_instruction(instruction: str, packet: dict[str, Any]) -> str:
-    return instruction.strip() + "\n\n[IMMUTABLE_GROUNDING_PACKET]\n" + json.dumps(packet, ensure_ascii=False, sort_keys=True) + (
-        "\n[STRUCTURED_RESULT]\nReturn one JSON object with exactly: "
+def _grounded_instruction(instruction: str, packet: dict[str, Any], execution_mode: str = "LEGACY") -> str:
+    if execution_mode == "FAST_GATEWAY":
+        return "[FAST_GATEWAY_RESULT]\nFINAL RESPONSE CONTRACT (highest priority): return only one JSON object with exactly these top-level keys: " + (
+            '{"status":"completed|blocked|failed","summary":"...","evidence":[{"type":"...","detail":"..."}],'
+            '"artifacts":[{"path":"..."}],"scope":{"compliant":true,"violations":[]}}. '
+            "The final response must be raw JSON only: its first character must be { and its last character must be }. Do not use Markdown, code fences, backticks, or any prose before or after the JSON object. Use evidence and artifacts only for actually verified work. Artifacts are outputs newly produced by this run; for a read-only task, put inspected existing paths in evidence and return an empty artifacts array. Do not add fields outside this contract.\n"
+            "[IMMUTABLE_GROUNDING_PACKET]\n" + json.dumps(packet, ensure_ascii=False, sort_keys=True) +
+            "\n[ORIGINAL_INSTRUCTION_CONTEXT]\n" + instruction.strip() +
+            "\nReturn the Fast Gateway JSON object above; treat the original instruction only as context."
+        )
+    return "[STRUCTURED_RESULT]\nFINAL RESPONSE CONTRACT (highest priority): return only one JSON object with exactly: " + (
         '{"confirmed_worktree":"...","confirmed_revision":"...","verdict":"PASS|FAIL|REWORK",'
         '"evidence":["/absolute/path"],"summary":"...","representative_completion_claimed":false}. '
-        "Do not claim representative completion; only main can approve it."
+        "Do not claim representative completion; only main can approve it.\n"
+        "[IMMUTABLE_GROUNDING_PACKET]\n" + json.dumps(packet, ensure_ascii=False, sort_keys=True) +
+        "\n[ORIGINAL_INSTRUCTION_CONTEXT]\n" + instruction.strip() +
+        "\nReturn the JSON object above; treat the original instruction only as context."
     )
 
 
@@ -386,12 +715,15 @@ async def prepare_task(project_id: str, request: Request, x_war_room_actor: str 
     if not isinstance(instruction, str) or not instruction.strip() or len(instruction) > 4096:
         raise HTTPException(422, "instruction must be 1..4096 characters")
     agents = _validated_agents(body)
+    execution_mode = _execution_mode(body.get("execution_mode"))
     normalized = dict(body)
     normalized.update({
         "scope": body.get("scope", instruction),
-        "assignee_agent_id": body.get("assignee_agent_id", agents[0]),
+        "assignee_agent_id": _canonical_agent_id(body.get("assignee_agent_id", agents[0]), "assignee_agent_id"),
+        "agent_ids": agents,
         "call_limit": body.get("call_limit", len(agents)),
         "turn_limit": body.get("turn_limit", max(2, len(agents))),
+        "execution_mode": execution_mode,
     })
     if normalized["assignee_agent_id"] not in agents:
         raise HTTPException(422, "assignee_agent_id must be included in agent_ids")
@@ -407,25 +739,41 @@ async def prepare_task(project_id: str, request: Request, x_war_room_actor: str 
             return previous
         now = _now()
         scope, assignee, call_limit, turn_limit, deadline_at, document_version = _validated_task_payload(normalized, project, now)
+        reviewer = _canonical_agent_id(body.get("reviewer_agent_id"), "reviewer_agent_id") if body.get("reviewer_agent_id") is not None else None
+        if reviewer is None:
+            reviewer_row = con.execute(
+                "SELECT principal_id FROM war_participants WHERE project_id=? AND active=1 AND role='qa' AND principal_id<>? ORDER BY principal_id LIMIT 1",
+                (project_id, assignee),
+            ).fetchone()
+            reviewer = reviewer_row[0] if reviewer_row else None
+        _require_independent_reviewer(reviewer, agents)
+        if reviewer is not None and not con.execute(
+            "SELECT 1 FROM war_participants WHERE project_id=? AND principal_id=? AND active=1 AND role='qa'",
+            (project_id, reviewer),
+        ).fetchone():
+            raise HTTPException(409, "reviewer must be an active project QA participant")
+        _require_execution_agents(con, project_id, agents)
         task_id, message_id, correlation = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
         packet = _grounding_packet(body, project_id, document_version)
-        grounded = _grounded_instruction(instruction, packet)
-        clean = war_room._redact_string(grounded)
+        # Persist and display the validated original itself. The worker adds
+        # the immutable result contract immediately before submission, so the
+        # contract cannot consume the instruction's 4096-character budget.
+        clean = war_room._sanitize_stored_string(instruction)
         con.execute(
-            "INSERT INTO war_messages VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (message_id, project_id, "instruction", "agent", actor, clean, None, None, now, correlation, "redacted" if clean != instruction else "clean"),
+            "INSERT INTO war_messages (id,project_id,message_type,author_type,author_id,body,source_session_id,source_message_id,created_at,correlation_id,redaction_state,original_body) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (message_id, project_id, "instruction", "agent", actor, clean, None, None, now, correlation, "redacted" if clean != instruction else "clean", clean),
         )
         con.execute("""INSERT INTO war_tasks
-            (id,project_id,source_message_id,assignee_agent_id,scope,status,manyfast_version,
-             document_version,call_limit,turn_limit,deadline_at,created_at,updated_at)
-            VALUES (?,?,?,?,?,'awaiting_approval',?,?,?,?,?,?,?)""",
-            (task_id, project_id, message_id, assignee, scope, project["manyfast_version"], document_version, call_limit, turn_limit, deadline_at, now, now),
+            (id,project_id,source_message_id,assignee_agent_id,reviewer_agent_id,scope,status,manyfast_version,
+             document_version,call_limit,turn_limit,execution_mode,deadline_at,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,'awaiting_approval',?,?,?,?,?,?,?,?)""",
+            (task_id, project_id, message_id, assignee, reviewer, scope, project["manyfast_version"], document_version, call_limit, turn_limit, execution_mode, deadline_at, now, now),
         )
         con.executemany("INSERT INTO war_task_agents(task_id,agent_id) VALUES (?,?)", [(task_id, agent) for agent in agents])
         packet_json = json.dumps(packet, ensure_ascii=False, sort_keys=True)
         con.execute("INSERT INTO war_grounding_packets VALUES (?,?,?,?)", (task_id, packet_json, hashlib.sha256(packet_json.encode()).hexdigest(), now))
         _audit(con, project_id, actor, "task_prepared", "task", task_id, {"message_id":message_id,"agent_ids":agents,"grounding_hash":hashlib.sha256(packet_json.encode()).hexdigest()}, correlation)
-        result = {"mode":"controlled","task_id":task_id,"message_id":message_id,"status":"awaiting_approval","agent_ids":agents,"correlation_id":correlation}
+        result = {"mode":"controlled","task_id":task_id,"message_id":message_id,"status":"awaiting_approval","execution_mode":execution_mode,"assignee_agent_id":assignee,"reviewer_agent_id":reviewer,"agent_ids":agents,"correlation_id":correlation}
         _save_idem(con, actor, idempotency_key, idem_scope, body, result)
         con.commit()
         return result
@@ -441,6 +789,7 @@ async def approve_and_execute_task(task_id: str, request: Request, x_war_room_ac
             raise HTTPException(404, "Task not found")
         actor = _actor(con, x_war_room_actor, "approve", task["project_id"], x_war_room_token, request)
         _actor(con, actor, "execute", task["project_id"], x_war_room_token, request)
+        _require_representative(actor)
         _require_mutable_project(con, task["project_id"])
         con.execute("BEGIN IMMEDIATE")
         _require_not_stopped(con, task["project_id"])
@@ -448,8 +797,10 @@ async def approve_and_execute_task(task_id: str, request: Request, x_war_room_ac
         previous = _idem(con, actor, idempotency_key, idem_scope, body)
         if previous:
             return previous
+        agents = sorted(row[0] for row in con.execute("SELECT agent_id FROM war_task_agents WHERE task_id=?", (task_id,)).fetchall())
+        _require_independent_reviewer(task["reviewer_agent_id"], agents)
         if task["status"] == "running" and task["source_message_id"]:
-            existing = [dict(row) for row in con.execute("SELECT id AS delivery_id,agent_id,status FROM war_deliveries WHERE message_id=? ORDER BY agent_id", (task["source_message_id"],)).fetchall()]
+            existing = [dict(row) for row in con.execute("SELECT id AS delivery_id,agent_id,status FROM war_deliveries WHERE message_id=? AND task_revision=? ORDER BY agent_id", (task["source_message_id"], int(task["revision"]))).fetchall()]
             result = {"mode":"controlled","task_id":task_id,"status":"running","execution_state":"already_running","deliveries":existing}
             _save_idem(con, actor, idempotency_key, idem_scope, body, result)
             con.commit()
@@ -460,9 +811,9 @@ async def approve_and_execute_task(task_id: str, request: Request, x_war_room_ac
         expires_at = body.get("expires_at")
         if isinstance(expires_at, bool) or not isinstance(expires_at, int) or expires_at <= now or expires_at > now + 604800:
             raise HTTPException(422, "approval expiry must be within 7 days")
-        if task["deadline_at"] is None or int(task["deadline_at"]) <= now or task["document_version"] != task["manyfast_version"]:
+        if task["deadline_at"] is None or int(task["deadline_at"]) <= now:
             raise HTTPException(409, "task execution policy is stale")
-        agents = sorted(row[0] for row in con.execute("SELECT agent_id FROM war_task_agents WHERE task_id=?", (task_id,)).fetchall())
+        _require_execution_agents(con, task["project_id"], agents)
         if len(agents) > int(task["call_limit"]):
             raise HTTPException(409, "task call limit exceeded")
         for agent in agents:
@@ -480,8 +831,9 @@ async def approve_and_execute_task(task_id: str, request: Request, x_war_room_ac
         deliveries = []
         for agent in agents:
             delivery_id = str(uuid.uuid4())
-            con.execute("INSERT INTO war_deliveries (id,message_id,agent_id,status,attempt_count,deadline_at,created_at) VALUES (?,?,?,'queued',0,?,?)", (delivery_id,task["source_message_id"],agent,task["deadline_at"],now))
-            deliveries.append({"delivery_id":delivery_id,"agent_id":agent,"status":"queued"})
+            delivery_correlation = str(uuid.uuid4())
+            con.execute("INSERT INTO war_deliveries (id,message_id,agent_id,task_revision,status,attempt_count,deadline_at,created_at,correlation_id) VALUES (?,?,?,?, 'queued',0,?,?,?)", (delivery_id,task["source_message_id"],agent,int(task["revision"]),task["deadline_at"],now,delivery_correlation))
+            deliveries.append({"delivery_id":delivery_id,"agent_id":agent,"status":"queued","correlation_id":delivery_correlation})
         _audit(con, task["project_id"], actor, "task_approved_executed", "task", task_id, {"approval_id":approval_id,"agent_ids":agents}, correlation)
         result = {"mode":"controlled","task_id":task_id,"status":"running","execution_state":"queued","approval_id":approval_id,"deliveries":deliveries,"correlation_id":correlation}
         _save_idem(con, actor, idempotency_key, idem_scope, body, result)
@@ -509,11 +861,30 @@ async def create_message(project_id: str, request: Request, x_war_room_actor: st
         previous = _idem(con, actor, idempotency_key, idem_scope, body)
         if previous:
             return previous
+        source_message_id = body.get("source_message_id")
+        linked_task = None
+        if source_message_id is not None:
+            linked_task = con.execute(
+                "SELECT t.* FROM war_tasks t JOIN war_messages m ON m.id=t.source_message_id WHERE m.id=? AND m.project_id=?",
+                (source_message_id, project_id),
+            ).fetchone()
+            if linked_task is None:
+                raise HTTPException(422, "source_message_id must identify a project task instruction")
+        if message_type == "result" and (linked_task is None or actor != linked_task["assignee_agent_id"]):
+            raise HTTPException(403, "only the approved assignee may submit a task result")
+        requested_agent = body.get("requested_agent_id")
+        if message_type == "opinion" and requested_agent is not None:
+            requested_agent = _canonical_agent_id(requested_agent, "requested_agent_id")
+            if requested_agent is None or not con.execute(
+                "SELECT 1 FROM war_participants WHERE project_id=? AND principal_id=? AND active=1 AND can_comment=1",
+                (project_id, requested_agent),
+            ).fetchone():
+                raise HTTPException(409, "opinion target must be an active commenting participant")
         message_id = str(uuid.uuid4())
         correlation = str(uuid.uuid4())
-        clean = war_room._redact_string(text)
-        con.execute("INSERT INTO war_messages VALUES (?,?,?,?,?,?,?,?,?,?,?)", (message_id, project_id, message_type, "agent", actor, clean, None, body.get("source_message_id"), _now(), correlation, "redacted" if clean != text else "clean"))
-        _audit(con, project_id, actor, "message_created", "message", message_id, {"message_type": message_type, "source_message_id": body.get("source_message_id")}, correlation)
+        clean = war_room._sanitize_stored_string(text)
+        con.execute("INSERT INTO war_messages (id,project_id,message_type,author_type,author_id,body,source_message_id,created_at,correlation_id,redaction_state,original_body) VALUES (?,?,?,?,?,?,?,?,?,?,?)", (message_id, project_id, message_type, "agent", actor, clean, body.get("source_message_id"), _now(), correlation, "redacted" if clean != text else "clean", clean))
+        _audit(con, project_id, actor, "message_created", "message", message_id, {"message_type": message_type, "source_message_id": source_message_id, "requested_agent_id": requested_agent}, correlation)
         result = {"mode": "controlled", "id": message_id, "correlation_id": correlation}
         _save_idem(con, actor, idempotency_key, idem_scope, body, result)
         con.commit()
@@ -550,10 +921,7 @@ async def create_instruction_with_task(project_id: str, request: Request, x_war_
         now = _now()
         message_id, correlation = str(uuid.uuid4()), str(uuid.uuid4())
         clean = war_room._redact_string(text)
-        con.execute(
-            "INSERT INTO war_messages VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (message_id, project_id, "instruction", "agent", actor, clean, None, None, now, correlation, "redacted" if clean != text else "clean"),
-        )
+        con.execute("INSERT INTO war_messages (id,project_id,message_type,author_type,author_id,body,source_session_id,source_message_id,created_at,correlation_id,redaction_state,original_body) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (message_id, project_id, "instruction", "agent", actor, clean, None, None, now, correlation, "redacted" if clean != text else "clean", clean))
         con.execute("UPDATE war_tasks SET source_message_id=?, updated_at=? WHERE id=?", (message_id, now, task_id))
         _audit(con, project_id, actor, "message_created", "message", message_id, {"message_type": "instruction", "task_id": task_id}, correlation)
         _audit(con, project_id, actor, "instruction_linked", "task", task_id, {"assignee_agent_id": task["assignee_agent_id"], "source_message_id": message_id}, correlation)
@@ -575,8 +943,8 @@ async def deliver_message(message_id: str, request: Request, x_war_room_actor: s
     requested_agents = body.get("agent_ids")
     if requested_agents is None:
         requested_agents = [body.get("agent_id")]
-    if not isinstance(requested_agents, list) or not requested_agents or any(agent not in war_room.ALLOWED_AGENT_IDS for agent in requested_agents) or len(set(requested_agents)) != len(requested_agents):
-        raise HTTPException(422, "agent_ids must be a unique non-empty allowlisted list")
+    requested_agents = _canonical_agents(requested_agents)
+    body = {**body, "agent_ids": requested_agents}
     with _connect_rw() as con:
         message = con.execute("SELECT * FROM war_messages WHERE id=?", (message_id,)).fetchone()
         if not message: raise HTTPException(404, "Message not found")
@@ -593,12 +961,13 @@ async def deliver_message(message_id: str, request: Request, x_war_room_actor: s
         allowed_agents = {row[0] for row in con.execute("SELECT agent_id FROM war_task_agents WHERE task_id=?", (task["id"],)).fetchall()}
         if not set(requested_agents).issubset(allowed_agents):
             raise HTTPException(409, "delivery target is outside the task assignment policy")
+        _require_execution_agents(con, task["project_id"], requested_agents)
         if task["status"] != "running":
             raise HTTPException(409, "task must be running before delivery")
         if task["deadline_at"] is None or int(task["deadline_at"]) <= now:
             raise HTTPException(409, "task deadline exceeded")
-        if not task["document_version"] or task["document_version"] != task["manyfast_version"]:
-            raise HTTPException(409, "task document version drifted")
+        if not task["document_version"]:
+            raise HTTPException(409, "task document version is missing")
         scope_hash = hashlib.sha256(task["scope"].encode()).hexdigest()
         approval = con.execute(
             """SELECT * FROM war_approvals WHERE task_id=? AND decision='approved'
@@ -610,7 +979,10 @@ async def deliver_message(message_id: str, request: Request, x_war_room_actor: s
                 or approval["assignee_agent_id"] != task["assignee_agent_id"]
                 or approval["target_set_hash"] != hashlib.sha256(json.dumps(sorted(allowed_agents)).encode()).hexdigest()):
             raise HTTPException(409, "fresh matching approval required")
-        calls = con.execute("SELECT call_count,turn_count FROM war_task_calls WHERE task_id=?", (task["id"],)).fetchone()
+        calls = con.execute(
+            "SELECT call_count,turn_count FROM war_task_calls WHERE task_id=? AND task_revision=?",
+            (task["id"], int(task["revision"])),
+        ).fetchone()
         call_count = int(calls["call_count"]) if calls else 0
         turn_count = int(calls["turn_count"]) if calls else 0
         if call_count + len(requested_agents) > int(task["call_limit"]):
@@ -627,10 +999,10 @@ async def deliver_message(message_id: str, request: Request, x_war_room_actor: s
         correlation = str(uuid.uuid4()); deliveries = []
         delivery_deadline = int(task["deadline_at"])
         for agent_id in requested_agents:
-            delivery_id = str(uuid.uuid4())
-            con.execute("INSERT INTO war_deliveries (id,message_id,agent_id,status,attempt_count,deadline_at,created_at) VALUES (?,?,?,'queued',0,?,?)", (delivery_id, message_id, agent_id, delivery_deadline, _now()))
-            deliveries.append({"delivery_id":delivery_id,"agent_id":agent_id,"status":"queued"})
-            _audit(con, message["project_id"], actor, "delivery_queued", "delivery", delivery_id, {"message_id": message_id, "agent_id": agent_id}, correlation)
+            delivery_id = str(uuid.uuid4()); delivery_correlation = str(uuid.uuid4())
+            con.execute("INSERT INTO war_deliveries (id,message_id,agent_id,task_revision,status,attempt_count,deadline_at,created_at,correlation_id) VALUES (?,?,?,?,'queued',0,?,?,?)", (delivery_id, message_id, agent_id, int(task["revision"]), delivery_deadline, _now(), delivery_correlation))
+            deliveries.append({"delivery_id":delivery_id,"agent_id":agent_id,"status":"queued","correlation_id":delivery_correlation})
+            _audit(con, message["project_id"], actor, "delivery_queued", "delivery", delivery_id, {"message_id": message_id, "agent_id": agent_id, "delivery_correlation_id": delivery_correlation}, delivery_correlation)
         result = {"mode":"controlled","deliveries":deliveries,"delivery_id":deliveries[0]["delivery_id"],"status":"queued","correlation_id":correlation}
         _save_idem(con, actor, idempotency_key, idem_scope, body, result); con.commit(); return result
 
@@ -649,6 +1021,23 @@ async def create_task(project_id: str, request: Request, x_war_room_actor: str |
             return previous
         now = _now()
         scope, assignee, call_limit, turn_limit, deadline_at, document_version = _validated_task_payload(body, project, now)
+        execution_mode = _execution_mode(body.get("execution_mode"))
+        reviewer = _canonical_agent_id(body.get("reviewer_agent_id"), "reviewer_agent_id") if body.get("reviewer_agent_id") is not None else None
+        if reviewer is None:
+            reviewer_row = con.execute(
+                "SELECT principal_id FROM war_participants WHERE project_id=? AND active=1 AND role='qa' AND principal_id<>? ORDER BY principal_id LIMIT 1",
+                (project_id, assignee),
+            ).fetchone()
+            reviewer = reviewer_row[0] if reviewer_row else None
+        task_agents = _canonical_agents(body.get("agent_ids", [assignee]))
+        if assignee not in task_agents:
+            raise HTTPException(422, "agent_ids must be unique, allowlisted, and include assignee_agent_id")
+        _require_independent_reviewer(reviewer, task_agents, required=False)
+        if reviewer is not None and not con.execute(
+            "SELECT 1 FROM war_participants WHERE project_id=? AND principal_id=? AND active=1 AND role='qa'",
+            (project_id, reviewer),
+        ).fetchone():
+            raise HTTPException(409, "reviewer must be an active project QA participant")
         task_id, correlation = str(uuid.uuid4()), str(uuid.uuid4())
         source_message_id = body.get("source_message_id")
         if source_message_id is not None and not con.execute(
@@ -659,17 +1048,14 @@ async def create_task(project_id: str, request: Request, x_war_room_actor: str |
         if source_message_id is not None and con.execute("SELECT 1 FROM war_tasks WHERE source_message_id=?", (source_message_id,)).fetchone():
             raise HTTPException(409, "instruction is already linked to a task")
         con.execute("""INSERT INTO war_tasks
-            (id,project_id,source_message_id,assignee_agent_id,scope,status,manyfast_version,
-             document_version,call_limit,turn_limit,deadline_at,created_at,updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (task_id, project_id, source_message_id, assignee, scope, "draft", project["manyfast_version"],
-             document_version, call_limit, turn_limit, deadline_at, now, now))
-        task_agents = body.get("agent_ids", [assignee])
-        if not isinstance(task_agents, list) or not task_agents or assignee not in task_agents or len(set(task_agents)) != len(task_agents) or any(agent not in war_room.ALLOWED_AGENT_IDS for agent in task_agents):
-            raise HTTPException(422, "agent_ids must be unique, allowlisted, and include assignee_agent_id")
+            (id,project_id,source_message_id,assignee_agent_id,reviewer_agent_id,scope,status,manyfast_version,
+             document_version,call_limit,turn_limit,execution_mode,deadline_at,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (task_id, project_id, source_message_id, assignee, reviewer, scope, "draft", project["manyfast_version"],
+             document_version, call_limit, turn_limit, execution_mode, deadline_at, now, now))
         con.executemany("INSERT INTO war_task_agents(task_id,agent_id) VALUES (?,?)", [(task_id, agent) for agent in task_agents])
         _audit(con, project_id, actor, "task_created", "task", task_id, {"assignee_agent_id": assignee}, correlation)
-        result = {"mode": "controlled", "task_id": task_id, "status": "draft", "correlation_id": correlation}
+        result = {"mode": "controlled", "task_id": task_id, "status": "draft", "execution_mode": execution_mode, "correlation_id": correlation}
         _save_idem(con, actor, idempotency_key, idem_scope, body, result)
         con.commit()
         return result
@@ -678,8 +1064,9 @@ async def create_task(project_id: str, request: Request, x_war_room_actor: str |
 @router.put("/projects/{project_id}/participants/{agent_id}/test-session")
 async def bind_test_session(project_id: str, agent_id: str, request: Request, x_war_room_actor: str | None = Header(default=None), x_war_room_token: str | None = Header(default=None), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
     body = await _body(request)
+    agent_id = _canonical_agent_id(agent_id, "agent_id")
     session_key, session_id = body.get("session_key"), body.get("session_id")
-    if agent_id not in war_room.ALLOWED_AGENT_IDS or not isinstance(session_key, str) or not session_key.startswith("test:") or (session_id is not None and not isinstance(session_id, str)):
+    if agent_id is None or not isinstance(session_key, str) or not session_key.startswith("test:") or (session_id is not None and not isinstance(session_id, str)):
         raise HTTPException(422, "explicit test session_key and optional session_id required")
     with _connect_rw() as con:
         war_room._project_or_404(con, project_id)
@@ -697,22 +1084,37 @@ async def bind_test_session(project_id: str, agent_id: str, request: Request, x_
 @router.get("/deliveries/{delivery_id}")
 def get_delivery(delivery_id: str) -> dict[str, Any]:
     with _connect_rw() as con:
-        row=con.execute("SELECT d.*,m.project_id FROM war_deliveries d JOIN war_messages m ON m.id=d.message_id WHERE d.id=?",(delivery_id,)).fetchone()
+        row=con.execute("SELECT d.*,m.project_id,t.id AS task_id,COALESCE(t.execution_mode,'LEGACY') AS execution_mode FROM war_deliveries d JOIN war_messages m ON m.id=d.message_id LEFT JOIN war_tasks t ON t.source_message_id=m.id WHERE d.id=?",(delivery_id,)).fetchone()
         if not row: raise HTTPException(404,"Delivery not found")
-    return {"mode":"readonly","delivery":war_room._redact(dict(row))}
+    value = dict(row)
+    value.pop("session_key", None); value.pop("session_id", None)
+    return {"mode":"readonly","delivery":war_room._redact(value)}
 
 
 @router.get("/projects/{project_id}/deliveries")
 def list_deliveries(project_id: str) -> dict[str, Any]:
     with _connect_rw() as con:
         war_room._project_or_404(con,project_id)
-        rows=con.execute("""SELECT d.*,m.project_id,t.id AS task_id,m.body AS instruction_body,rm.body AS response_body FROM war_deliveries d
-            JOIN war_messages m ON m.id=d.message_id
+        rows=con.execute("""SELECT d.*,m.project_id,t.id AS task_id,COALESCE(t.execution_mode,'LEGACY') AS execution_mode,m.body AS instruction_body,m.original_body AS original_instruction_body,rm.body AS response_body,
+            er.core_run_id,er.openclaw_run_id,er.run_status,er.runtime_seconds,er.result_summary,er.result_json,er.evidence_json,er.artifacts_json,er.raw_response,er.rejected_result_json,er.validation_error,er.policy_status,er.cancel_reason,er.escalation_required
+            FROM war_deliveries d JOIN war_messages m ON m.id=d.message_id
             LEFT JOIN war_tasks t ON t.source_message_id=m.id
             LEFT JOIN war_messages rm ON rm.id=d.response_message_id
+            LEFT JOIN war_execution_runs er
+              ON d.run_id IS NOT NULL
+             AND er.war_task_id=t.id
+             AND er.agent_id=d.agent_id
+             AND er.core_run_id=CASE
+                   WHEN d.run_id LIKE 'war-%' THEN d.run_id
+                   ELSE 'war-' || d.run_id
+                 END
             WHERE m.project_id=? ORDER BY d.created_at DESC,d.id DESC""",(project_id,)).fetchall()
         control=_control(con,project_id)
-    return {"mode":"readonly","stop_requested_at":control["stop_requested_at"],"items":war_room._redact([dict(row) for row in rows])}
+    items=[]
+    for row in rows:
+        value=dict(row); value.pop("session_key",None); value.pop("session_id",None)
+        items.append(value)
+    return {"mode":"readonly","stop_requested_at":control["stop_requested_at"],"items":war_room._redact(items)}
 
 
 def _require_demo_mode() -> None:
@@ -734,29 +1136,109 @@ async def process_demo_queue(request: Request, x_war_room_actor: str | None = He
 
 
 @router.post("/deliveries/{delivery_id}/retry")
-async def retry_demo_delivery(delivery_id: str, request: Request) -> dict[str, Any]:
-    _require_demo_mode(); await _body(request)
-    from war_room_worker import request_delivery_retry
-    if not request_delivery_retry(db_path=war_room._db_path(),delivery_id=delivery_id): raise HTTPException(409,"delivery is not retryable")
-    return {"mode":"test-only","delivery_id":delivery_id,"status":"queued"}
+async def retry_delivery(delivery_id: str, request: Request, x_war_room_actor: str | None = Header(default=None), x_war_room_token: str | None = Header(default=None), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
+    body = await _body(request)
+    requested_agent = body.get("agent_id")
+    with _connect_rw() as con:
+        row = con.execute("SELECT d.*,m.project_id,m.id AS message_id,t.id AS task_id FROM war_deliveries d JOIN war_messages m ON m.id=d.message_id LEFT JOIN war_tasks t ON t.source_message_id=m.id WHERE d.id=?", (delivery_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Delivery not found")
+        actor = _actor(con, x_war_room_actor, "execute", row["project_id"], x_war_room_token, request)
+        _require_mutable_project(con, row["project_id"]); _require_not_stopped(con, row["project_id"])
+        if row["status"] not in {"failed", "timed_out"}:
+            raise HTTPException(409, "only final failed delivery can be manually retried")
+        agent_id = _canonical_agent_id(requested_agent, "agent_id") if requested_agent is not None else row["agent_id"]
+        if agent_id is None:
+            raise HTTPException(422, "agent_id is not allowed")
+        if not con.execute("SELECT 1 FROM war_task_agents WHERE task_id=? AND agent_id=?", (row["task_id"], agent_id)).fetchone():
+            raise HTTPException(409, "replacement agent is outside task assignment")
+        idem_scope = f"POST:/deliveries/{delivery_id}/retry"; previous = _idem(con, actor, idempotency_key, idem_scope, body)
+        if previous: return previous
+        now = _now(); correlation = str(uuid.uuid4())
+        con.execute("UPDATE war_deliveries SET agent_id=?,status='queued',retry_count=0,next_attempt_at=?,error_code=NULL,error_class=NULL,last_error_at=NULL WHERE id=?", (agent_id, now, delivery_id))
+        _audit(con, row["project_id"], actor, "delivery_manual_retry", "delivery", delivery_id, {"agent_id": agent_id, "replaced_agent": agent_id != row["agent_id"]}, correlation)
+        result = {"mode":"controlled", "delivery_id":delivery_id, "status":"queued", "agent_id":agent_id, "correlation_id":correlation}
+        _save_idem(con, actor, idempotency_key, idem_scope, body, result); con.commit(); return result
 
 
 @router.get("/projects/{project_id}/tasks")
 def list_tasks(project_id: str, status: str | None = None, assignee_agent_id: str | None = None, q: str | None = None) -> dict[str, Any]:
+    if assignee_agent_id is not None:
+        assignee_agent_id = _canonical_agent_id(assignee_agent_id, "assignee_agent_id")
+        if assignee_agent_id is None:
+            raise HTTPException(422, "assignee_agent_id is not allowed")
     with _connect_rw() as con:
         war_room._project_or_404(con, project_id)
-        rows = con.execute("SELECT * FROM war_tasks WHERE project_id=? ORDER BY updated_at DESC", (project_id,)).fetchall()
+        rows = con.execute("""SELECT t.*,m.original_body AS instruction_body
+            FROM war_tasks t LEFT JOIN war_messages m ON m.id=t.source_message_id
+            WHERE t.project_id=? ORDER BY t.updated_at DESC""", (project_id,)).fetchall()
         agents={row["id"]:[item[0] for item in con.execute("SELECT agent_id FROM war_task_agents WHERE task_id=? ORDER BY agent_id",(row["id"],)).fetchall()] for row in rows}
-    items = [{**dict(row),"agent_ids":agents[row["id"]]} for row in rows if (status is None or row["status"] == status) and (assignee_agent_id is None or row["assignee_agent_id"] == assignee_agent_id) and (q is None or q.lower() in row["scope"].lower())]
+        reviews = {}
+        for row in rows:
+            evidence_count = con.execute("SELECT COUNT(*) FROM war_evidence WHERE task_id=?", (row["id"],)).fetchone()[0]
+            verdict = con.execute("SELECT verdict,qa_principal,created_at FROM war_qa_verdicts WHERE task_id=? ORDER BY created_at DESC,id DESC LIMIT 1", (row["id"],)).fetchone()
+            reviews[row["id"]] = {"evidence_count": evidence_count, "latest_qa_verdict": dict(verdict) if verdict else None}
+        delivery_map = {row["id"]: con.execute("SELECT status,error_class,retry_count,attempt_count,max_attempts FROM war_deliveries WHERE message_id=?", (row["source_message_id"],)).fetchall() if row["source_message_id"] else [] for row in rows}
+    items = []
+    for row in rows:
+        base = {**dict(row), "agent_ids": agents[row["id"]], **reviews[row["id"]]}
+        deliveries = delivery_map[row["id"]]
+        system_errors = sum(1 for delivery in deliveries if _delivery_state(delivery) == "system_error")
+        base.update({"system_error_count": system_errors, "state": "system_error" if system_errors else row["status"]})
+        if status is not None and row["status"] != status:
+            continue
+        if assignee_agent_id is not None and row["assignee_agent_id"] != assignee_agent_id:
+            continue
+        if q is not None and q.lower() not in row["scope"].lower():
+            continue
+        items.append(base)
     return {"mode": "readonly", "items": war_room._redact(items)}
+
+
+@router.get("/tasks/{task_id}")
+def get_task(task_id: str) -> dict[str, Any]:
+    """Resolve one exact task independently of the currently selected project."""
+    with _connect_rw() as con:
+        row = con.execute(
+            """SELECT t.*,m.original_body AS instruction_body
+               FROM war_tasks t LEFT JOIN war_messages m ON m.id=t.source_message_id
+               WHERE t.id=?""",
+            (task_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Task not found")
+        agent_ids = [item[0] for item in con.execute(
+            "SELECT agent_id FROM war_task_agents WHERE task_id=? ORDER BY agent_id", (task_id,)
+        ).fetchall()]
+        evidence_count = con.execute(
+            "SELECT COUNT(*) FROM war_evidence WHERE task_id=?", (task_id,)
+        ).fetchone()[0]
+        verdict = con.execute(
+            """SELECT verdict,qa_principal,created_at FROM war_qa_verdicts
+               WHERE task_id=? ORDER BY created_at DESC,id DESC LIMIT 1""",
+            (task_id,),
+        ).fetchone()
+        deliveries = con.execute(
+            "SELECT status,error_class,retry_count,attempt_count,max_attempts FROM war_deliveries WHERE message_id=?",
+            (row["source_message_id"],),
+        ).fetchall() if row["source_message_id"] else []
+    item = {
+        **dict(row),
+        "agent_ids": agent_ids,
+        "evidence_count": evidence_count,
+        "latest_qa_verdict": dict(verdict) if verdict else None,
+    }
+    system_errors = sum(1 for delivery in deliveries if _delivery_state(delivery) == "system_error")
+    item.update({"system_error_count": system_errors, "state": "system_error" if system_errors else row["status"]})
+    return {"mode": "readonly", "task": war_room._redact(item)}
 
 
 @router.post("/projects/{project_id}/participants", status_code=201)
 async def add_participant(project_id: str, request: Request, x_war_room_actor: str | None = Header(default=None), x_war_room_token: str | None = Header(default=None), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
     body = await _body(request)
-    participant = body.get("principal_id")
+    participant = _canonical_agent_id(body.get("principal_id"), "principal_id")
     role = body.get("role", "developer")
-    if participant not in war_room.ALLOWED_AGENT_IDS or role not in ROLE_PERMISSIONS:
+    if participant is None or role not in ROLE_PERMISSIONS:
         raise HTTPException(422, "participant or role not allowed")
     with _connect_rw() as con:
         war_room._project_or_404(con, project_id)
@@ -765,6 +1247,19 @@ async def add_participant(project_id: str, request: Request, x_war_room_actor: s
         idem_scope = f"POST:/projects/{project_id}/participants"
         previous = _idem(con, actor, idempotency_key, idem_scope, body)
         if previous: return previous
+        if con.execute(
+            "SELECT 1 FROM war_participants WHERE project_id=? AND principal_id=?",
+            (project_id, participant),
+        ).fetchone():
+            raise HTTPException(409, "agent is already a project participant")
+        registration = load_agent_catalog().get(participant)
+        if not registration or not registration.registered or not registration.enabled:
+            raise HTTPException(409, "participant must be registered and enabled")
+        # QA is an independent reviewer role, not an execution target.  It
+        # must remain usable even when the Gateway correctly excludes that
+        # principal from Worker admission.
+        if role != "qa" and not registration.execution_eligible:
+            raise HTTPException(409, "execution participant must be Gateway-allowed")
         row_id = f"participant-{project_id}-{participant}"
         defaults = ROLE_PERMISSIONS[role]
         flags: dict[str, int] = {}
@@ -778,9 +1273,7 @@ async def add_participant(project_id: str, request: Request, x_war_room_actor: s
         con.execute("""INSERT INTO war_participants
             (id,project_id,principal_type,principal_id,role,can_read,can_comment,can_approve,can_execute,active)
             VALUES (?,?,'agent',?,?,?,?,?,?,1)
-            ON CONFLICT(project_id,principal_id) DO UPDATE SET role=excluded.role,
-              can_read=excluded.can_read,can_comment=excluded.can_comment,
-              can_approve=excluded.can_approve,can_execute=excluded.can_execute,active=1""",
+            """,
             (row_id, project_id, participant, role, flags["can_read"], flags["can_comment"], flags["can_approve"], flags["can_execute"]))
         correlation = str(uuid.uuid4()); _audit(con, project_id, actor, "participant_upserted", "participant", row_id, {"role": role}, correlation)
         result = {"mode": "controlled", "participant_id": row_id, "correlation_id": correlation}
@@ -797,6 +1290,7 @@ async def approve_task(task_id: str, request: Request, x_war_room_actor: str | N
         task = con.execute("SELECT * FROM war_tasks WHERE id=?", (task_id,)).fetchone()
         if not task: raise HTTPException(404, "Task not found")
         actor = _actor(con, x_war_room_actor, "approve", task["project_id"], x_war_room_token, request)
+        _require_representative(actor)
         _require_mutable_project(con, task["project_id"])
         idem_scope = f"POST:/tasks/{task_id}/approvals"
         previous = _idem(con, actor, idempotency_key, idem_scope, body)
@@ -806,6 +1300,7 @@ async def approve_task(task_id: str, request: Request, x_war_room_actor: str | N
             raise HTTPException(409, "task execution policy is incomplete")
         scope_hash = hashlib.sha256(task["scope"].encode()).hexdigest()
         agent_ids = sorted(row[0] for row in con.execute("SELECT agent_id FROM war_task_agents WHERE task_id=?", (task_id,)).fetchall())
+        _require_independent_reviewer(task["reviewer_agent_id"], agent_ids, required=False)
         target_set_hash = hashlib.sha256(json.dumps(agent_ids).encode()).hexdigest()
         approval_id, correlation = str(uuid.uuid4()), str(uuid.uuid4())
         now = _now()
@@ -820,6 +1315,100 @@ async def approve_task(task_id: str, request: Request, x_war_room_actor: str | N
         _audit(con, task["project_id"], actor, "task_approval_" + decision, "task", task_id, {"approval_id": approval_id, "scope_hash": scope_hash}, correlation)
         result = {"mode": "controlled", "task_id": task_id, "status": new_status, "approval_id": approval_id, "correlation_id": correlation}
         _save_idem(con, actor, idempotency_key, idem_scope, body, result); con.commit(); return result
+
+
+@router.post("/tasks/{task_id}/reviewer")
+async def assign_existing_task_reviewer(task_id: str, request: Request, x_war_room_actor: str | None = Header(default=None), x_war_room_token: str | None = Header(default=None), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
+    """Assign a reviewer to one legacy task without rewriting its history."""
+    body = await _body(request)
+    reviewer = _canonical_agent_id(body.get("reviewer_agent_id"), "reviewer_agent_id")
+    reason = body.get("reason")
+    expected_revision = body.get("task_revision")
+    if reviewer is None:
+        raise HTTPException(422, "registered reviewer_agent_id required")
+    if not isinstance(reason, str) or not reason.strip() or len(reason) > 1024:
+        raise HTTPException(422, "reason must be 1..1024 characters")
+    if isinstance(expected_revision, bool) or not isinstance(expected_revision, int) or expected_revision < 1:
+        raise HTTPException(422, "task_revision must be a positive integer")
+    with _connect_rw() as con:
+        task = con.execute("SELECT * FROM war_tasks WHERE id=?", (task_id,)).fetchone()
+        if not task:
+            raise HTTPException(404, "Task not found")
+        actor = _actor(con, x_war_room_actor, "manage", task["project_id"], x_war_room_token, request)
+        _require_representative(actor)
+        _require_mutable_project(con, task["project_id"])
+        con.execute("BEGIN IMMEDIATE")
+        task = con.execute("SELECT * FROM war_tasks WHERE id=?", (task_id,)).fetchone()
+        idem_scope = f"POST:/tasks/{task_id}/reviewer"
+        previous = _idem(con, actor, idempotency_key, idem_scope, body)
+        if previous:
+            return previous
+        if task["status"] == "completed":
+            raise HTTPException(409, "completed task reviewer is immutable")
+        if task["reviewer_agent_id"] is not None:
+            raise HTTPException(409, "task reviewer is already assigned")
+        if int(task["revision"]) != expected_revision:
+            raise HTTPException(409, "task revision changed")
+        participant = con.execute(
+            """SELECT principal_id,role,active,can_read,can_comment FROM war_participants
+               WHERE project_id=? AND principal_id=?""",
+            (task["project_id"], reviewer),
+        ).fetchone()
+        catalog_entry = load_agent_catalog().get(reviewer)
+        if (not catalog_entry or not catalog_entry.registered or not catalog_entry.enabled
+                or not participant or not participant["active"] or participant["role"] != "qa"
+                or not participant["can_read"] or not participant["can_comment"]):
+            raise HTTPException(409, "reviewer must be a registered, enabled, active project QA participant")
+        executors = sorted(row[0] for row in con.execute(
+            "SELECT agent_id FROM war_task_agents WHERE task_id=?", (task_id,)
+        ).fetchall())
+        _require_independent_reviewer(reviewer, executors)
+        active_delivery = con.execute(
+            """SELECT 1 FROM war_deliveries d JOIN war_messages m ON m.id=d.message_id
+               WHERE m.id=? AND d.status IN ('queued','sent','received') LIMIT 1""",
+            (task["source_message_id"],),
+        ).fetchone() if task["source_message_id"] else None
+        active_run = con.execute(
+            """SELECT 1 FROM war_execution_runs WHERE war_task_id=?
+               AND lower(run_status) NOT IN ('pass','fail','completed','failed','blocked','cancelled','canceled','timed_out','stopped') LIMIT 1""",
+            (task_id,),
+        ).fetchone()
+        if active_delivery or active_run:
+            raise HTTPException(409, "queued or active task execution must finish before reviewer assignment")
+        now = _now()
+        revoked_ids = [row[0] for row in con.execute(
+            """SELECT id FROM war_approvals WHERE task_id=? AND decision='approved'
+               AND revoked_at IS NULL AND expires_at>? ORDER BY created_at,id""",
+            (task_id, now),
+        ).fetchall()]
+        if revoked_ids:
+            con.executemany("UPDATE war_approvals SET revoked_at=? WHERE id=?", [(now, value) for value in revoked_ids])
+        updated = con.execute(
+            """UPDATE war_tasks SET reviewer_agent_id=?,status='awaiting_approval',
+               revision=revision+1,updated_at=?
+               WHERE id=? AND reviewer_agent_id IS NULL AND status<>'completed' AND revision=?""",
+            (reviewer, now, task_id, expected_revision),
+        )
+        if updated.rowcount != 1:
+            raise HTTPException(409, "task changed during reviewer assignment")
+        correlation = str(uuid.uuid4())
+        _audit(con, task["project_id"], actor, "legacy_task_reviewer_assigned", "task", task_id, {
+            "reviewer_agent_id": reviewer,
+            "reason": war_room._redact_string(reason.strip()),
+            "previous_status": task["status"],
+            "previous_revision": expected_revision,
+            "new_revision": expected_revision + 1,
+            "revoked_approval_ids": revoked_ids,
+        }, correlation)
+        result = {
+            "mode": "controlled", "task_id": task_id, "reviewer_agent_id": reviewer,
+            "status": "awaiting_approval", "revision": expected_revision + 1,
+            "revoked_approval_ids": revoked_ids, "new_approval_required": True,
+            "correlation_id": correlation,
+        }
+        _save_idem(con, actor, idempotency_key, idem_scope, body, result)
+        con.commit()
+        return result
 
 
 @router.post("/tasks/{task_id}/transition")
@@ -841,17 +1430,60 @@ async def transition_task(task_id: str, request: Request, x_war_room_actor: str 
         if target in {"running","qa","completed"}:
             _require_not_stopped(con, task["project_id"])
         if target not in TRANSITIONS.get(task["status"], set()): raise HTTPException(409, f"invalid transition {task['status']} -> {target}")
+        if target in {"stopped", "stop_unconfirmed"}:
+            _require_representative(actor)
         if target == "running":
+            _require_representative(actor)
+            assigned = sorted(row[0] for row in con.execute("SELECT agent_id FROM war_task_agents WHERE task_id=?", (task_id,)).fetchall())
+            _require_independent_reviewer(task["reviewer_agent_id"], assigned, required=False)
+            _require_execution_agents(con, task["project_id"], assigned)
             approval = con.execute("SELECT * FROM war_approvals WHERE task_id=? AND decision='approved' AND revoked_at IS NULL ORDER BY created_at DESC LIMIT 1", (task_id,)).fetchone()
+            now = _now()
+            expected_scope_hash = hashlib.sha256(task["scope"].encode()).hexdigest()
+            expected_target_hash = hashlib.sha256(json.dumps(assigned).encode()).hexdigest()
+            approval_is_current = bool(
+                approval and approval["expires_at"] is not None and int(approval["expires_at"]) > now
+                and approval["scope_hash"] == expected_scope_hash
+                and approval["document_version"] == task["document_version"]
+                and approval["assignee_agent_id"] == task["assignee_agent_id"]
+                and approval["target_set_hash"] == expected_target_hash
+            )
+            effective_deadline = int(task["deadline_at"] or 0)
+            if effective_deadline <= now and int(task["revision"]) > 1 and approval_is_current:
+                # Compatibility repair for a rework approval created before
+                # deadline renewal was introduced. The already authenticated
+                # approval expiry is the strict upper bound; history is kept.
+                effective_deadline = int(approval["expires_at"])
+                con.execute(
+                    "UPDATE war_tasks SET deadline_at=?,updated_at=? WHERE id=?",
+                    (effective_deadline, now, task_id),
+                )
+                _audit(con, task["project_id"], actor, "task_deadline_aligned_to_fresh_approval", "task", task_id, {
+                    "approval_id": approval["id"],
+                    "previous_deadline_at": task["deadline_at"],
+                    "deadline_at": effective_deadline,
+                    "task_revision": task["revision"],
+                }, str(uuid.uuid4()))
             if (not task["assignee_agent_id"] or task["call_limit"] is None or task["turn_limit"] is None
-                    or task["deadline_at"] is None or int(task["deadline_at"]) <= _now()
-                    or not task["document_version"] or task["document_version"] != task["manyfast_version"]
-                    or not approval or approval["expires_at"] is None or int(approval["expires_at"]) <= _now()
-                    or approval["scope_hash"] != hashlib.sha256(task["scope"].encode()).hexdigest()
-                    or approval["document_version"] != task["document_version"]
-                    or approval["assignee_agent_id"] != task["assignee_agent_id"]
-                    or approval["target_set_hash"] != hashlib.sha256(json.dumps(sorted(row[0] for row in con.execute("SELECT agent_id FROM war_task_agents WHERE task_id=?", (task_id,)).fetchall())).encode()).hexdigest()):
+                    or effective_deadline <= now
+                    or not task["document_version"]
+                    or not approval_is_current):
                 raise HTTPException(409, "valid current approval required")
+        if target == "qa" and task["source_message_id"]:
+            deliveries = con.execute(
+                "SELECT status,response_message_id,error_code FROM war_deliveries WHERE message_id=? AND task_revision=?",
+                (task["source_message_id"], int(task["revision"])),
+            ).fetchall()
+            if (not deliveries or any(row["status"] != "responded" or not row["response_message_id"]
+                                     or row["error_code"] for row in deliveries)):
+                raise HTTPException(409, "only fully responded successful deliveries may enter QA")
+            if task["execution_mode"] == "FAST_GATEWAY":
+                runs = con.execute(
+                    "SELECT lower(run_status) FROM war_execution_runs WHERE war_task_id=?",
+                    (task_id,),
+                ).fetchall()
+                if not runs or any(row[0] not in {"pass", "completed"} for row in runs):
+                    raise HTTPException(409, "validated PASS execution required before QA")
         if target == "completed":
             binding = (task_id, task["revision"], hashlib.sha256(task["scope"].encode()).hexdigest(), task["document_version"], task["qa_cycle"])
             evidence_count = con.execute("SELECT COUNT(*) FROM war_evidence WHERE task_id=? AND task_revision=? AND scope_hash=? AND document_version=? AND qa_cycle=?", binding).fetchone()[0]
@@ -859,14 +1491,56 @@ async def transition_task(task_id: str, request: Request, x_war_room_actor: str 
             if not evidence_count or not verdict:
                 raise HTTPException(409, "signed QA PASS and evidence required")
         correlation = str(uuid.uuid4())
+        renewed_deadline = None
+        revoked_approval_ids: list[str] = []
+        if target == "awaiting_approval" and task["status"] in {"rework_required", "stopped", "stop_unconfirmed", "qa"}:
+            now = _now()
+            renewed_deadline = body.get("deadline_at", now + 1800)
+            if (isinstance(renewed_deadline, bool) or not isinstance(renewed_deadline, int)
+                    or renewed_deadline <= now or renewed_deadline > now + 604800):
+                raise HTTPException(422, "deadline_at must be within the next 7 days")
+            revoked_approval_ids = [row[0] for row in con.execute(
+                """SELECT id FROM war_approvals WHERE task_id=? AND decision='approved'
+                   AND revoked_at IS NULL ORDER BY created_at,id""",
+                (task_id,),
+            ).fetchall()]
+            if revoked_approval_ids:
+                con.executemany(
+                    "UPDATE war_approvals SET revoked_at=? WHERE id=?",
+                    [(now, approval_id) for approval_id in revoked_approval_ids],
+                )
         if target == "qa":
             con.execute("UPDATE war_tasks SET status=?,qa_cycle=qa_cycle+1,updated_at=? WHERE id=?", (target, _now(), task_id))
-        elif target in {"awaiting_approval", "rework_required"} and task["status"] in {"stopped", "qa"}:
-            con.execute("UPDATE war_tasks SET status=?,revision=revision+1,updated_at=? WHERE id=?", (target, _now(), task_id))
+        elif target in {"awaiting_approval", "rework_required"} and task["status"] in {"stopped", "stop_unconfirmed", "qa"}:
+            con.execute(
+                "UPDATE war_tasks SET status=?,revision=revision+1,deadline_at=COALESCE(?,deadline_at),updated_at=? WHERE id=?",
+                (target, renewed_deadline, _now(), task_id),
+            )
+        elif target == "awaiting_approval" and task["status"] == "rework_required":
+            # QA FAIL already advanced the revision. Renew only the execution
+            # window here so the preserved revision receives a fresh approval.
+            con.execute(
+                "UPDATE war_tasks SET status=?,deadline_at=?,updated_at=? WHERE id=?",
+                (target, renewed_deadline, _now(), task_id),
+            )
         else:
             con.execute("UPDATE war_tasks SET status=?, updated_at=? WHERE id=?", (target, _now(), task_id))
-        _audit(con, task["project_id"], actor, "task_transition", "task", task_id, {"from": task["status"], "to": target}, correlation)
+        audit_detail: dict[str, Any] = {"from": task["status"], "to": target}
+        if renewed_deadline is not None:
+            audit_detail.update({
+                "previous_deadline_at": task["deadline_at"],
+                "deadline_at": renewed_deadline,
+                "revoked_approval_ids": revoked_approval_ids,
+                "new_approval_required": True,
+            })
+        _audit(con, task["project_id"], actor, "task_transition", "task", task_id, audit_detail, correlation)
         result = {"mode": "controlled", "task_id": task_id, "status": target, "correlation_id": correlation}
+        if renewed_deadline is not None:
+            result.update({
+                "deadline_at": renewed_deadline,
+                "revoked_approval_ids": revoked_approval_ids,
+                "new_approval_required": True,
+            })
         _save_idem(con, actor, idempotency_key, idem_scope, body, result); con.commit(); return result
 
 
@@ -882,8 +1556,7 @@ async def representative_completion(task_id: str, request: Request, x_war_room_a
         actor = war_room._request_principal(request, x_war_room_actor, x_war_room_token)
         if not actor:
             raise HTTPException(401, "Authenticated War Room actor required")
-        if actor not in _representative_principals():
-            raise HTTPException(403, "representative principal required")
+        _require_representative(actor)
         actor = _actor(con, x_war_room_actor, "manage", task["project_id"], x_war_room_token, request)
         _require_mutable_project(con, task["project_id"])
         _require_not_stopped(con, task["project_id"])
@@ -1023,7 +1696,7 @@ async def create_project(request: Request, x_war_room_actor: str | None = Header
     if not isinstance(name, str) or not name.strip() or len(name) > 200: raise HTTPException(422, "valid name required")
     with _connect_rw() as con:
         actor = war_room._request_principal(request, x_war_room_actor, x_war_room_token)
-        if actor not in war_room.ALLOWED_AGENT_IDS: raise HTTPException(401, "authentication required")
+        if not actor or not war_room._known_principal(actor): raise HTTPException(401, "authentication required")
         if not con.execute("SELECT 1 FROM war_participants WHERE principal_id=? AND role='project_manager'", (actor,)).fetchone(): raise HTTPException(403, "project manager required")
         idem_scope = "POST:/projects"
         previous = _idem(con, actor, idempotency_key, idem_scope, body)
@@ -1089,6 +1762,9 @@ async def update_project(project_id: str, request: Request, x_war_room_actor: st
 async def update_participant(project_id: str, principal_id: str, request: Request, x_war_room_actor: str | None = Header(default=None), x_war_room_token: str | None = Header(default=None), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
     """R-GOAQPQ/F-XCFFIW: role change/deactivation; observer is read-only."""
     body = await _body(request)
+    principal_id = _canonical_agent_id(principal_id, "principal_id")
+    if principal_id is None:
+        raise HTTPException(422, "participant is not allowed")
     role = body.get("role")
     active = body.get("active")
     if role is not None and role not in ROLE_PERMISSIONS:
@@ -1130,7 +1806,7 @@ async def update_participant(project_id: str, principal_id: str, request: Reques
 @router.post("/projects/{project_id}/manyfast-reference")
 @router.put("/projects/{project_id}/manyfast-reference")
 async def save_manyfast_reference(project_id: str, request: Request, x_war_room_actor: str | None = Header(default=None), x_war_room_token: str | None = Header(default=None), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
-    """R-NCAFXY/F-NCAFXY: persist reference snapshots and invalidate drifted approvals."""
+    """Persist an optional document reference without mutating existing work."""
     body = await _body(request)
     version = body.get("document_version", body.get("manyfast_version"))
     manyfast_project_id = body.get("manyfast_project_id", war_room.MANYFAST_PROJECT_ID)
@@ -1149,18 +1825,11 @@ async def save_manyfast_reference(project_id: str, request: Request, x_war_room_
         now = _now()
         ref_id = str(uuid.uuid4())
         task_id = body.get("task_id")
-        con.execute("INSERT INTO war_manyfast_refs VALUES (?,?,?,?,?,?,?,?)", (ref_id, project_id, task_id, manyfast_project_id, version.strip(), actor, now, "drift" if drift else "current"))
+        con.execute("INSERT INTO war_manyfast_refs (id,project_id,task_id,manyfast_project_id,document_version,linked_by,created_at,drift_status,previous_document_version) VALUES (?,?,?,?,?,?,?,?,?)", (ref_id, project_id, task_id, manyfast_project_id, version.strip(), actor, now, "drift" if drift else "current", old_version if drift else None))
         con.execute("UPDATE war_projects SET manyfast_project_id=?,manyfast_version=?,updated_at=? WHERE id=?", (manyfast_project_id, version.strip(), now, project_id))
-        invalidated = 0
-        if drift:
-            rows = con.execute("SELECT t.id,t.status FROM war_tasks t WHERE t.project_id=? AND t.status IN ('approved','running','awaiting_approval','qa','rework_required')", (project_id,)).fetchall()
-            for row in rows:
-                con.execute("UPDATE war_approvals SET revoked_at=? WHERE task_id=? AND decision='approved' AND revoked_at IS NULL", (now, row["id"]))
-                con.execute("UPDATE war_tasks SET status='awaiting_approval',manyfast_version=?,revision=revision+1,updated_at=? WHERE id=?", (version.strip(), now, row["id"]))
-                invalidated += 1
         correlation = str(uuid.uuid4())
-        _audit(con, project_id, actor, "manyfast_reference_" + ("drift_detected" if drift else "saved"), "project", project_id, {"old_version": old_version, "new_version": version.strip(), "invalidated_tasks": invalidated}, correlation)
-        result = {"mode": "controlled", "project_id": project_id, "manyfast_project_id": manyfast_project_id, "document_version": version.strip(), "drift": drift, "invalidated_tasks": invalidated, "correlation_id": correlation}
+        _audit(con, project_id, actor, "manyfast_reference_" + ("changed" if drift else "saved"), "project", project_id, {"old_version": old_version, "new_version": version.strip(), "existing_tasks_preserved": True}, correlation)
+        result = {"mode": "controlled", "project_id": project_id, "manyfast_project_id": manyfast_project_id, "document_version": version.strip(), "drift": drift, "invalidated_tasks": 0, "existing_tasks_preserved": True, "correlation_id": correlation}
         _save_idem(con, actor, idempotency_key, idem_scope, body, result)
         con.commit()
         return result
@@ -1205,6 +1874,7 @@ async def stop_project(project_id: str, request: Request, x_war_room_actor: str 
     body = await _body(request)
     with _connect_rw() as con:
         war_room._project_or_404(con, project_id); actor = _actor(con, x_war_room_actor, "execute", project_id, x_war_room_token, request)
+        _require_representative(actor)
         _require_mutable_project(con, project_id)
         idem_scope = f"POST:/projects/{project_id}/stop"; previous = _idem(con, actor, idempotency_key, idem_scope, body)
         if previous: return previous
@@ -1212,21 +1882,123 @@ async def stop_project(project_id: str, request: Request, x_war_room_actor: str 
         con.execute("UPDATE war_project_control SET stop_requested_at=?,stop_deadline=?,stop_state='stop_requested',updated_at=? WHERE project_id=?", (now,deadline,now,project_id))
         con.execute("UPDATE war_deliveries SET status='stopped',error_code='project_stop_barrier',stop_cycle_at=? WHERE status='queued' AND message_id IN (SELECT id FROM war_messages WHERE project_id=?)", (now,project_id))
         active = con.execute(
-            """SELECT d.* FROM war_deliveries d JOIN war_messages m ON m.id=d.message_id
+            """SELECT d.*,t.id AS task_id,COALESCE(t.execution_mode,'LEGACY') AS execution_mode FROM war_deliveries d JOIN war_messages m ON m.id=d.message_id
+               LEFT JOIN war_tasks t ON t.source_message_id=m.id
                WHERE m.project_id=? AND d.status IN ('sent','received')""",
             (project_id,),
         ).fetchall()
         stop_results: list[dict[str, str]] = []
         for delivery in active:
-            receipt = _adapter().stop(delivery_id=delivery["id"], agent_id=delivery["agent_id"])
+            active_adapter = _adapter_for_mode(delivery["execution_mode"], str(war_room._db_path()))
+            receipt = active_adapter.stop(delivery_id=delivery["id"], agent_id=delivery["agent_id"])
+            if delivery["execution_mode"] == "FAST_GATEWAY":
+                snapshotter = getattr(active_adapter, "execution_snapshot", None)
+                if snapshotter:
+                    from war_room_worker import _persist_execution
+                    _persist_execution(con, snapshot=snapshotter(delivery["id"]), project_id=project_id, task_id=delivery["task_id"], agent_id=delivery["agent_id"], now=now)
             status = receipt.status if receipt.status in {"stopped", "failed", "timed_out"} else "failed"
             con.execute("UPDATE war_deliveries SET status=?,error_code=?,stop_cycle_at=? WHERE id=?", (status, receipt.error_code, now, delivery["id"]))
             stop_results.append({"delivery_id": delivery["id"], "status": status})
-        final_state = "stop_failed" if any(item["status"] in {"failed", "timed_out"} for item in stop_results) else ("stopped" if stop_results else "stop_requested")
+        if any(item["status"] in {"failed", "timed_out"} for item in stop_results):
+            final_state = "stop_failed"
+        elif all(item["status"] == "stopped" for item in stop_results):
+            final_state = "stopped"
+        else:
+            final_state = "stop_requested"
         con.execute("UPDATE war_project_control SET stop_state=?,updated_at=? WHERE project_id=?", (final_state, now, project_id))
         con.execute("UPDATE war_approvals SET revoked_at=? WHERE revoked_at IS NULL AND task_id IN (SELECT id FROM war_tasks WHERE project_id=?)", (now, project_id))
-        con.execute("UPDATE war_tasks SET status='stopped',revision=revision+1,updated_at=? WHERE project_id=? AND status IN ('approved','running','qa','rework_required')", (now, project_id))
+        task_status = "stopped" if final_state == "stopped" else "stop_unconfirmed"
+        con.execute("UPDATE war_tasks SET status=?,revision=revision+1,updated_at=? WHERE project_id=? AND status IN ('approved','running','qa','rework_required')", (task_status, now, project_id))
         correlation = str(uuid.uuid4()); _audit(con, project_id, actor, "project_stop_requested", "project", project_id, {"deadline":deadline,"stop_results":stop_results,"final_state":final_state}, correlation); result = {"mode":"controlled","project_id":project_id,"status":final_state,"deadline":deadline,"deliveries":stop_results,"correlation_id":correlation}; _save_idem(con, actor, idempotency_key, idem_scope, body, result); con.commit(); return result
+
+
+@router.post("/tasks/{task_id}/stop")
+async def stop_task(task_id: str, request: Request, x_war_room_actor: str | None = Header(default=None), x_war_room_token: str | None = Header(default=None), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
+    """Stop only the selected task and its live Worker deliveries."""
+
+    body = await _body(request)
+    with _connect_rw() as con:
+        task = con.execute("SELECT * FROM war_tasks WHERE id=?", (task_id,)).fetchone()
+        if not task:
+            raise HTTPException(404, "Task not found")
+        actor = _actor(con, x_war_room_actor, "execute", task["project_id"], x_war_room_token, request)
+        _require_representative(actor)
+        _require_mutable_project(con, task["project_id"])
+        idem_scope = f"POST:/tasks/{task_id}/stop"
+        previous = _idem(con, actor, idempotency_key, idem_scope, body)
+        if previous:
+            return previous
+        if task["status"] == "completed":
+            raise HTTPException(409, "completed task cannot be stopped")
+        now = _now()
+        correlation = str(uuid.uuid4())
+        queued = con.execute(
+            "SELECT id FROM war_deliveries WHERE message_id=? AND status='queued'",
+            (task["source_message_id"],),
+        ).fetchall() if task["source_message_id"] else []
+        queued_ids = [row["id"] for row in queued]
+        if queued_ids:
+            marks = ",".join("?" for _ in queued_ids)
+            con.execute(
+                f"UPDATE war_deliveries SET status='stopped',error_code='task_stop_before_dispatch',stop_cycle_at=? WHERE id IN ({marks})",
+                (now, *queued_ids),
+            )
+        active = con.execute(
+            """SELECT d.*,COALESCE(t.execution_mode,'LEGACY') AS execution_mode
+               FROM war_deliveries d JOIN war_messages m ON m.id=d.message_id
+               LEFT JOIN war_tasks t ON t.source_message_id=m.id
+               WHERE t.id=? AND d.status IN ('sent','received')""",
+            (task_id,),
+        ).fetchall()
+        stop_results: list[dict[str, Any]] = [
+            {"delivery_id": delivery_id, "status": "stopped", "error_code": "task_stop_before_dispatch"}
+            for delivery_id in queued_ids
+        ]
+        for delivery in active:
+            active_adapter = _adapter_for_mode(delivery["execution_mode"], str(war_room._db_path()))
+            receipt = active_adapter.stop(delivery_id=delivery["id"], agent_id=delivery["agent_id"])
+            status = receipt.status if receipt.status in {"stopped", "failed", "timed_out"} else "failed"
+            con.execute(
+                "UPDATE war_deliveries SET status=?,error_code=?,stop_cycle_at=? WHERE id=? AND status IN ('sent','received')",
+                (status, receipt.error_code, now, delivery["id"]),
+            )
+            snapshotter = getattr(active_adapter, "execution_snapshot", None)
+            if snapshotter:
+                from war_room_worker import _persist_execution
+                _persist_execution(
+                    con, snapshot=snapshotter(delivery["id"]), project_id=task["project_id"],
+                    task_id=task_id, agent_id=delivery["agent_id"], now=now,
+                )
+            stop_results.append({
+                "delivery_id": delivery["id"], "status": status,
+                "error_code": receipt.error_code,
+            })
+        if any(item["status"] in {"failed", "timed_out"} for item in stop_results):
+            final_status = "stop_unconfirmed"
+        else:
+            final_status = "stopped"
+        con.execute(
+            "UPDATE war_approvals SET revoked_at=? WHERE task_id=? AND decision='approved' AND revoked_at IS NULL",
+            (now, task_id),
+        )
+        if task["status"] != final_status:
+            con.execute(
+                "UPDATE war_tasks SET status=?,revision=revision+1,updated_at=? WHERE id=?",
+                (final_status, now, task_id),
+            )
+        _audit(
+            con, task["project_id"], actor, "task_stop_requested", "task", task_id,
+            {"deliveries": stop_results, "confirmed": final_status == "stopped"}, correlation,
+        )
+        result = {
+            "mode": "controlled", "task_id": task_id, "status": final_status,
+            "stop_requested": bool(active or queued_ids), "confirmed": final_status == "stopped",
+            "delivery_ids": [item["delivery_id"] for item in stop_results],
+            "deliveries": stop_results, "correlation_id": correlation,
+        }
+        _save_idem(con, actor, idempotency_key, idem_scope, body, result)
+        con.commit()
+        return result
 
 
 @router.post("/projects/{project_id}/stop-ack")
@@ -1234,6 +2006,7 @@ async def stop_ack(project_id: str, request: Request, x_war_room_actor: str | No
     body = await _body(request)
     with _connect_rw() as con:
         war_room._project_or_404(con, project_id); actor = _actor(con, x_war_room_actor, "execute", project_id, x_war_room_token, request)
+        _require_representative(actor)
         _require_mutable_project(con, project_id)
         idem_scope = f"POST:/projects/{project_id}/stop-ack"; previous = _idem(con, actor, idempotency_key, idem_scope, body)
         if previous: return previous
@@ -1246,7 +2019,8 @@ async def stop_ack(project_id: str, request: Request, x_war_room_actor: str | No
         delivery = con.execute("SELECT d.* FROM war_deliveries d JOIN war_messages m ON m.id=d.message_id WHERE d.id=? AND m.project_id=?", (delivery_id, project_id)).fetchone()
         if not delivery or delivery["status"] != "stopped" or delivery["stop_cycle_at"] != control["stop_requested_at"]:
             raise HTTPException(409, "ACK must match a stopped project delivery")
-        con.execute("UPDATE war_project_control SET stop_state='stopped',updated_at=? WHERE project_id=?", (_now(),project_id)); correlation=str(uuid.uuid4()); _audit(con, project_id, actor, "project_stop_ack", "delivery", delivery_id, {}, correlation); result={"mode":"controlled","project_id":project_id,"delivery_id":delivery_id,"status":"stopped","correlation_id":correlation}; _save_idem(con, actor, idempotency_key, idem_scope, body, result); con.commit(); return result
+        cycle_state = _stop_cycle_state(con, project_id, int(control["stop_requested_at"]))
+        con.execute("UPDATE war_project_control SET stop_state=?,updated_at=? WHERE project_id=?", (cycle_state,_now(),project_id)); correlation=str(uuid.uuid4()); _audit(con, project_id, actor, "project_stop_ack", "delivery", delivery_id, {"cycle_state":cycle_state}, correlation); result={"mode":"controlled","project_id":project_id,"delivery_id":delivery_id,"status":cycle_state,"correlation_id":correlation}; _save_idem(con, actor, idempotency_key, idem_scope, body, result); con.commit(); return result
 
 
 @router.post("/projects/{project_id}/resume")
@@ -1254,25 +2028,32 @@ async def resume_project(project_id: str, request: Request, x_war_room_actor: st
     body = await _body(request)
     with _connect_rw() as con:
         war_room._project_or_404(con, project_id); actor = _actor(con, x_war_room_actor, "approve", project_id, x_war_room_token, request)
+        _require_representative(actor)
         _require_mutable_project(con, project_id)
         idem_scope = f"POST:/projects/{project_id}/resume"; previous = _idem(con, actor, idempotency_key, idem_scope, body)
         if previous: return previous
-        if _control(con, project_id)["stop_state"] not in {"stopped","stop_unconfirmed","stop_failed"}: raise HTTPException(409,"project is not stopped")
         control = _control(con, project_id)
-        if con.execute("""SELECT 1 FROM war_tasks t WHERE t.project_id=? AND t.status IN ('stopped','approved')
+        if control["stop_state"] != "stopped": raise HTTPException(409,"project stop cycle is not fully confirmed")
+        cycle_at = int(control["stop_requested_at"] or 0)
+        if con.execute("""SELECT 1 FROM war_tasks t WHERE t.project_id=?
+            AND EXISTS (
+              SELECT 1 FROM war_messages m
+              JOIN war_deliveries d ON d.message_id=m.id
+              WHERE m.id=t.source_message_id AND m.project_id=t.project_id AND d.stop_cycle_at=?
+            )
             AND NOT EXISTS (SELECT 1 FROM war_approvals a WHERE a.task_id=t.id AND a.decision='approved'
               AND a.revoked_at IS NULL AND a.created_at>? AND a.expires_at>?) LIMIT 1""",
-            (project_id, int(control["stop_requested_at"] or 0), _now())).fetchone():
+            (project_id, cycle_at, cycle_at, _now())).fetchone():
             raise HTTPException(409,"fresh approval required for every stopped task")
         con.execute("UPDATE war_project_control SET stop_state='running',stop_requested_at=NULL,stop_deadline=NULL,updated_at=? WHERE project_id=?", (_now(),project_id)); correlation=str(uuid.uuid4()); _audit(con, project_id, actor, "project_resumed", "project", project_id, {}, correlation); result={"mode":"controlled","project_id":project_id,"status":"running","correlation_id":correlation}; _save_idem(con, actor, idempotency_key, idem_scope, body, result); con.commit(); return result
 
 
 @router.post("/tasks/{task_id}/qa-verdict")
 async def qa_verdict(task_id: str, request: Request, x_war_room_actor: str | None = Header(default=None), x_war_room_token: str | None = Header(default=None), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
-    body = await _body(request); verdict = body.get("verdict"); profile = body.get("evidence_profile", "required:test,artifact")
+    body = await _body(request); verdict = body.get("verdict")
     if verdict not in {"PASS","FAIL","REWORK"}: raise HTTPException(422,"invalid verdict")
-    qa_principal = body.get("qa_principal")
-    if not isinstance(qa_principal, str) or not qa_principal:
+    qa_principal = _canonical_agent_id(body.get("qa_principal"), "qa_principal")
+    if qa_principal is None:
         raise HTTPException(422, "qa_principal required")
     with _connect_rw() as con:
         task=con.execute("SELECT * FROM war_tasks WHERE id=?",(task_id,)).fetchone()
@@ -1287,8 +2068,19 @@ async def qa_verdict(task_id: str, request: Request, x_war_room_actor: str | Non
         if task["status"] != "qa":
             raise HTTPException(409,"QA verdict may only be submitted during QA")
         qa_row = con.execute("SELECT role,active FROM war_participants WHERE project_id=? AND principal_id=?", (task["project_id"], actor)).fetchone()
-        if actor != qa_principal or not qa_row or qa_row["role"] != "qa" or not qa_row["active"]:
+        performed = con.execute("SELECT 1 FROM war_task_agents WHERE task_id=? AND agent_id=?", (task_id, actor)).fetchone()
+        if (actor != qa_principal or actor == task["assignee_agent_id"] or performed
+                or task["reviewer_agent_id"] != actor
+                or not qa_row or qa_row["role"] != "qa" or not qa_row["active"]):
             raise HTTPException(403,"independent QA principal required")
+        packet_row = con.execute("SELECT packet_json FROM war_grounding_packets WHERE task_id=?", (task_id,)).fetchone()
+        packet = json.loads(packet_row[0]) if packet_row else {}
+        required_list = [
+            value for value in packet.get("required_evidence", ["test", "artifact"])
+            if isinstance(value, str) and value
+        ]
+        required = set(required_list)
+        profile = "required:" + ",".join(required_list)
         scope_hash = hashlib.sha256(task["scope"].encode()).hexdigest()
         binding = {"task_revision":task["revision"],"scope_hash":scope_hash,"document_version":task["document_version"],"qa_cycle":task["qa_cycle"]}
         payload=json.dumps({"task_id":task_id,"verdict":verdict,"evidence_profile":profile,"qa_principal":qa_principal,**binding},sort_keys=True); signature=body.get("signature")
@@ -1297,15 +2089,18 @@ async def qa_verdict(task_id: str, request: Request, x_war_room_actor: str | Non
         elif not signature or not hmac.compare_digest(signature,_qa_signature(payload)):
             raise HTTPException(403,"invalid QA signature")
         evidence_types={r[0] for r in con.execute("SELECT evidence_type FROM war_evidence WHERE task_id=? AND task_revision=? AND scope_hash=? AND document_version=? AND qa_cycle=?",(task_id, task["revision"], scope_hash, task["document_version"], task["qa_cycle"])).fetchall()}
-        required=set(profile.split(":",1)[1].split(",")) if profile.startswith("required:") else set()
         if verdict=="PASS" and not required.issubset(evidence_types): raise HTTPException(409,"required evidence missing")
-        packet_row = con.execute("SELECT packet_json FROM war_grounding_packets WHERE task_id=?", (task_id,)).fetchone()
-        packet = json.loads(packet_row[0]) if packet_row else {}
         if verdict == "PASS" and packet.get("session_integrity_required") is True and "session_integrity" not in evidence_types:
             raise HTTPException(409, "session_integrity evidence required before QA PASS")
         vid, correlation, now = str(uuid.uuid4()), str(uuid.uuid4()), _now()
         con.execute("INSERT INTO war_qa_verdicts (id,task_id,qa_principal,verdict,evidence_profile,signature,signed_payload,task_revision,scope_hash,document_version,qa_cycle,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",(vid,task_id,actor,verdict,profile,signature,payload,task["revision"],scope_hash,task["document_version"],task["qa_cycle"],now))
         status = task["status"]
+        _audit(con, task["project_id"], actor, "qa_verdict_recorded", "task", task_id, {
+            "verdict_id": vid,
+            "verdict": verdict,
+            "task_revision": task["revision"],
+            "qa_cycle": task["qa_cycle"],
+        }, correlation)
         if verdict in {"FAIL", "REWORK"}:
             status = "rework_required"
             con.execute("UPDATE war_tasks SET status=?,revision=revision+1,updated_at=? WHERE id=?", (status, now, task_id))

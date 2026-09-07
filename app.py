@@ -13,6 +13,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
+from datetime import datetime, timezone
 
 import psutil
 from fastapi import FastAPI, Request
@@ -22,7 +23,7 @@ from fastapi.staticfiles import StaticFiles
 import war_room
 from war_room import router as war_room_router
 from war_room_actions import router as war_room_actions_router
-from war_room_command_center import router as war_room_command_center_router
+from fast_gateway_api import router as fast_gateway_router
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -32,7 +33,7 @@ app = FastAPI(title="PLACHEM AI Server Monitor")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 app.include_router(war_room_router)
 app.include_router(war_room_actions_router)
-app.include_router(war_room_command_center_router)
+app.include_router(fast_gateway_router)
 
 
 @app.on_event("startup")
@@ -46,9 +47,14 @@ def provision_war_room_on_startup() -> None:
 
 @app.on_event("shutdown")
 def stop_war_room_runtime() -> None:
-    if os.environ.get("PLACHEM_WAR_ROOM_REAL_ADAPTER") == "1" and os.environ.get("PLACHEM_WAR_ROOM_TEST_ADAPTER") != "1":
-        from war_room_runtime import get_runtime
-        get_runtime().close()
+    from fast_gateway_service import close_persistent_harnesses
+    try:
+        if os.environ.get("PLACHEM_WAR_ROOM_REAL_ADAPTER") == "1" and os.environ.get("PLACHEM_WAR_ROOM_TEST_ADAPTER") != "1":
+            from war_room_runtime import get_runtime
+            get_runtime().close()
+    finally:
+        # Phase 2 can own a Harness even when the delivery worker is disabled.
+        close_persistent_harnesses()
 
 
 def _war_room_principal(request: Request) -> str | None:
@@ -77,7 +83,7 @@ async def war_room_read_rbac(request: Request, call_next):
         proxy_secret = os.environ.get("PLACHEM_WAR_ROOM_REVERSE_PROXY_SECRET", "")
         proxy_principal = request.headers.get("X-Authenticated-Principal") or request.headers.get("X-Forwarded-User")
         presented_secret = request.headers.get("X-War-Room-Proxy-Secret")
-        if proxy_secret and proxy_principal and hmac.compare_digest(proxy_secret, presented_secret or "") and proxy_principal in war_room.ALLOWED_AGENT_IDS and os.environ.get("PLACHEM_WAR_ROOM_SESSION_SECRET"):
+        if proxy_secret and proxy_principal and hmac.compare_digest(proxy_secret, presented_secret or "") and war_room._known_principal(proxy_principal) and os.environ.get("PLACHEM_WAR_ROOM_SESSION_SECRET"):
             session_secret = os.environ["PLACHEM_WAR_ROOM_SESSION_SECRET"]
             signature = hmac.new(session_secret.encode(), proxy_principal.encode(), hashlib.sha256).hexdigest()
             response.set_cookie("war_room_session", f"{proxy_principal}.{signature}", httponly=True, samesite="lax", secure=request.url.scheme == "https", path="/")
@@ -401,18 +407,22 @@ def probe_openclaw_gateway(config: dict[str, Any]) -> dict[str, Any]:
     token = gateway.get("auth", {}).get("token") if isinstance(gateway.get("auth"), dict) else None
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     started = time.time()
-    for path in ("/api/health", "/chat"):
-        try:
-            request = urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers=headers)
-            with urllib.request.urlopen(request, timeout=2.5) as response:
-                response_ms = round((time.time() - started) * 1000)
-                return {"state": "degraded" if response_ms > 1500 else "healthy", "ok": True, "port": port, "response_ms": response_ms, "checked_path": path, "http_status": response.status}
-        except urllib.error.HTTPError as exc:
-            if exc.code < 500:
-                return {"state": "degraded", "ok": True, "port": port, "response_ms": round((time.time() - started) * 1000), "checked_path": path, "http_status": exc.code}
-        except Exception:
-            continue
-    return {"state": "down", "ok": False, "port": port, "response_ms": round((time.time() - started) * 1000)}
+    try:
+        request = urllib.request.Request(f"http://127.0.0.1:{port}/health", headers=headers)
+        with urllib.request.urlopen(request, timeout=2.5) as response:
+            response_ms = round((time.time() - started) * 1000)
+            raw = response.read().decode("utf-8", errors="replace")
+            payload = json.loads(raw)
+            health_ok = response.status == 200 and (payload.get("ok") is True if isinstance(payload, dict) else False)
+            if not health_ok:
+                return {"state": "probe_failed", "ok": False, "port": port, "response_ms": response_ms, "checked_path": "/health", "http_status": response.status, "error": "invalid_health_response"}
+            return {"state": "degraded" if response_ms > 1500 else "healthy", "ok": True, "port": port, "response_ms": response_ms, "checked_path": "/health", "http_status": response.status}
+    except urllib.error.HTTPError as exc:
+        return {"state": "probe_failed" if exc.code < 500 else "down", "ok": False, "port": port, "response_ms": round((time.time() - started) * 1000), "checked_path": "/health", "http_status": exc.code, "error": "health_http_error"}
+    except (ConnectionRefusedError, TimeoutError, urllib.error.URLError, OSError):
+        return {"state": "down", "ok": False, "port": port, "response_ms": round((time.time() - started) * 1000), "checked_path": "/health", "error": "gateway_unreachable"}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {"state": "probe_failed", "ok": False, "port": port, "response_ms": round((time.time() - started) * 1000), "checked_path": "/health", "error": "invalid_health_response"}
 
 
 def collect_openclaw_status() -> dict[str, Any]:
@@ -503,6 +513,47 @@ def get_network() -> dict[str, Any]:
         return {"upload_bps": None, "download_bps": None, "status": "error", "error": str(exc)}
 
 
+VRAM_HEADROOM_THRESHOLD_GB = 2.0
+VRAM_HEADROOM_THRESHOLD_PERCENT = 10.0
+# A resident inference model commonly keeps VRAM above 97%. Treat capacity as
+# critical only when it is effectively exhausted; lower headroom remains a
+# warning unless an actual GPU/OOM error is observed.
+VRAM_CRITICAL_PERCENT = 99.5
+
+
+def _gpu_headroom_state(gpu: dict[str, Any]) -> tuple[str, float | None]:
+    vram_used = gpu.get("vram_used_gb")
+    vram_total = gpu.get("vram_total_gb")
+    vram_pct = gpu.get("vram_usage_percent")
+    if vram_used is None or vram_total is None:
+        return "unknown", None
+    headroom_gb = round(max(0.0, vram_total - vram_used), 2)
+    if vram_pct is not None and vram_pct >= VRAM_CRITICAL_PERCENT:
+        return "critical", headroom_gb
+    if headroom_gb < VRAM_HEADROOM_THRESHOLD_GB or vram_pct is not None and vram_pct >= 100 - VRAM_HEADROOM_THRESHOLD_PERCENT:
+        return "headroom_low", headroom_gb
+    return "ok", headroom_gb
+
+
+def gpu_risk_summary(gpus: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate all adapters; high VRAM is safe when measurable headroom remains."""
+    risks: list[str] = []
+    for item in gpus:
+        if item.get("status") == "error":
+            risks.append("error")
+            continue
+        state = item.get("vram_headroom_state")
+        if not isinstance(state, str):
+            state, _ = _gpu_headroom_state(item)
+        risks.append("error" if state == "critical" else "warning" if state in {"headroom_low", "unknown"} else "ok")
+    if not risks:
+        return {"risk": "warning", "headroom_gb": None, "temperature_c": None, "worst_index": None}
+    priority = {"error": 3, "warning": 2, "ok": 1}
+    worst_index = max(range(len(risks)), key=lambda index: priority[risks[index]])
+    worst = gpus[worst_index]
+    return {"risk": risks[worst_index], "headroom_gb": worst.get("vram_headroom_gb"), "temperature_c": worst.get("temperature_c"), "worst_index": worst_index}
+
+
 def _gpu_metrics_from_nvidia_smi_row(row: list[str], index: int) -> dict[str, Any] | None:
     name, gpu_util, mem_used, mem_total, temp = row[:5]
     uuid = row[5] if len(row) > 5 and row[5] else None
@@ -522,6 +573,9 @@ def _gpu_metrics_from_nvidia_smi_row(row: list[str], index: int) -> dict[str, An
     pcie_gen_max = row[11] if len(row) > 11 and row[11].isdigit() else None
     pcie_width_current = row[12] if len(row) > 12 and row[12].isdigit() else None
     pcie_width_max = row[13] if len(row) > 13 and row[13].isdigit() else None
+    headroom_state, headroom_gb = _gpu_headroom_state({
+        "vram_used_gb": used_gb, "vram_total_gb": total_gb, "vram_usage_percent": vram_percent,
+    })
     return {
         "index": index,
         "uuid": uuid,
@@ -530,6 +584,8 @@ def _gpu_metrics_from_nvidia_smi_row(row: list[str], index: int) -> dict[str, An
         "vram_used_gb": used_gb,
         "vram_total_gb": total_gb,
         "vram_usage_percent": vram_percent,
+        "vram_headroom_gb": headroom_gb,
+        "vram_headroom_state": headroom_state,
         "temperature_c": pct(temp),
         "power_draw_w": power_draw,
         "power_limit_w": power_limit,
@@ -705,6 +761,7 @@ def get_gpus_from_pynvml() -> list[dict[str, Any]]:
             "vram_used_gb": bytes_to_gb(mem_used),
             "vram_total_gb": bytes_to_gb(mem_total),
             "vram_usage_percent": pct((mem_used / mem_total) * 100 if mem_total else None),
+            "vram_headroom_gb": round(max(0.0, bytes_to_gb(mem_total) - bytes_to_gb(mem_used)), 2) if mem_used is not None and mem_total is not None else None,
             "temperature_c": temp,
             "power_draw_w": power_draw_w,
             "power_limit_w": power_limit_w,
@@ -717,6 +774,7 @@ def get_gpus_from_pynvml() -> list[dict[str, Any]]:
             "status": "ok",
             "source": "pynvml",
         })
+        out[-1]["vram_headroom_state"], _ = _gpu_headroom_state(out[-1])
     try:
         pynvml.nvmlShutdown()
     except Exception:
@@ -833,11 +891,316 @@ def service_status(service: str, process_names: list[str]) -> dict[str, str]:
         return {"state": "error", "label": "Error"}
 
 
-def get_services() -> dict[str, dict[str, str]]:
+OPENCONNECTOR_CONTAINER = "openconnector-test"
+OPENCONNECTOR_HEALTH_URL = "http://127.0.0.1:3001/health"
+OPENCONNECTOR_CONSOLE_URL = "https://openclaw.tail8eba4b.ts.net:3001/"
+OPENCONNECTOR_API_BASE = "http://127.0.0.1:3001"
+OPENCONNECTOR_ENV_FILE = Path("/opt/openconnector/.env")
+OPENCONNECTOR_MANAGED_ACTIONS = {
+    "github": "github.get_current_user",
+    "gmail": "gmail.get_profile",
+    "googledrive": "googledrive.about.get",
+    "google_search_console": "google_search_console.list_sites",
+    "google_analytics": "google_analytics.list_account_summaries",
+    "notion": "notion.search",
+    "supabase": "supabase.list_organizations",
+    "cloudflare_dns": "cloudflare_dns.list_accounts",
+    "cloudflare_worker": "cloudflare_worker.list_accounts",
+    "wordpress": "wordpress.get_current_user",
+    "elevenlabs": "elevenlabs.get_user_info",
+    "gemini": "gemini.list_models",
+    "telegram": "telegram.get_me",
+}
+
+
+def _read_env_value(path: Path, key: str) -> str | None:
+    """Read one plain dotenv value without loading secrets into process env."""
+    try:
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            name, value = line.split("=", 1)
+            if name.strip() == key:
+                return value.strip().strip("'\"") or None
+    except OSError:
+        return None
+    return None
+
+
+def get_openconnector_connection_updates() -> dict[str, dict[str, Any]]:
+    """Return per-service connection and OAuth client modification times."""
+    node_script = """const { DatabaseSync } = require("node:sqlite");
+const db = new DatabaseSync("/app/data/connect.sqlite", { readOnly: true });
+const connections = db.prepare("SELECT service, MAX(updated_at) AS updated_at FROM connections GROUP BY service").all();
+const oauth = db.prepare("SELECT service, MAX(updated_at) AS updated_at FROM oauth_client_configs GROUP BY service").all();
+process.stdout.write(JSON.stringify({ connections, oauth }));"""
+    result = subprocess.run(
+        ["docker", "exec", "-i", OPENCONNECTOR_CONTAINER, "node", "-e", node_script],
+        capture_output=True, text=True, timeout=5,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"OpenConnector DB read failed: {result.stderr.strip() or 'unknown error'}")
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"OpenConnector DB returned invalid JSON: {exc}")
+    updates: dict[str, dict[str, Any]] = {}
+    for row in payload.get("connections", []):
+        updates[row["service"]] = {"connection_last_modified_at": row.get("updated_at")}
+    for row in payload.get("oauth", []):
+        updates.setdefault(row["service"], {})[
+            "oauth_client_last_modified_at"
+        ] = row.get("updated_at")
+    return updates
+
+
+def _openconnector_admin_get(path: str, timeout: float = 2.5) -> Any:
+    token = os.environ.get("OOMOL_CONNECT_ADMIN_TOKEN") or _read_env_value(
+        OPENCONNECTOR_ENV_FILE, "OOMOL_CONNECT_ADMIN_TOKEN"
+    )
+    if not token:
+        raise RuntimeError("OpenConnector admin token is unavailable")
+    request = urllib.request.Request(
+        f"{OPENCONNECTOR_API_BASE}{path}",
+        headers={"Accept": "application/json", "Authorization": f"Bearer {token}"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8", errors="replace"))
+
+
+def _parse_iso_timestamp(value: Any) -> float | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def get_openconnector_dashboard() -> dict[str, Any]:
+    """Return a secret-free authentication operations view from real run logs."""
+    now = time.time()
+    metadata_collected_at = datetime.fromtimestamp(now, tz=timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    connections = _openconnector_admin_get("/api/connections")
+    run_page = _openconnector_admin_get("/api/runs?limit=100")
+    runs = run_page.get("items", []) if isinstance(run_page, dict) else []
+    connection_by_service = {
+        item.get("service"): item
+        for item in connections
+        if isinstance(item, dict) and item.get("service") in OPENCONNECTOR_MANAGED_ACTIONS
+    }
+    recent_by_action: dict[str, dict[str, Any]] = {}
+    successful_read_by_action: dict[str, dict[str, Any]] = {}
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        action_id = run.get("actionId")
+        if action_id in OPENCONNECTOR_MANAGED_ACTIONS.values() and action_id not in recent_by_action:
+            recent_by_action[action_id] = run
+        if action_id in OPENCONNECTOR_MANAGED_ACTIONS.values() and run.get("ok") is True and action_id not in successful_read_by_action:
+            successful_read_by_action[action_id] = run
+
+    try:
+        updates = get_openconnector_connection_updates() or {}
+    except Exception:
+        updates = {}
+
+    services: list[dict[str, Any]] = []
+    alerts: list[dict[str, str]] = []
+    for service, action_id in OPENCONNECTOR_MANAGED_ACTIONS.items():
+        connection = connection_by_service.get(service)
+        run = recent_by_action.get(action_id)
+        verified_at = run.get("completedAt") if run else None
+        updates_for_service = updates.get(service) or {}
+        verified_epoch = _parse_iso_timestamp(verified_at)
+        configured = bool(connection and connection.get("configured"))
+        state: str
+        state_reason: str
+        if run and run.get("ok") is False:
+            state = "error"
+            state_reason = "recent_read_failed"
+            message = str(run.get("errorCode") or run.get("error") or "최근 READ 검증 실패")
+            alerts.append({"severity": "error", "service": service, "message": message[:160], "action": "중앙 연결 상태를 확인하고 READ 검증을 다시 실행하세요"})
+        elif not configured:
+            state = "error"
+            state_reason = "not_configured"
+            alerts.append({"severity": "error", "service": service, "message": "연결이 설정되지 않았습니다", "action": "중앙 연결을 복구하세요"})
+        elif verified_epoch is None:
+            state = "unverified"
+            state_reason = "no_run_record"
+            alerts.append({"severity": "warning", "service": service, "message": "READ 검증 기록이 없습니다", "action": "서비스 READ 점검을 실행하세요"})
+        elif now - verified_epoch > 86400:
+            state = "warning"
+            state_reason = "stale_verification"
+            alerts.append({"severity": "warning", "service": service, "message": "마지막 READ 검증이 24시간을 초과했습니다", "action": "서비스 READ 점검을 실행하세요"})
+        else:
+            state = "healthy"
+            state_reason = "recent_read_ok"
+
+        auth_type_value = connection.get("authType") if connection else None
+        auth_type_provided = auth_type_value not in (None, "")
+        # Token expiry is only considered "known" when the Provider actually
+        # exposes an expiry timestamp. API-key style credentials have no
+        # refreshable expiry, but that still counts as "Provider 미제공" for
+        # the monitoring gap until the Provider starts publishing it.
+        token_expiry = "Provider 미제공"
+
+        services.append({
+            "service": service,
+            "manager": "OpenConnector",
+            "metadata_source": "openconnector_admin_api+local_read_only_db",
+            "metadata_collected_at": metadata_collected_at,
+            "state": state,
+            "state_reason": state_reason,
+            "configured": configured,
+            "auth_type": auth_type_value,
+            "auth_type_provided": auth_type_provided,
+            "verification_action": action_id,
+            "last_verified_at": verified_at,
+            "last_read_at": successful_read_by_action.get(action_id, {}).get("completedAt"),
+            "connection_last_modified_at": updates_for_service.get("connection_last_modified_at"),
+            "oauth_client_last_modified_at": updates_for_service.get("oauth_client_last_modified_at"),
+            "last_verified_ok": run.get("ok") if run else None,
+            "last_duration_ms": run.get("durationMs") if run else None,
+            "caller": run.get("caller") if run else None,
+            "token_expiry": token_expiry,
+        })
+
+    day_runs = [run for run in runs if (_parse_iso_timestamp(run.get("completedAt")) or 0) >= now - 86400]
+    success_count = sum(1 for run in day_runs if run.get("ok") is True)
+    success_rate = round(success_count / len(day_runs) * 100, 1) if day_runs else None
+    counts = {key: sum(1 for item in services if item["state"] == key) for key in ("healthy", "warning", "error", "unverified")}
+
+    def summarize_runs(group_key: str) -> list[dict[str, Any]]:
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for run in day_runs:
+            label = str(run.get(group_key) or "unknown")
+            grouped.setdefault(label, []).append(run)
+        result = []
+        for label, items in grouped.items():
+            durations = [float(item["durationMs"]) for item in items if isinstance(item.get("durationMs"), (int, float))]
+            successes = sum(1 for item in items if item.get("ok") is True)
+            result.append({
+                group_key: label,
+                "runs": len(items),
+                "successes": successes,
+                "failures": len(items) - successes,
+                "success_rate": round(successes / len(items) * 100, 1),
+                "average_duration_ms": round(sum(durations) / len(durations), 1) if durations else None,
+                "max_duration_ms": round(max(durations), 1) if durations else None,
+            })
+        return sorted(result, key=lambda item: (-item["runs"], item[group_key]))
+
+    service_usage = summarize_runs("service")
+    caller_usage = summarize_runs("caller")
+    expiry_known = sum(1 for item in services if item["token_expiry"] != "Provider 미제공")
+    operational_insights: list[dict[str, str]] = []
+    if counts["error"] == 0 and success_rate is not None and success_rate < 95:
+        operational_insights.append({
+            "level": "info",
+            "title": "현재 연결 상태 복구 완료",
+            "message": f"현재 모든 연결은 정상이지만 24시간 실행 성공률은 {success_rate}%입니다. 복구 과정에서 발생한 과거 실패가 표본에 포함되어 있습니다.",
+        })
+    if service_usage:
+        busiest = service_usage[0]
+        operational_insights.append({
+            "level": "info",
+            "title": "사용량 1위 서비스",
+            "message": f"최근 24시간 표본 {len(day_runs)}건 중 {busiest['service']}가 {busiest['runs']}건으로 가장 많이 사용됐습니다.",
+        })
+        risky = max(service_usage, key=lambda item: (item["failures"], item["runs"]))
+        if risky["failures"]:
+            operational_insights.append({
+                "level": "warning",
+                "title": "실패 집중 서비스",
+                "message": f"{risky['service']}의 표본 실패가 {risky['failures']}건으로 가장 많습니다. 새 인증을 요청하기 전에 기존 연결의 복구 이력을 먼저 확인하세요.",
+            })
+    if expiry_known < len(services):
+        operational_insights.append({
+            "level": "warning",
+            "title": "유효기간 확인 공백",
+            "message": f"중앙 연결 {len(services)}개 중 {len(services) - expiry_known}개의 토큰 유효기간이 제공되지 않습니다. 이는 정상이 아니라 미확인 상태입니다.",
+        })
+    recent_activity = [{
+        "service": run.get("service"),
+        "action": run.get("actionId"),
+        "caller": run.get("caller"),
+        "ok": run.get("ok"),
+        "completed_at": run.get("completedAt"),
+        "duration_ms": run.get("durationMs"),
+    } for run in runs[:20] if isinstance(run, dict)]
+    return {
+        "summary": {"managed": len(services), **counts, "runs_24h": len(day_runs), "success_rate_24h": success_rate, "expiry_known": expiry_known, "expiry_unknown": len(services) - expiry_known},
+        "services": services,
+        "service_usage_24h": service_usage,
+        "caller_usage_24h": caller_usage,
+        "operational_insights": operational_insights,
+        "alerts": alerts,
+        "recent_activity": recent_activity,
+        "checked_at": int(now),
+        "console_url": OPENCONNECTOR_CONSOLE_URL,
+    }
+
+
+def get_openconnector_status() -> dict[str, Any]:
+    started = time.monotonic()
+    api_ok = False
+    http_status: int | None = None
+    try:
+        request = urllib.request.Request(OPENCONNECTOR_HEALTH_URL, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(request, timeout=1.2) as response:
+            http_status = response.status
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+            api_ok = response.status == 200 and payload.get("ok") is True
+    except (OSError, ValueError, urllib.error.URLError):
+        pass
+    response_ms = round((time.monotonic() - started) * 1000, 1)
+
+    details: dict[str, Any] = {
+        "state": "running" if api_ok else "stopped",
+        "label": "Running" if api_ok else "Stopped",
+        "api_ok": api_ok,
+        "http_status": http_status,
+        "response_ms": response_ms,
+        "container": OPENCONNECTOR_CONTAINER,
+        "console_url": OPENCONNECTOR_CONSOLE_URL,
+    }
+    inspected = safe_run(
+        ["docker", "inspect", OPENCONNECTOR_CONTAINER, "--format", "{{json .}}"],
+        timeout=1.5,
+    )
+    if not inspected or inspected.returncode != 0:
+        return details
+    try:
+        container = json.loads(inspected.stdout)
+        state = container.get("State") or {}
+        health = (state.get("Health") or {}).get("Status") or "unknown"
+        details.update({
+            "container_status": state.get("Status") or "unknown",
+            "container_health": health,
+            "started_at": state.get("StartedAt"),
+            "restart_count": container.get("RestartCount", 0),
+            "image": (container.get("Config") or {}).get("Image") or "unknown",
+        })
+        if state.get("Running") and api_ok:
+            details.update({"state": "running", "label": "Running"})
+        elif state.get("Running"):
+            details.update({"state": "unknown", "label": "Degraded"})
+        else:
+            details.update({"state": "stopped", "label": "Stopped"})
+    except (TypeError, ValueError):
+        pass
+    return details
+
+
+def get_services() -> dict[str, dict[str, Any]]:
     return {
         "openclaw": service_status("openclaw", ["openclaw"]),
         "ollama": service_status("ollama", ["ollama"]),
         "tailscale": service_status("tailscaled", ["tailscaled", "tailscale"]),
+        "openconnector": get_openconnector_status(),
     }
 
 
@@ -1115,7 +1478,7 @@ def listening_ports(limit: int = 30) -> list[dict[str, Any]]:
     return sorted(rows, key=lambda row: (row["port"], row["ip"]))[:limit]
 
 
-def extended_services() -> dict[str, dict[str, str]]:
+def extended_services() -> dict[str, dict[str, Any]]:
     services = {
         "openclaw": ("openclaw", ["openclaw"]),
         "ollama": ("ollama", ["ollama"]),
@@ -1125,7 +1488,11 @@ def extended_services() -> dict[str, dict[str, str]]:
         "paperclip": ("paperclip", ["paperclip"]),
         "server_monitor": ("plachem-ai-server-monitor", ["uvicorn", "plachem-ai-server-monitor"]),
     }
-    return {key: service_status(service, names) for key, (service, names) in services.items()}
+    statuses: dict[str, dict[str, Any]] = {
+        key: service_status(service, names) for key, (service, names) in services.items()
+    }
+    statuses["openconnector"] = get_openconnector_status()
+    return statuses
 
 
 def detail_response(name: str, payload: dict[str, Any], status: str = "ok") -> dict[str, Any]:
@@ -1382,9 +1749,27 @@ def api_openclaw_status() -> dict[str, Any]:
 @app.get("/api/detail/services")
 def detail_services() -> dict[str, Any]:
     try:
-        return detail_response("services", {"services": extended_services()})
+        dashboard: dict[str, Any] | None = None
+        dashboard_error: str | None = None
+        try:
+            dashboard = get_openconnector_dashboard()
+        except Exception as exc:
+            dashboard_error = str(exc)
+        return detail_response("services", {
+            "services": extended_services(),
+            "openconnector_dashboard": dashboard,
+            "openconnector_dashboard_error": dashboard_error,
+        })
     except Exception as exc:
         return detail_response("services", {"error": str(exc)}, "error")
+
+
+@app.get("/api/openconnector/dashboard")
+def api_openconnector_dashboard() -> dict[str, Any]:
+    try:
+        return detail_response("openconnector", {"dashboard": get_openconnector_dashboard()})
+    except Exception as exc:
+        return detail_response("openconnector", {"error": str(exc)}, "error")
 
 
 @app.get("/compact")
@@ -1404,6 +1789,11 @@ def openclaw_control_page() -> FileResponse:
 @app.get("/war-room")
 def war_room_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "war-room.html")
+
+
+@app.get("/fast-gateway")
+def fast_gateway_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "fast-gateway.html")
 
 
 @app.get("/")
@@ -1438,13 +1828,33 @@ def api_status() -> dict[str, Any]:
         "source": "none",
     }
     services = get_services()
+    openclaw = collect_openclaw_status()
+    openconnector_error = None
+    try:
+        openconnector = get_openconnector_dashboard()
+    except Exception as exc:
+        openconnector_error = _sanitize_error(exc)
+        openconnector = {"summary": {"managed": 0, "healthy": 0, "warning": 0, "error": 0, "unverified": 0}}
 
     service_states = [item["state"] for item in services.values()]
+    gateway_state = openclaw.get("summary", {}).get("gateway", "unknown")
+    oc_summary = openconnector.get("summary", {})
+    oc_healthy = oc_summary.get("healthy", 0)
+    oc_total = oc_summary.get("managed", 0)
+    oc_unverified = oc_summary.get("unverified", 0)
+
+    gpu_summary = gpu_risk_summary(gpus)
+    gpu_risk = gpu_summary["risk"]
+    gpu_headroom_gb = gpu_summary["headroom_gb"]
+    gpu_temp_c = gpu_summary["temperature_c"]
+
     has_error = any(
-        item.get("status") == "error" for item in [cpu, memory, disk, network, gpu]
-    ) or "error" in service_states
-    has_warning = any(item.get("status") in {"unknown", "warming"} for item in [network, gpu]) or any(
+        item.get("status") == "error" for item in [cpu, memory, disk, network]
+    ) or "error" in service_states or gateway_state in {"down", "probe_failed"} or gpu_risk == "error"
+    has_warning = any(item.get("status") in {"unknown", "warming"} for item in [network]) or any(
         state in {"stopped", "unknown"} for state in service_states
+    ) or gateway_state == "degraded" or gpu_risk == "warning" or openconnector_error is not None or (
+        oc_total > 0 and oc_unverified > 0
     )
 
     overall = "error" if has_error else "warning" if has_warning else "normal"
@@ -1458,13 +1868,30 @@ def api_status() -> dict[str, Any]:
             "uptime": get_uptime(),
         },
         "overall": overall,
+        "overall_breakdown": {
+            "cpu": cpu.get("status"),
+            "memory": memory.get("status"),
+            "disk": disk.get("status"),
+            "network": network.get("status"),
+            "gpu": gpu_risk,
+            "services": {k: v.get("state") for k, v in services.items()},
+            "gateway": gateway_state,
+            "openconnector": {"healthy": oc_healthy, "total": oc_total, "unverified": oc_unverified, "state": "unavailable" if openconnector_error else "available"},
+        },
         "cpu": cpu,
         "memory": memory,
         "disk": disk,
         "network": network,
         "gpu": gpu,
         "gpus": gpus,
+        "gpu_risk": gpu_risk,
+        "gpu_headroom_gb": gpu_headroom_gb,
+        "gpu_temperature_c": gpu_temp_c,
         "services": services,
+        "gateway": openclaw.get("gateway"),
+        "openconnector_summary": oc_summary,
+        "openconnector_error": openconnector_error,
+        "gpu_risk_detail": gpu_summary,
     }
 
 

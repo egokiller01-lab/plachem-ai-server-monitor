@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>PLACHEM Agent War Room 와이어프레임</title>
+<style>
+  :root{--bg:#f5f7fb;--paper:#fff;--fg:#18212f;--muted:#64748b;--line:#94a3b8;--nav:#e2e8f0;--input:#dbeafe;--process:#e0e7ff;--ok:#d1fae5;--warn:#fef3c7;--risk:#fee2e2;--accent:#1d4ed8}
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
+  main{max-width:1500px;margin:28px auto;padding:0 20px 40px} h1{margin:0 0 6px;font-size:26px} p{margin:0 0 20px;color:var(--muted)}
+  svg{display:block;width:100%;height:auto;background:var(--paper);border:1px solid #cbd5e1;border-radius:16px}
+  text{fill:var(--fg);font-family:system-ui,-apple-system,"Segoe UI",sans-serif}.t{font-size:22px;font-weight:700}.h{font-size:16px;font-weight:700}.b{font-size:13px}.s{font-size:11px;fill:var(--muted)}
+  .box{fill:#fff;stroke:var(--line);stroke-width:1.2}.nav{fill:var(--nav);stroke:var(--line)}.input{fill:var(--input);stroke:var(--line)}.process{fill:var(--process);stroke:var(--line)}.ok{fill:var(--ok);stroke:var(--line)}.warn{fill:var(--warn);stroke:var(--line)}.risk{fill:var(--risk);stroke:var(--line)}.btn{fill:#fff;stroke:var(--accent);stroke-width:1.4}.primary{fill:var(--accent);stroke:var(--accent)}.white{fill:#fff}.edge{fill:none;stroke:var(--line);stroke-width:1.5;marker-end:url(#arrow)}
+</style>
+</head>
+<body><main>
+<h1>PLACHEM Agent War Room — 대표 검토용 와이어프레임</h1>
+<p>개발 전 화면 구조 시안 · 대시보드 → 프로젝트 → 작업 → 검수/승인의 4단계</p>
+<svg viewBox="0 0 1460 2100" role="img" aria-labelledby="title desc">
+<title id="title">Agent War Room 네 화면 와이어프레임</title><desc id="desc">대표가 프로젝트와 에이전트 작업을 지시, 감독, 검수, 승인하는 화면 구성</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#64748b"/></marker></defs>
+
+<!-- 1 dashboard -->
+<text x="40" y="45" class="t">1. 전체 대시보드</text><text x="40" y="70" class="s">대표님이 접속했을 때 가장 먼저 보는 화면</text>
+<rect x="40" y="90" width="1380" height="420" rx="10" class="box"/>
+<rect x="40" y="90" width="1380" height="54" rx="10" class="nav"/><text x="65" y="123" class="h">Agent War Room</text><text x="1110" y="123" class="b">전체 상태  ● 정상  │ 알림 3 │ 설정</text>
+<rect x="40" y="144" width="215" height="366" class="nav"/><text x="65" y="178" class="h">프로젝트</text><text x="65" y="214" class="b">● ERP 개선</text><text x="65" y="244" class="b">○ 홈페이지 개편</text><text x="65" y="274" class="b">○ 블로그 운영</text><rect x="65" y="302" width="160" height="38" rx="6" class="btn"/><text x="94" y="327" class="b">+ 새 프로젝트</text>
+<text x="285" y="180" class="h">전체 프로젝트 현황</text>
+<rect x="285" y="198" width="200" height="78" rx="8" class="process"/><text x="305" y="226" class="s">진행 중</text><text x="305" y="258" class="t">4</text>
+<rect x="500" y="198" width="200" height="78" rx="8" class="warn"/><text x="520" y="226" class="s">QA 대기</text><text x="520" y="258" class="t">2</text>
+<rect x="715" y="198" width="200" height="78" rx="8" class="risk"/><text x="735" y="226" class="s">재작업/오류</text><text x="735" y="258" class="t">1</text>
+<rect x="930" y="198" width="200" height="78" rx="8" class="ok"/><text x="950" y="226" class="s">대표 승인 대기</text><text x="950" y="258" class="t">1</text>
+<rect x="1145" y="198" width="230" height="78" rx="8" class="input"/><text x="1165" y="226" class="s">전체 진행률</text><text x="1165" y="258" class="t">63%</text>
+<rect x="285" y="298" width="1090" height="180" rx="8" class="box"/><text x="305" y="326" class="h">주의가 필요한 작업</text><text x="305" y="360" class="b">ERP VAT UI 개선</text><text x="650" y="360" class="b">ERPcoder</text><text x="820" y="360" class="b">REWORK</text><text x="1050" y="360" class="b">증거 부족</text><text x="1240" y="360" class="b">상세 보기 ›</text><line x1="305" y1="377" x2="1350" y2="377" stroke="#cbd5e1"/><text x="305" y="410" class="b">매입 화면 독립 QA</text><text x="650" y="410" class="b">ERPqa</text><text x="820" y="410" class="b">QA 대기</text><text x="1050" y="410" class="b">Coder 결과 대기</text><text x="1240" y="410" class="b">상세 보기 ›</text>
+
+<!-- 2 project -->
+<text x="40" y="565" class="t">2. 프로젝트 상세</text><text x="40" y="590" class="s">목표와 작업 단위를 관리하는 화면</text>
+<rect x="40" y="610" width="1380" height="420" rx="10" class="box"/><rect x="40" y="610" width="1380" height="54" rx="10" class="nav"/><text x="65" y="644" class="h">← 전체 프로젝트</text><text x="1120" y="644" class="b">프로젝트 설정 │ 보관</text>
+<text x="70" y="710" class="t">ERP 사용자 화면 개선</text><text x="70" y="740" class="b">목표: 운영 ERP의 입력 오류를 줄이고 PC·모바일 사용성을 개선</text><text x="70" y="770" class="s">책임자 ERPmanager · 기간 8/25–8/31 · 전체 진행률 42% · 위험도 보통</text>
+<rect x="70" y="800" width="1280" height="52" rx="8" class="input"/><text x="92" y="832" class="b">단계: ① 요구 정리  ✓  →  ② 구현 진행 중  →  ③ 독립 QA  →  ④ 대표 승인</text>
+<text x="70" y="892" class="h">작업 목록</text><rect x="1135" y="864" width="215" height="40" rx="6" class="primary"/><text x="1170" y="890" class="b white">+ 새 작업 만들기</text>
+<rect x="70" y="914" width="1280" height="82" rx="8" class="box"/><text x="90" y="944" class="b">VAT 버튼 겹침 수정</text><text x="450" y="944" class="b">ERPcoder</text><text x="650" y="944" class="b">REWORK</text><text x="850" y="944" class="b">최근 보고 10분 전</text><text x="1180" y="944" class="b">상세 보기 ›</text><text x="90" y="974" class="s">완료조건 4개 중 2개 충족 · QA 미통과 · 운영 반영 금지</text>
+
+<!-- 3 task -->
+<text x="40" y="1085" class="t">3. 작업 상세·실시간 관제</text><text x="40" y="1110" class="s">지시, 진행 상황, 중간 개입을 한 화면에서 처리</text>
+<rect x="40" y="1130" width="1380" height="500" rx="10" class="box"/><rect x="40" y="1130" width="1380" height="54" rx="10" class="nav"/><text x="65" y="1164" class="h">← ERP 사용자 화면 개선 / VAT 버튼 겹침 수정</text><text x="1190" y="1164" class="b">상태: REWORK</text>
+<rect x="70" y="1210" width="600" height="245" rx="8" class="box"/><text x="95" y="1242" class="h">작업 지시서</text><text x="95" y="1275" class="s">목표</text><text x="95" y="1298" class="b">PC·모바일에서 VAT 0/5/8/10이 겹치지 않게 수정</text><text x="95" y="1330" class="s">금지사항</text><text x="95" y="1353" class="b">DB·매출 화면·운영 데이터 변경 금지</text><text x="95" y="1385" class="s">완료조건</text><text x="95" y="1408" class="b">1366 / 1440 / 390px 화면 증거 + 계산·저장 회귀검증</text>
+<rect x="700" y="1210" width="650" height="245" rx="8" class="box"/><text x="725" y="1242" class="h">실시간 진행 기록</text><circle cx="735" cy="1280" r="7" fill="#22c55e"/><text x="755" y="1285" class="b">13:00 지시 전달 완료</text><circle cx="735" cy="1320" r="7" fill="#22c55e"/><text x="755" y="1325" class="b">13:01 ERPcoder 작업 착수</text><circle cx="735" cy="1360" r="7" fill="#f59e0b"/><text x="755" y="1365" class="b">13:04 중간보고 — 브라우저 확인 중</text><circle cx="735" cy="1400" r="7" fill="#ef4444"/><text x="755" y="1405" class="b">13:08 결과 제출 — REWORK</text>
+<rect x="70" y="1482" width="1280" height="68" rx="8" class="risk"/><text x="95" y="1512" class="h">판정 사유</text><text x="250" y="1512" class="b">실제 저장·재열기 검증 증거 없음</text><text x="95" y="1538" class="s">시스템 오류가 아니라 완료조건 미충족입니다. 세부 로그와 증거 파일을 열어볼 수 있어야 합니다.</text>
+<rect x="70" y="1570" width="128" height="38" rx="6" class="btn"/><text x="103" y="1595" class="b">추가 지시</text><rect x="210" y="1570" width="105" height="38" rx="6" class="btn"/><text x="246" y="1595" class="b">중지</text><rect x="327" y="1570" width="105" height="38" rx="6" class="btn"/><text x="363" y="1595" class="b">재개</text><rect x="444" y="1570" width="135" height="38" rx="6" class="primary"/><text x="477" y="1595" class="b white">재작업 지시</text><rect x="591" y="1570" width="120" height="38" rx="6" class="btn"/><text x="624" y="1595" class="b">QA 요청</text>
+
+<!-- 4 review -->
+<text x="40" y="1685" class="t">4. 결과 검수·대표 승인</text><text x="40" y="1710" class="s">Coder 결과와 QA 판정을 비교하고 최종 결정을 내리는 화면</text>
+<rect x="40" y="1730" width="1380" height="330" rx="10" class="box"/>
+<rect x="70" y="1765" width="610" height="205" rx="8" class="process"/><text x="95" y="1798" class="h">ERPcoder 결과</text><text x="95" y="1832" class="b">변경 파일 2개 · 테스트 68개 PASS</text><text x="95" y="1862" class="b">PC·모바일 화면 증거 3개</text><text x="95" y="1892" class="b">판정: 작업 완료 요청</text><rect x="95" y="1915" width="150" height="34" rx="6" class="btn"/><text x="123" y="1938" class="b">증거 전체 보기</text>
+<path d="M690 1865H750" class="edge"/>
+<rect x="770" y="1765" width="580" height="205" rx="8" class="ok"/><text x="795" y="1798" class="h">ERPqa 독립 검수</text><text x="795" y="1832" class="b">완료조건 4/4 충족</text><text x="795" y="1862" class="b">회귀·화면·권한 검증 PASS</text><text x="795" y="1892" class="b">최종 판정: PASS</text><rect x="795" y="1915" width="150" height="34" rx="6" class="btn"/><text x="823" y="1938" class="b">QA 보고서 보기</text>
+<rect x="70" y="1990" width="210" height="42" rx="6" class="btn"/><text x="112" y="2017" class="b">재작업 요청</text><rect x="1130" y="1990" width="220" height="42" rx="6" class="primary"/><text x="1175" y="2017" class="b white">대표 최종 승인</text>
+</svg>
+</main></body></html>

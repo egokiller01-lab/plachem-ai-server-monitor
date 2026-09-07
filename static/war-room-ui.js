@@ -2,10 +2,19 @@ let selectedProjectId = null;
 let selectedDocumentVersion = null;
 let projectAccess = {permissions: []};
 let currentProject = null;
+let currentProjects = [];
 let currentParticipants = [];
+let currentAgentCatalog = [];
 let currentTasks = [];
+let currentDeliveries = [];
 let demoMode = false;
 let quickTaskId = null;
+let selectedTaskId = null;
+let pinnedTaskId = new URLSearchParams(window.location.search).get("task_id");
+let currentScreen = new URLSearchParams(window.location.search).get("screen") || "dashboard";
+let pinnedLookupError = null;
+const mutationInFlight = new Set();
+const UI_STATE_KEY = "war-room-ui-state-v2";
 
 const esc = value => String(value ?? "").replace(
   /[&<>"']/g,
@@ -31,11 +40,195 @@ const post = (url, body, method = "POST") => requestJson(url, {
 });
 
 function fail(id, error) {
-  document.getElementById(id).innerHTML = `<div class="empty error">조회 실패: ${esc(error.message)}</div>`;
+  const target = document.getElementById(id);
+  if (target) target.innerHTML = `<div class="empty error">조회 실패: ${esc(error.message)}</div>`;
+}
+
+function storedUiState() {
+  try { return JSON.parse(sessionStorage.getItem(UI_STATE_KEY) || "{}"); }
+  catch (_) { return {}; }
+}
+
+function saveUiState() {
+  sessionStorage.setItem(UI_STATE_KEY, JSON.stringify({
+    projectId: selectedProjectId,
+    taskId: selectedTaskId,
+    screen: currentScreen,
+    statusFilter: document.getElementById("task-status-filter")?.value || "",
+    searchFilter: document.getElementById("task-search-filter")?.value || "",
+  }));
+}
+
+function updateLocation({push = false} = {}) {
+  const params = new URLSearchParams(window.location.search);
+  if (selectedProjectId) params.set("project_id", selectedProjectId); else params.delete("project_id");
+  if (selectedTaskId) params.set("task_id", selectedTaskId); else if (!pinnedTaskId) params.delete("task_id");
+  params.set("screen", currentScreen);
+  const url = `${window.location.pathname}?${params}`;
+  window.history[push ? "pushState" : "replaceState"]({projectId:selectedProjectId, taskId:selectedTaskId, screen:currentScreen}, "", url);
+  pinnedTaskId = params.get("task_id");
+  saveUiState();
+}
+
+function navigateScreen(name, {push = true} = {}) {
+  if (name === "review") name = "task";
+  currentScreen = name;
+  document.querySelectorAll(".screen").forEach(screen => { screen.hidden = screen.id !== `screen-${name}`; });
+  document.querySelectorAll("[data-screen]").forEach(button => button.setAttribute("aria-current", button.dataset.screen === name ? "page" : "false"));
+  if (name === "task") renderTaskDetail();
+  if (name === "task") renderReview();
+  if (push) updateLocation({push:true});
+}
+
+function openTask(id, screen = "task", {push = true} = {}) {
+  selectedTaskId = id; quickTaskId = id;
+  ["message-task", "approval-task", "qa-task"].forEach(selectId => { const select = document.getElementById(selectId); if (select) select.value = id; });
+  navigateScreen(screen, {push}); renderTaskDetail(); renderReview();
+}
+
+function setSelectOptions(id, html, preferredValue = null) {
+  const node = document.getElementById(id); if (!node) return;
+  const previous = preferredValue ?? node.value;
+  node.innerHTML = html;
+  if ([...node.options].some(option => option.value === previous)) node.value = previous;
+}
+
+async function withMutation(key, outputId, action) {
+  if (mutationInFlight.has(key)) return;
+  mutationInFlight.add(key);
+  document.querySelectorAll("[data-mutation]").forEach(node => { node.disabled = true; node.setAttribute("aria-busy", "true"); });
+  try { return await action(); }
+  catch (error) { const out = document.getElementById(outputId); if (out) out.textContent = error.message; throw error; }
+  finally {
+    mutationInFlight.delete(key);
+    document.querySelectorAll("[data-mutation]").forEach(node => { node.removeAttribute("aria-busy"); });
+    applyAccess();
+  }
+}
+
+async function requireFreshTask(id, allowedStatuses = null) {
+  if (!id || !selectedProjectId) throw new Error("작업과 프로젝트를 선택하세요");
+  const data = await get(`/api/war-room/projects/${encodeURIComponent(selectedProjectId)}/tasks`);
+  const task = (data.items || []).find(row => row.id === id);
+  if (!task) throw new Error(`선택한 작업이 현재 프로젝트에 없습니다 · ${id}`);
+  if (allowedStatuses && !allowedStatuses.includes(task.status)) throw new Error(`작업 상태가 변경되었습니다 · ${statusLabel(task.status)}`);
+  currentTasks = data.items || [];
+  selectedTaskId = id; quickTaskId = id;
+  return task;
+}
+
+function selectedCurrentTask() { return taskById(selectedTaskId || quickTaskId); }
+
+function statusLabel(status) {
+  return ({draft:"초안",awaiting_approval:"승인 대기",approved:"승인됨",running:"수행 중",qa:"QA 대기",completed:"완료",rework_required:"재작업",system_error:"SYSTEM ERROR",stopped:"중지",planning:"기획",active:"진행 중",paused:"일시중지",archived:"보관"})[status] || status || "확인 필요";
+}
+
+function statusChip(status) { return `<span class="status-chip ${esc(status)}">${esc(statusLabel(status))}</span>`; }
+
+function renderDashboard(projects = currentProjects, operations = {agents:[]}) {
+  const counts = {running:0,qa:0,rework:0,system_error:0,approval:0,completed:0,total:0};
+  currentTasks.forEach(task => { counts.total += 1; if (task.status === "running") counts.running += 1; if (task.status === "qa") counts.qa += 1; if (task.status === "rework_required") counts.rework += 1; if (task.state === "system_error") counts.system_error += 1; if (task.status === "awaiting_approval") counts.approval += 1; if (task.status === "completed") counts.completed += 1; });
+  const progress = counts.total ? Math.round((counts.completed / counts.total) * 100) : 0;
+  document.getElementById("dashboard-kpis").innerHTML = [["진행 중",counts.running],["QA 대기",counts.qa],["재작업",counts.rework],["SYSTEM ERROR",counts.system_error],["대표 승인 대기",counts.approval],["전체 진행률",`${progress}%`]].map(([label,value]) => `<div class="stat"><strong>${esc(value)}</strong><small>${esc(label)} · 작업 ${counts.total}건 / 프로젝트 ${projects.length}건</small></div>`).join("");
+  const attention = currentTasks.filter(task => ["qa","rework_required","system_error","awaiting_approval","stopped"].includes(task.state || task.status));
+  document.getElementById("dashboard-attention").innerHTML = attention.map(task => { const state = task.state || task.status; const next = state === "system_error" ? "다음 행동: 오류 상세 확인 후 자동 재시도 또는 수동 재전송" : task.status === "rework_required" ? "다음 행동: 재작업 지시" : task.status === "qa" ? "다음 행동: ERPqa 독립 판정" : task.status === "awaiting_approval" ? "다음 행동: 승인 검토" : "다음 행동: 중지 원인 확인"; return `<button class="project" onclick="openTask('${esc(task.id)}')"><strong>${esc(task.scope)}</strong><div>${statusChip(state)} · ${esc(task.assignee_agent_id || "담당 미지정")}</div><small>${next}</small></button>`; }).join("") || '<div class="empty">주의 작업 없음</div>';
+  document.getElementById("dashboard-agents").innerHTML = (operations.agents || []).map(agent => `<div class="project"><div><strong>${esc(agent.agent_id)}</strong> ${statusChip(agent.state)}</div><small>세션 ${agent.session_count} · 최근 ${esc(agent.latest?.status || "없음")}</small></div>`).join("") || '<div class="empty">참여 에이전트 상태 없음</div>';
+  const monitor = document.getElementById("monitor-banner");
+  if (monitor) { monitor.hidden = !operations.degraded; monitor.innerHTML = operations.degraded ? `<strong>AI Server Monitor 장애</strong><br>마지막 확인 ${esc(new Date((operations.last_checked || 0) * 1000).toLocaleString())} · 마지막 정상 ${esc(new Date((operations.last_good_snapshot?.captured_at || 0) * 1000).toLocaleString())}<br>마지막 정상 상태를 표시 중입니다. 새 호출 전 서버 상태를 재조회하세요.` : ""; }
+  const monitorLast = document.getElementById("monitor-last-good");
+  if (monitorLast) monitorLast.textContent = `마지막 확인 ${new Date((operations.last_checked || 0) * 1000).toLocaleString()} · 정상 스냅샷 ${operations.last_good_snapshot ? "보존됨" : "없음"}`;
+  document.getElementById("dashboard-updated").textContent = `마지막 갱신 ${new Date().toLocaleTimeString()}`;
+}
+
+function renderProjectDetail() {
+  if (!currentProject) return;
+  document.getElementById("project-title").textContent = currentProject.name;
+  document.getElementById("project-status-chip").innerHTML = statusChip(currentProject.status);
+  document.getElementById("project-goal").textContent = `목표: ${currentProject.name}의 요구사항·작업·QA·승인 흐름을 한 곳에서 관리`;
+  document.getElementById("project-meta").textContent = `참여자 ${currentParticipants.length}명 · 생성 ${new Date(currentProject.created_at * 1000).toLocaleString()} · 갱신 ${new Date(currentProject.updated_at * 1000).toLocaleString()}`;
+  const statuses = new Set(currentTasks.map(task => task.status));
+  document.querySelectorAll("#project-stage div").forEach((node,index) => { node.classList.toggle("done", index === 0 || (index === 1 && currentTasks.length > 0)); node.classList.toggle("current", (index === 2 && statuses.has("qa")) || (index === 3 && statuses.has("completed"))); });
+}
+
+function renderTaskDetail() {
+  const task = selectedCurrentTask(); const target = document.getElementById("task-detail");
+  if (!task) { target.innerHTML = '<div class="empty">프로젝트에서 작업을 선택하면 목표·담당·완료조건이 표시됩니다.</div>'; document.getElementById("task-status").innerHTML = ""; return; }
+  document.getElementById("task-screen-title").textContent = `작업 관제 · ${task.scope}`;
+  document.getElementById("task-detail-subtitle").textContent = `담당 ${task.assignee_agent_id || "미지정"} · 검수 ${task.reviewer_agent_id || "미지정"} · 참고 ${task.document_version || "-"} · revision ${task.revision}`;
+  const state = task.state || task.status;
+  document.getElementById("task-status").innerHTML = statusChip(state);
+  target.innerHTML = `<div class="three-col"><div><small class="muted">지시 원문·범위</small><p>${esc(task.instruction_body || task.scope)}</p></div><div><small class="muted">담당·독립 검수</small><p>${esc(task.assignee_agent_id || "-")} → ${esc(task.reviewer_agent_id || "-")}</p></div><div><small class="muted">완료조건</small><p>결과 제출 → 필수 evidence → 독립 QA PASS → 대표 승인</p></div></div><div class="muted">대상: ${esc((task.agent_ids || []).join(", ") || "-")} · 상태 원인: ${state === "system_error" ? "전달/서버 오류. QA FAIL·REWORK와 독립 상태" : task.status === "rework_required" ? "QA FAIL/REWORK 또는 결과 검증 실패" : task.status === "stopped" ? "중지 확인됨" : task.status === "stop_unconfirmed" ? "중지 미확인 또는 부분 중지" : "서버 상태 전이"}</div>`;
+  const legacyForm = document.getElementById("legacy-reviewer-form");
+  if (legacyForm) {
+    legacyForm.hidden = Boolean(task.reviewer_agent_id) || task.status === "completed" || projectAccess.is_representative !== true;
+    const select = document.getElementById("legacy-reviewer");
+    const executors = new Set(task.agent_ids || []);
+    select.innerHTML = '<option value="">독립 검수자 선택</option>' + currentParticipants
+      .filter(row => row.active && row.role === "qa" && !executors.has(row.principal_id))
+      .map(row => `<option value="${esc(row.principal_id)}">${esc(row.principal_id)}</option>`).join("");
+  }
+  renderExecutionProjection(task);
+}
+
+document.getElementById("legacy-reviewer-form")?.addEventListener("submit", async event => {
+  event.preventDefault();
+  const task = selectedCurrentTask();
+  if (!task) return;
+  const out = document.getElementById("legacy-reviewer-result");
+  try {
+    const result = await post(`/api/war-room/tasks/${encodeURIComponent(task.id)}/reviewer`, {
+      reviewer_agent_id: document.getElementById("legacy-reviewer").value,
+      reason: document.getElementById("legacy-reviewer-reason").value,
+      task_revision: Number(task.revision),
+    });
+    out.textContent = `검수자 ${result.reviewer_agent_id} 지정 · 기존 유효 승인 ${result.revoked_approval_ids.length}건 해제 · 새 승인 필요`;
+    document.getElementById("legacy-reviewer-reason").value = "";
+    await load();
+  } catch (error) { out.textContent = `검수자 지정 실패 · ${error.message}`; }
+});
+
+function renderExecutionProjection(task) {
+  const target = document.getElementById("task-detail");
+  const rows = currentDeliveries.filter(row => row.task_id === task.id || row.message_id === task.source_message_id);
+  const fast = rows.filter(row => row.execution_mode === "FAST_GATEWAY" || row.core_run_id);
+  if (!fast.length) return;
+  const refs = value => { try { const parsed = JSON.parse(value || "[]"); return Array.isArray(parsed) ? parsed.map(item => typeof item === "string" ? item : (item?.path || item?.detail || JSON.stringify(item))).join(", ") : "-"; } catch (_) { return value || "-"; } };
+  target.insertAdjacentHTML("beforeend", `<div class="card" style="margin-top:12px"><strong>Fast Gateway 실행 투영</strong>${fast.map(row => `<div class="muted">Agent ${esc(row.agent_id)} · Core ${esc(row.core_run_id || "-")} · 실행 ${esc(row.run_status || row.status)} · runtime ${esc(row.runtime_seconds ?? "-")}s · policy ${esc(row.policy_status || "-")} · escalation ${row.escalation_required ? "required" : "no"}${row.cancel_reason ? ` · cancel ${esc(row.cancel_reason)}` : ""}<br>결과 요약: ${esc(row.result_summary || "-")}<br>Evidence: ${esc(refs(row.evidence_json))}<br>Artifacts: ${esc(refs(row.artifacts_json))}</div>`).join("")}</div>`);
+}
+
+async function renderReview() {
+  const task = selectedCurrentTask(); if (!task) return;
+  const deliveries = currentDeliveries.filter(row => row.task_id === task.id || row.message_id === task.source_message_id);
+  const parseRefs = value => { try { const parsed = typeof value === "string" ? JSON.parse(value || "null") : value; return parsed ? JSON.stringify(parsed, null, 2) : "-"; } catch (_) { return value || "-"; } };
+  document.getElementById("coder-result").innerHTML = `<p>${esc(task.scope)}</p><div class="muted">상태 ${statusChip(task.status)}</div>${deliveries.map(row => { const raw = row.response_body || row.raw_response; const normalized = row.result_json || row.rejected_result_json || row.result_summary; const failure = row.validation_error || row.error_detail; return `<article class="project"><strong>${esc(row.agent_id)} · ${esc(deliveryLabel(row.status))}</strong><small>task ${esc(task.id)} · run ${esc(row.run_id || row.core_run_id || "-")}</small>${raw ? `<details><summary>Worker 원본 응답</summary><pre>${esc(raw)}</pre></details>` : '<div class="warning">Worker 원본 응답 미보존</div>'}${normalized ? `<details><summary>${row.rejected_result_json && !row.result_json ? "거절된 정규화 결과" : "정규화 결과"}</summary><pre>${esc(parseRefs(normalized))}</pre></details>` : ""}${row.evidence_json ? `<details><summary>Evidence</summary><pre>${esc(parseRefs(row.evidence_json))}</pre></details>` : ""}${row.artifacts_json ? `<details><summary>Artifacts</summary><pre>${esc(parseRefs(row.artifacts_json))}</pre></details>` : ""}${row.error_code || failure ? `<div class="error-detail"><strong>거절·실패 사유</strong><br>${esc(row.error_code || "RESULT_VALIDATION_FAILED")}${failure ? `<br>${esc(failure)}` : ""}</div>` : ""}</article>`; }).join("") || '<div class="empty">이 작업의 실행 결과가 없습니다.</div>'}`;
+  document.getElementById("qa-task").value = task.id;
+  try {
+    const [evidence, audit] = await Promise.all([
+      get(`/api/war-room/tasks/${encodeURIComponent(task.id)}/evidence`),
+      get(`/api/war-room/tasks/${encodeURIComponent(task.id)}/audit`),
+    ]);
+    document.getElementById("evidence-list").innerHTML = evidence.items.map(row => `<div class="evidence"><strong>${esc(row.evidence_type)}</strong> · ${esc(row.summary)}<br><small>${esc(row.uri)} · revision ${esc(row.task_revision)}</small></div>`).join("") || '<div class="empty">필수 증거 없음</div>';
+    const verdict = task.latest_qa_verdict ? `${task.latest_qa_verdict.verdict} · ${task.latest_qa_verdict.qa_principal}` : "판정 없음";
+    document.getElementById("qa-result-summary").innerHTML = `<p>최근 ERPqa 판정: <strong>${esc(verdict)}</strong></p><p class="muted">필수 증거 ${task.evidence_count || 0}건 · QA cycle ${task.qa_cycle}</p>`;
+    const canComplete = task.status === "qa" && task.latest_qa_verdict?.verdict === "PASS" && Number(task.evidence_count || 0) > 0;
+    document.getElementById("representative-complete").disabled = !canComplete;
+    document.getElementById("representative-explanation").textContent = canComplete ? "필수 evidence와 ERPqa PASS가 확인되어 대표 승인할 수 있습니다." : "QA PASS와 필수 증거 전에는 승인 불가";
+    document.getElementById("review-guard").textContent = canComplete ? "대표 승인 가능" : "QA PASS와 필수 증거 전에는 승인 불가";
+    renderAudit(audit.items || []);
+  } catch (error) { fail("evidence-list", error); }
+}
+
+async function completeSelectedTask() {
+  const task = selectedCurrentTask(); if (!task) return;
+  try { await withMutation(`complete:${task.id}`, "representative-result", async () => { const fresh = await requireFreshTask(task.id, ["qa"]); if (fresh.latest_qa_verdict?.verdict !== "PASS" || Number(fresh.evidence_count || 0) < 1) throw new Error("QA PASS와 필수 증거를 다시 확인하세요"); const result = await post(`/api/war-room/tasks/${fresh.id}/representative-completion`, {decision:"approved"}); document.getElementById("representative-result").textContent = `대표 승인 ${result.status || "완료"}`; await load(); }); }
+  catch (_) { /* reported */ }
 }
 
 function applyAccess(access = projectAccess) {
   projectAccess = access;
+  // First remove a previous invalid-pinned lock. The permission pass below
+  // then recalculates the current actor's real disabled reason and title.
+  enforcePinnedTaskFailClosed();
   const permissions = new Set(access.permissions || []);
   document.querySelectorAll("[data-permission]").forEach(element => {
     const allowed = permissions.has(element.dataset.permission);
@@ -61,6 +254,43 @@ function applyAccess(access = projectAccess) {
   });
   document.getElementById("audit-summary").textContent =
     `principal ${access.principal_id || "-"} · role ${access.role || "-"} · permissions ${[...permissions].join(", ")}`;
+  enforcePinnedTaskFailClosed();
+}
+
+function enforcePinnedTaskFailClosed() {
+  const unavailable = pinnedTaskId !== null && !taskById(pinnedTaskId);
+  const selectors = [
+    "[data-mutation]", "#quick-prepare", "#quick-open-qa", "#representative-complete",
+    "#new-project-button", "#project-form button", "#project-edit-form button",
+    "#task-form button", "#participant-form button", "#legacy-reviewer-form button",
+    "#message-form button", 'button[onclick^="retryDelivery("]',
+  ].join(",");
+  document.querySelectorAll(selectors).forEach(control => {
+    if (unavailable) {
+      if (control.dataset.pinnedFailClosed !== "true") {
+        control.dataset.pinnedPreviousHidden = String(control.hidden);
+        control.dataset.pinnedPreviousDisabled = String(control.disabled);
+        control.dataset.pinnedPreviousTitle = control.title || "";
+        control.dataset.pinnedPreviousAriaDisabled = control.getAttribute("aria-disabled") || "";
+      }
+      control.dataset.pinnedFailClosed = "true";
+      control.hidden = true;
+      control.disabled = true;
+      control.setAttribute("aria-disabled", "true");
+      control.title = `존재하지 않는 고정 task에서는 변경할 수 없습니다 · ${pinnedTaskId}`;
+    } else if (control.dataset.pinnedFailClosed === "true") {
+      control.hidden = control.dataset.pinnedPreviousHidden === "true";
+      control.disabled = control.dataset.pinnedPreviousDisabled === "true";
+      control.title = control.dataset.pinnedPreviousTitle || "";
+      if (control.dataset.pinnedPreviousAriaDisabled) control.setAttribute("aria-disabled", control.dataset.pinnedPreviousAriaDisabled);
+      else control.removeAttribute("aria-disabled");
+      delete control.dataset.pinnedFailClosed;
+      delete control.dataset.pinnedPreviousHidden;
+      delete control.dataset.pinnedPreviousDisabled;
+      delete control.dataset.pinnedPreviousTitle;
+      delete control.dataset.pinnedPreviousAriaDisabled;
+    }
+  });
 }
 
 function taskById(id) {
@@ -74,32 +304,50 @@ function selectedTask(selectId) {
 }
 
 function renderTasks() {
-  if (!quickTaskId) {
+  if (pinnedTaskId !== null) {
+    // A supplied task_id is an explicit safety boundary: never fall back to
+    // the most recent task when it is absent or invalid.
+    quickTaskId = currentTasks.some(task => task.id === pinnedTaskId) ? pinnedTaskId : null;
+  } else if (!quickTaskId) {
     quickTaskId = currentTasks.find(task => ["awaiting_approval","approved","running","qa"].includes(task.status) && task.source_message_id)?.id
       || currentTasks.find(task => task.status === "completed" && task.source_message_id)?.id || null;
   }
-  document.getElementById("tasks").innerHTML = currentTasks.map(task => {
+  const statusFilter = document.getElementById("task-status-filter")?.value || "";
+  const searchFilter = (document.getElementById("task-search-filter")?.value || "").trim().toLowerCase();
+  const visibleTasks = currentTasks.filter(task => {
+    if (statusFilter && task.status !== statusFilter) return false;
+    if (!searchFilter) return true;
+    return [task.id, task.scope, task.instruction_body, task.assignee_agent_id, task.reviewer_agent_id]
+      .some(value => String(value || "").toLowerCase().includes(searchFilter));
+  });
+  document.getElementById("tasks").innerHTML = visibleTasks.map(task => {
     const buttons = [];
     if (task.status === "draft") buttons.push(`<button data-permission="manage" onclick="changeTask('${task.id}','awaiting_approval')">승인 요청</button>`);
     if (task.status === "awaiting_approval") {
-      buttons.push(`<button data-permission="approve" onclick="selectApprovalTask('${task.id}')">승인 화면에 선택</button>`);
+      buttons.push(`<button data-permission="approve" data-mutation onclick="selectApprovalTask('${task.id}')">승인 화면에 선택</button>`);
     }
     if (task.status === "approved") {
-      buttons.push(`<button data-permission="execute" onclick="selectApprovalTask('${task.id}')">실행 준비</button>`);
+      buttons.push(`<button data-permission="execute" data-mutation onclick="selectApprovalTask('${task.id}')">실행 준비</button>`);
     }
-    if (task.status === "running" && task.source_message_id) {
-      buttons.push(`<button data-permission="execute" onclick="deliverTask('${task.id}')">지시 전달</button>`);
+    if (task.status === "running" && task.source_message_id && !currentDeliveries.some(row => row.task_id === task.id && Number(row.task_revision || 1) === Number(task.revision || 1))) {
+      buttons.push(`<button data-permission="execute" data-mutation onclick="deliverTask('${task.id}')">지시 전달</button>`);
     }
-    if (task.status === "running") buttons.push(`<button data-permission="execute" onclick="changeTask('${task.id}','qa')">QA 전환</button>`);
-    if (task.status === "qa") buttons.push(`<button data-permission="manage" onclick="representativeComplete('${task.id}')">대표 최종 완료</button>`);
-    if (["running","qa"].includes(task.status)) buttons.push(`<button data-permission="execute" onclick="changeTask('${task.id}','stopped')">작업 중지</button>`);
-    return `<div class="project"><strong>${esc(task.scope)}</strong><div class="muted">${esc(task.status)} · ${esc(task.assignee_agent_id)}</div><small>호출 ${task.call_limit} · 턴 ${task.turn_limit} · 문서 ${esc(task.document_version)}</small><div class="filterbar">${buttons.join("")}</div></div>`;
-  }).join("") || '<div class="empty">작업 없음</div>';
+    if (["rework_required","stopped","stop_unconfirmed"].includes(task.status)) buttons.push(`<button data-permission="approve" data-mutation onclick="prepareTaskForReapproval('${task.id}')">재승인 준비</button>`);
+    if (["approved","running","qa"].includes(task.status)) buttons.push(`<button data-permission="execute" data-mutation onclick="stopTask('${task.id}')">실제 작업 중지</button>`);
+    return `<div class="project"><button class="project" onclick="openTask('${esc(task.id)}')"><strong>${esc(task.scope)}</strong><div>${statusChip(task.status)} · ${esc(task.assignee_agent_id || "담당 미지정")}</div><small>호출 ${task.call_limit} · 턴 ${task.turn_limit} · 문서 ${esc(task.document_version)}</small></button><div class="filterbar">${buttons.join("")}</div></div>`;
+  }).join("") || '<div class="empty">조건에 맞는 작업 없음</div>';
   const options = currentTasks.map(task => `<option value="${esc(task.id)}">${esc(task.status)} · ${esc(task.scope.slice(0, 42))}</option>`);
-  document.getElementById("message-task").innerHTML = '<option value="">작업 선택</option>' + options.filter(option => !option.includes("completed") && !option.includes("stopped")).join("");
-  document.getElementById("approval-task").innerHTML = '<option value="">작업 선택</option>' + options.join("");
-  document.getElementById("qa-task").innerHTML = '<option value="">QA 작업 선택</option>' + options.join("");
+  setSelectOptions("message-task", '<option value="">작업 선택</option>' + options.filter(option => !option.includes("completed") && !option.includes("stopped")).join(""), selectedTaskId);
+  setSelectOptions("approval-task", '<option value="">작업 선택</option>' + options.join(""), selectedTaskId);
+  setSelectOptions("qa-task", '<option value="">QA 작업 선택</option>' + options.join(""), selectedTaskId);
+  saveUiState();
   renderQuickProgress();
+}
+
+function clearTaskFilters() {
+  document.getElementById("task-status-filter").value = "";
+  document.getElementById("task-search-filter").value = "";
+  renderTasks();
 }
 
 function renderQuickProgress() {
@@ -114,13 +362,40 @@ function renderQuickProgress() {
   document.getElementById("quick-step-3")?.classList.toggle("done", status === "completed");
   const approve = document.getElementById("quick-approve-run");
   if (approve) {
-    approve.disabled = true;
-    approve.hidden = true;
+    approve.hidden = status !== "awaiting_approval";
+    approve.disabled = Boolean(pinnedTaskId !== null && (!task || status !== "awaiting_approval"));
   }
   const qaButton = document.getElementById("quick-open-qa");
   if (qaButton) qaButton.hidden = status !== "qa";
   const completeButton = document.getElementById("quick-complete");
   if (completeButton) completeButton.hidden = status !== "qa";
+  let lock = document.getElementById("quick-target-lock");
+  if (!lock && pinnedTaskId !== null) {
+    lock = document.createElement("div");
+    lock.id = "quick-target-lock";
+    lock.className = "warning";
+    document.getElementById("quick-task-form")?.prepend(lock);
+  }
+  if (lock) {
+    lock.hidden = pinnedTaskId === null;
+    if (pinnedTaskId !== null) lock.textContent = task
+      ? `고정 대상 · task ${task.id} · 담당 ${task.assignee_agent_id} · 호출 ${task.call_limit}회 · 턴 ${task.turn_limit}회 · ${statusLabel(task.status)}`
+      : `고정 대상 task ${pinnedTaskId}를 불러오는 중…`;
+  }
+  const prepare = document.getElementById("quick-prepare");
+  if (prepare && pinnedTaskId !== null) {
+    prepare.hidden = true;
+    prepare.disabled = true;
+  }
+  if (pinnedTaskId !== null && !task) {
+    ["quick-prepare", "quick-approve-run", "quick-open-qa", "quick-complete"].forEach(id => {
+      const control = document.getElementById(id);
+      if (control) { control.hidden = true; control.disabled = true; }
+    });
+    if (lock) lock.textContent = pinnedLookupError
+      ? `오류: 고정 task 소속 프로젝트 조회 실패 · ${pinnedLookupError}`
+      : `오류: 고정 task를 찾을 수 없습니다 · ${pinnedTaskId}`;
+  }
 }
 
 function deliveryLabel(status) {
@@ -130,8 +405,15 @@ function deliveryLabel(status) {
 function renderQuickDeliveries(items) {
   const relevant = quickTaskId ? items.filter(row => row.task_id === quickTaskId) : [];
   document.getElementById("quick-delivery-cards").innerHTML = relevant.map(row =>
-    `<div class="project"><strong>${esc(row.agent_id)}</strong><div class="${row.status === "responded" ? "status" : "muted"}">${esc(row.error_code === "agent_busy_queued" ? "다른 작업 종료 후 순서대로 실행" : deliveryLabel(row.status))}</div>${row.response_body ? `<p>${esc(row.response_body)}</p>` : ""}${row.error_code && row.error_code !== "agent_busy_queued" ? `<small class="error">${esc(row.error_code)}</small>` : ""}<small>${row.error_code === "agent_busy_queued" ? "대기 순서가 유지됩니다. 다시 누르지 마세요." : row.error_code ? "다음 행동: 오류를 수정한 뒤 재작업" : row.status === "responded" ? "다음 행동: 결과와 QA 판정을 비교" : "다음 행동: 처리 완료 대기"}</small></div>`
+    `<div class="project"><strong>${esc(row.agent_id)}</strong> ${statusChip(row.error_class === "system_error" ? "system_error" : row.status)}<div class="${row.status === "responded" ? "status" : "muted"}">${esc(row.error_code === "agent_busy_queued" ? "다른 작업 종료 후 순서대로 실행" : deliveryLabel(row.status))}</div>${row.response_body ? `<p>${esc(row.response_body)}</p>` : ""}${row.error_code && row.error_code !== "agent_busy_queued" ? `<div class="error-detail"><strong>오류 상세</strong><br>${esc(row.error_code)}<br><small>재시도 ${row.retry_count || row.attempt_count || 0}/${row.max_attempts || 3}</small></div>` : ""}<small>${row.error_class === "system_error" ? (row.status === "queued" ? "다음 행동: 자동 재시도 대기" : "다음 행동: 원인 확인 후 수동 재전송 또는 담당자 교체") : row.status === "responded" ? "다음 행동: 결과와 QA 판정을 비교" : "다음 행동: 처리 완료 대기"}</small></div>`
   ).join("") || '<div class="empty">실행 후 에이전트별 결과가 여기에 표시됩니다.</div>';
+}
+
+async function refreshOperations() { await load(); }
+
+async function retryDelivery(id) {
+  try { await post(`/api/war-room/deliveries/${encodeURIComponent(id)}/retry`, {}); await load(); }
+  catch (error) { document.getElementById("approval-result").textContent = `수동 재전송 실패 · ${error.message}`; }
 }
 
 function toggleAdvanced(button) {
@@ -149,6 +431,39 @@ function renderParticipants() {
   }).join("") || '<div class="empty">참여자 없음</div>';
 }
 
+function renderAgentControls() {
+  const remembered = Object.fromEntries(["quick-assignee","task-assignee","quick-reviewer","task-reviewer","participant-principal","message-agent","timeline-author"].map(id => [id, document.getElementById(id)?.value || ""]));
+  const rememberedTargets = Object.fromEntries(["quick-agent-targets","task-agent-targets"].map(id => [id, new Set([...document.querySelectorAll(`#${id} input:checked`)].map(input => input.value))]));
+  const participating = new Set(currentParticipants.filter(row => row.active).map(row => row.principal_id));
+  const executable = currentAgentCatalog.filter(row => row.execution_eligible && participating.has(row.agent_id));
+  const reviewers = currentParticipants.filter(row => row.active && row.role === "qa");
+  const checkboxes = executable.map((row, index) => `<label><input type="checkbox" value="${esc(row.agent_id)}" ${index === 0 ? "checked" : ""}> ${esc(row.agent_id)}</label>`).join("") || '<span class="warning">실행 가능한 참여 Agent 없음</span>';
+  ["quick-agent-targets", "task-agent-targets"].forEach(id => {
+    const node = document.getElementById(id); if (!node) return;
+    node.innerHTML = `<legend>수행 에이전트</legend>${checkboxes}`;
+    if (rememberedTargets[id].size) [...node.querySelectorAll("input")].forEach(input => { input.checked = rememberedTargets[id].has(input.value); });
+  });
+  const assigneeOptions = executable.map(row => `<option value="${esc(row.agent_id)}">${esc(row.agent_id)}</option>`).join("");
+  ["quick-assignee", "task-assignee"].forEach(id => setSelectOptions(id, '<option value="">담당자 선택</option>' + assigneeOptions, remembered[id]));
+  const reviewerOptions = reviewers.map(row => `<option value="${esc(row.principal_id)}">${esc(row.principal_id)}</option>`).join("");
+  ["quick-reviewer", "task-reviewer"].forEach(id => setSelectOptions(id, '<option value="">독립 검수자 선택</option>' + reviewerOptions, remembered[id]));
+  const addable = currentAgentCatalog.filter(row => !currentParticipants.some(item => item.principal_id === row.agent_id));
+  const participantSelect = document.getElementById("participant-principal");
+  if (participantSelect) {
+    const editing = participantSelect.dataset.editingPrincipal;
+    const editingRow = editing ? currentAgentCatalog.find(row => row.agent_id === editing) : null;
+    const choices = editingRow && !addable.some(row => row.agent_id === editing) ? [editingRow, ...addable] : addable;
+    setSelectOptions("participant-principal", choices.map(row => `<option value="${esc(row.agent_id)}">${esc(row.agent_id)}${row.execution_eligible ? " · 실행 가능" : " · 참여만 가능"}</option>`).join(""), editing || remembered["participant-principal"]);
+    participantSelect.disabled = Boolean(editing);
+  }
+  const messageSelect = document.getElementById("message-agent");
+  if (messageSelect) setSelectOptions("message-agent", currentParticipants.filter(row => row.active && row.can_comment).map(row => `<option>${esc(row.principal_id)}</option>`).join(""), remembered["message-agent"]);
+  const authorSelect = document.getElementById("timeline-author");
+  if (authorSelect) setSelectOptions("timeline-author", '<option value="">전체 작성자</option>' + currentParticipants.map(row => `<option>${esc(row.principal_id)}</option>`).join(""), remembered["timeline-author"]);
+  const note = document.getElementById("agent-candidate-note");
+  if (note) note.textContent = `OpenClaw 등록 ${currentAgentCatalog.length}명 · 현재 실행 가능 ${executable.length}명. 참여 등록은 승인·실행 권한을 자동 부여하지 않습니다.`;
+}
+
 function renderAudit(items) {
   document.getElementById("audit-list").innerHTML = items.map(row => `<div class="project"><strong>${esc(row.event_type)}</strong><div>${esc(row.actor_id)} → ${esc(row.target_type)} ${esc(row.target_id)}</div><small>${new Date(row.created_at * 1000).toLocaleString()} · ${esc(row.correlation_id)}</small></div>`).join("") || '<div class="empty">감사 기록 없음</div>';
 }
@@ -158,11 +473,13 @@ async function loadTimeline() {
   const params = new URLSearchParams();
   const filters = {message_type:"timeline-type", author_id:"timeline-author", delivery_status:"timeline-delivery"};
   Object.entries(filters).forEach(([key,id]) => {
-    const value = document.getElementById(id).value;
+    const control = document.getElementById(id); if (!control) return;
+    const value = control.value;
     if (value) params.set(key, value);
   });
   [["from_ts","timeline-from"],["to_ts","timeline-to"]].forEach(([key,id]) => {
-    const value = document.getElementById(id).value;
+    const control = document.getElementById(id); if (!control) return;
+    const value = control.value;
     if (value) params.set(key, String(Math.floor(new Date(value).getTime() / 1000)));
   });
   try {
@@ -176,7 +493,7 @@ async function loadTimeline() {
 }
 
 function resetTimelineFilters() {
-  ["timeline-type","timeline-author","timeline-delivery","timeline-from","timeline-to"].forEach(id => { document.getElementById(id).value = ""; });
+  ["timeline-type","timeline-author","timeline-delivery","timeline-from","timeline-to"].forEach(id => { const control = document.getElementById(id); if (control) control.value = ""; });
   loadTimeline();
 }
 
@@ -191,39 +508,57 @@ async function loadAudit() {
 async function load() {
   try {
     const projects = await get("/api/war-room/projects");
-    if (!selectedProjectId && projects.items[0]) selectedProjectId = projects.items[0].id;
-    if (selectedProjectId && !projects.items.some(row => row.id === selectedProjectId)) selectedProjectId = projects.items[0]?.id || null;
-    document.getElementById("projects").innerHTML = projects.items.map(row => `<button class="project ${row.id === selectedProjectId ? "active" : ""}" onclick="selectProject('${esc(row.id)}')"><strong>${esc(row.name)}</strong><div class="muted">${esc(row.status)} · 참여자 ${row.participant_count}</div></button>`).join("") || '<div class="empty">프로젝트 없음</div>';
+    currentProjects = projects.items || [];
+    const requestedProjectId = new URLSearchParams(window.location.search).get("project_id") || storedUiState().projectId;
+    if (!selectedProjectId && requestedProjectId && currentProjects.some(row => row.id === requestedProjectId)) selectedProjectId = requestedProjectId;
+    if (pinnedTaskId) {
+      pinnedLookupError = null;
+      try {
+        const exact = await get(`/api/war-room/tasks/${encodeURIComponent(pinnedTaskId)}`);
+        selectedProjectId = exact.task.project_id;
+        selectedTaskId = pinnedTaskId;
+        quickTaskId = pinnedTaskId;
+        if (!currentProjects.some(row => row.id === selectedProjectId)) {
+          const detail = await get(`/api/war-room/projects/${encodeURIComponent(selectedProjectId)}`);
+          currentProjects.unshift({...detail.project, participant_count:0, task_count:"-"});
+        }
+      } catch (error) {
+        pinnedLookupError = error.message;
+      }
+    }
+    if (!selectedProjectId && currentProjects[0]) selectedProjectId = currentProjects[0].id;
+    if (selectedProjectId && !currentProjects.some(row => row.id === selectedProjectId)) selectedProjectId = currentProjects[0]?.id || null;
+    document.getElementById("projects").innerHTML = currentProjects.map(row => `<button class="project ${row.id === selectedProjectId ? "active" : ""}" onclick="selectProject('${esc(row.id)}')"><strong>${esc(row.name)}</strong><div>${statusChip(row.status)}</div><small>참여자 ${row.participant_count} · 작업 ${row.task_count ?? "-"}</small></button>`).join("") || '<div class="empty">프로젝트 없음</div>';
   } catch (error) { fail("projects", error); return; }
   if (!selectedProjectId) return;
   try { applyAccess(await get(`/api/war-room/projects/${encodeURIComponent(selectedProjectId)}/access`)); }
   catch (error) { fail("audit-summary", error); return; }
   try {
     const base = `/api/war-room/projects/${encodeURIComponent(selectedProjectId)}`;
-    const [detail, participants, operations, baseline, tasks, audit, deliveries] = await Promise.all([
+    const [detail, participants, operations, baseline, tasks, audit, deliveries, candidates] = await Promise.all([
       get(base), get(`${base}/participants`), get(`${base}/operations`),
-      get(`${base}/manyfast-baseline`), get(`${base}/tasks`), get(`${base}/audit?limit=100`), get(`${base}/deliveries`),
+      get(`${base}/manyfast-baseline`), get(`${base}/tasks`), get(`${base}/audit?limit=100`), get(`${base}/deliveries`), get(`${base}/agent-candidates`),
     ]);
     currentProject = detail.project;
     currentParticipants = participants.items;
+    currentAgentCatalog = candidates.items || [];
     currentTasks = tasks.items;
+    currentDeliveries = deliveries.items || [];
     selectedDocumentVersion = baseline.version;
-    document.getElementById("project-title").textContent = currentProject.name;
     document.getElementById("project-edit-name").value = currentProject.name;
     document.getElementById("project-edit-status").value = currentProject.status;
     document.getElementById("baseline").textContent = `ManyFast ${baseline.version}`;
+    const driftBanner = document.getElementById("manyfast-drift-banner");
+    if (driftBanner) { driftBanner.hidden = !baseline.drift; driftBanner.textContent = baseline.drift ? `Manyfast 참고 버전 변경${baseline.drift_from ? `: ${baseline.drift_from} → ` : " → "}${baseline.version}. 기존 작업·원문·revision·승인은 그대로 보존됩니다.` : ""; }
     document.getElementById("task-document-version").value = baseline.version;
-    document.getElementById("stats").innerHTML = [["요구사항",baseline.counts.requirements],["기능",baseline.counts.features],["상세 기능",baseline.counts.specs]].map(row => `<div class="stat"><strong>${row[1]}</strong>${row[0]}</div>`).join("");
-    document.getElementById("gaps").innerHTML = baseline.known_gaps.map(value => `<div class="placeholder gap">보완 설계: ${esc(value)}</div>`).join("");
-    const roles = Object.fromEntries(currentParticipants.map(row => [row.principal_id,row.role]));
-    document.getElementById("agents").innerHTML = operations.agents.map(row => {
-      const latest = row.latest ? esc(row.latest.status) : "최근 세션 없음";
-      return `<div class="agent"><div class="agent-head"><strong>${esc(row.agent_id)}</strong><span class="status">${esc(row.state)}</span></div><div>${esc(roles[row.agent_id] || "participant")} · 세션 ${row.session_count}</div><small>${latest}</small></div>`;
-    }).join("");
-    renderTasks(); renderParticipants(); renderAudit(audit.items); applyAccess();
-    renderQuickDeliveries(deliveries.items);
-    document.getElementById("delivery-cards").innerHTML = deliveries.items.map(row => `<div class="project"><strong>${esc(row.agent_id)} · ${esc(row.status)}</strong><small>session/run ${esc(row.run_id || "-")} · retry ${row.attempt_count}/${row.max_attempts} · ${esc(row.error_code || "정상")}</small><div>${esc(row.response_message_id || "응답 대기")}</div>${demoMode && ["failed","timed_out"].includes(row.status) ? `<button onclick="retryDemoDelivery('${esc(row.id)}')">재시도</button>` : ""}</div>`).join("") || '<div class="empty">delivery 없음</div>';
-    document.getElementById("stop-ack-delivery").innerHTML = '<option value="">현재 중지 cycle delivery 선택</option>' + deliveries.items.filter(row => row.status === "stopped" && row.stop_cycle_at === deliveries.stop_requested_at).map(row => `<option value="${esc(row.id)}">${esc(row.agent_id)} · ${esc(row.id.slice(0,8))}</option>`).join("");
+    if (selectedTaskId && !currentTasks.some(task => task.id === selectedTaskId)) selectedTaskId = null;
+    if (pinnedTaskId && currentTasks.some(task => task.id === pinnedTaskId)) selectedTaskId = pinnedTaskId;
+    renderProjectDetail(); renderDashboard(currentProjects, operations);
+    renderTasks(); renderParticipants(); renderAgentControls(); renderAudit(audit.items); applyAccess();
+    renderQuickDeliveries(currentDeliveries);
+    document.getElementById("delivery-cards").innerHTML = currentDeliveries.map(row => `<div class="project"><strong>${esc(row.agent_id)} · ${statusChip(row.error_class === "system_error" ? "system_error" : row.status)}</strong><small>run ${esc(row.run_id || "-")} · source ${esc(row.message_id || "-")} · response ${esc(row.response_message_id || "-")}</small><small>retry ${row.retry_count || row.attempt_count || 0}/${row.max_attempts} · ${esc(row.error_code || "정상")}</small>${row.error_class === "system_error" && ["failed","timed_out"].includes(row.status) ? `<button data-permission="execute" onclick="retryDelivery('${esc(row.id)}')">수동 재전송</button>` : ""}</div>`).join("") || '<div class="empty">delivery 없음</div>';
+    document.getElementById("stop-ack-delivery").innerHTML = '<option value="">현재 중지 cycle delivery 선택</option>' + currentDeliveries.filter(row => row.status === "stopped" && row.stop_cycle_at === deliveries.stop_requested_at).map(row => `<option value="${esc(row.id)}">${esc(row.agent_id)} · ${esc(row.id.slice(0,8))}</option>`).join("");
+    renderTaskDetail(); renderReview(); applyAccess(); updateLocation();
     await loadTimeline();
   } catch (error) { fail("tasks", error); }
 }
@@ -236,7 +571,9 @@ function showProjectForm() {
 
 function selectProject(id) {
   selectedProjectId = id;
+  selectedTaskId = null; quickTaskId = null; pinnedTaskId = null;
   currentProject = null; currentParticipants = []; currentTasks = [];
+  updateLocation({push:true});
   load();
 }
 
@@ -248,9 +585,14 @@ function syncParticipantFlags() {
 function editParticipant(principal) {
   const row = currentParticipants.find(item => item.principal_id === principal);
   if (!row) return;
-  document.getElementById("participant-principal").value = row.principal_id;
+  const principalSelect = document.getElementById("participant-principal");
+  principalSelect.dataset.editingPrincipal = row.principal_id;
+  principalSelect.innerHTML = `<option value="${esc(row.principal_id)}">${esc(row.principal_id)}</option>`;
+  principalSelect.value = row.principal_id;
+  principalSelect.disabled = true;
   document.getElementById("participant-role").value = row.role;
   ["read","comment","approve","execute"].forEach(name => { document.getElementById(`participant-${name}`).checked = Boolean(row[`can_${name}`]); });
+  document.getElementById("project-management-result").textContent = `${row.principal_id} 수정 모드`;
 }
 
 async function setParticipantActive(principal, active) {
@@ -270,76 +612,77 @@ async function archiveProject() {
 
 function selectApprovalTask(id) {
   document.getElementById("approval-task").value = id;
-  document.getElementById("approval-flow").scrollIntoView({behavior:"smooth",block:"center"});
+  openTask(id, "task");
 }
 
 async function approveSelectedTask() {
   const out = document.getElementById("approval-result");
-  try {
-    const task = selectedTask("approval-task");
+  try { await withMutation(`approve:${document.getElementById("approval-task").value}`, "approval-result", async () => {
+    const task = await requireFreshTask(document.getElementById("approval-task").value, ["awaiting_approval"]);
     const expires_at = Math.floor(Date.now() / 1000) + Number(document.getElementById("approval-expiry").value);
     const result = await post(`/api/war-room/tasks/${task.id}/approvals`, {decision:"approved",expires_at});
     out.textContent = `승인 완료 · ${result.approval_id.slice(0,8)}`; await load();
-  } catch (error) { out.textContent = error.message; }
+  }); } catch (_) { /* withMutation reports the exact failure */ }
 }
 
 async function rejectSelectedTask() {
   const out = document.getElementById("approval-result");
-  try { const task = selectedTask("approval-task"); await post(`/api/war-room/tasks/${task.id}/approvals`, {decision:"rejected"}); out.textContent = "거절 완료"; await load(); }
-  catch (error) { out.textContent = error.message; }
+  try { await withMutation(`reject:${document.getElementById("approval-task").value}`, "approval-result", async () => { const task = await requireFreshTask(document.getElementById("approval-task").value, ["awaiting_approval"]); await post(`/api/war-room/tasks/${task.id}/approvals`, {decision:"rejected"}); out.textContent = "거절 완료"; await load(); }); }
+  catch (_) { /* reported */ }
 }
 
 async function deliverTask(id) {
   const out = document.getElementById("approval-result");
-  try {
-    const task = taskById(id);
+  try { await withMutation(`deliver:${id}`, "approval-result", async () => {
+    const task = await requireFreshTask(id, ["running"]);
     if (!task || !task.source_message_id) throw new Error("연결된 지시가 없습니다");
+    if (currentDeliveries.some(row => row.task_id === task.id && Number(row.task_revision || 1) === Number(task.revision || 1))) throw new Error("현재 revision에 이미 생성된 delivery가 있어 중복 전달하지 않습니다");
     const url = `/api/war-room/messages/${task.source_message_id}/deliveries`;
     const payload = {agent_ids: task.agent_ids || [task.assignee_agent_id], task_id: task.id};
     const result = await post(url, payload);
     out.textContent = `${payload.agent_ids.join(", ")} 전달 ${result.status}`; await load();
-  } catch (error) { out.textContent = error.message; }
+  }); } catch (_) { /* reported */ }
 }
 
 async function runSelectedTask() {
   const out = document.getElementById("approval-result");
-  try {
-    const task = selectedTask("approval-task");
+  try { await withMutation(`run:${document.getElementById("approval-task").value}`, "approval-result", async () => {
+    const task = await requireFreshTask(document.getElementById("approval-task").value, ["approved","running"]);
     if (task.status === "approved") await post(`/api/war-room/tasks/${task.id}/transition`, {status:"running"});
     else if (task.status !== "running") throw new Error("승인된 작업만 실행할 수 있습니다");
     await load();
     const refreshed = taskById(task.id);
     if (refreshed?.source_message_id) await deliverTask(refreshed.id);
     else out.textContent = "실행 시작됨 · 연결된 지시는 없음";
-  } catch (error) { out.textContent = error.message; }
+  }); } catch (_) { /* reported */ }
 }
 
 async function saveResult() {
   const out = document.getElementById("qa-result");
   try {
-    const task = selectedTask("qa-task");
+    const task = await requireFreshTask(document.getElementById("qa-task").value, ["running","qa"]);
     const body = document.getElementById("result-body").value.trim();
     if (!body) throw new Error("작업 결과를 입력하세요");
     const url = `/api/war-room/projects/${encodeURIComponent(selectedProjectId)}/messages`;
     await post(url, {message_type:"result",body:`[task ${task.id}] ${body}`,source_message_id:task.source_message_id || null});
-    document.getElementById("result-body").value = ""; out.textContent = "결과를 타임라인에 저장했습니다"; await load();
+    document.getElementById("result-body").value = ""; out.textContent = "결과를 타임라인에 저장했습니다"; await load(); await renderReview();
   } catch (error) { out.textContent = error.message; }
 }
 
 async function addEvidence() {
   const out = document.getElementById("qa-result");
   try {
-    const task = selectedTask("qa-task");
+    const task = await requireFreshTask(document.getElementById("qa-task").value, ["qa"]);
     const body = {uri:document.getElementById("evidence-uri").value.trim(),summary:document.getElementById("evidence-summary").value.trim(),evidence_type:document.getElementById("evidence-type").value};
     const result = await post(`/api/war-room/tasks/${task.id}/evidence`, body);
-    out.textContent = `증거 추가 · ${result.evidence_id.slice(0,8)}`; await loadAudit();
+    out.textContent = `증거 추가 · ${result.evidence_id.slice(0,8)}`; await load(); await renderReview();
   } catch (error) { out.textContent = error.message; }
 }
 
 async function submitQaVerdict() {
   const out = document.getElementById("qa-result");
   try {
-    const task = selectedTask("qa-task");
+    const task = await requireFreshTask(document.getElementById("qa-task").value, ["qa"]);
     const body = {verdict:document.getElementById("qa-verdict").value,evidence_profile:"required:test,artifact",qa_principal:projectAccess.principal_id,source:"agent_result"};
     const result = await post(`/api/war-room/tasks/${task.id}/qa-verdict`, body);
     out.textContent = `QA ${result.verdict} 저장 완료`; await load();
@@ -356,6 +699,43 @@ async function stopProject() {
     await load();
   }
   catch (error) { out.textContent = error.message; }
+}
+
+async function stopTask(id) {
+  const out = document.getElementById("stop-result");
+  try { await withMutation(`stop:${id}`, "stop-result", async () => {
+    const task = await requireFreshTask(id, ["approved","running","qa"]);
+    const result = await post(`/api/war-room/tasks/${encodeURIComponent(task.id)}/stop`, {});
+    out.textContent = result.confirmed
+      ? `작업 중지 확인 · ${task.id} · delivery ${(result.delivery_ids || []).length}건`
+      : `작업 중지 요청 · ${task.id} · ${result.status}`;
+    await load();
+  }); } catch (_) { /* reported */ }
+}
+
+async function stopSelectedTask() {
+  const id = document.getElementById("approval-task").value;
+  if (!id) { document.getElementById("stop-result").textContent = "중지할 작업을 선택하세요"; return; }
+  await stopTask(id);
+}
+
+async function prepareTaskForReapproval(id) {
+  const out = document.getElementById("approval-result");
+  try { await withMutation(`reapproval:${id}`, "approval-result", async () => {
+    const task = await requireFreshTask(id, ["rework_required","stopped","stop_unconfirmed"]);
+    const result = await post(`/api/war-room/tasks/${encodeURIComponent(task.id)}/transition`, {
+      status:"awaiting_approval",
+      deadline_at:Math.floor(Date.now()/1000)+1800,
+    });
+    out.textContent = `재승인 준비 완료 · ${result.status || "awaiting_approval"} · 새 승인이 필요합니다`;
+    await load();
+  }); } catch (_) { /* reported */ }
+}
+
+async function prepareSelectedTaskForReapproval() {
+  const id = document.getElementById("approval-task").value;
+  if (!id) { document.getElementById("approval-result").textContent = "재승인할 작업을 선택하세요"; return; }
+  await prepareTaskForReapproval(id);
 }
 
 async function acknowledgeStop() {
@@ -386,81 +766,68 @@ document.getElementById("task-form").addEventListener("submit", async event => {
   event.preventDefault(); const out = document.getElementById("task-result");
   try {
     const agent_ids=[...document.querySelectorAll('#task-agent-targets input:checked')].map(input=>input.value); const assignee_agent_id=document.getElementById("task-assignee").value; if(!agent_ids.includes(assignee_agent_id)) agent_ids.unshift(assignee_agent_id);
-    const body = {scope:document.getElementById("task-scope").value,assignee_agent_id,agent_ids,call_limit:Number(document.getElementById("task-call-limit").value),turn_limit:Number(document.getElementById("task-turn-limit").value),deadline_at:Math.floor(Date.now()/1000)+Number(document.getElementById("task-deadline").value),document_version:document.getElementById("task-document-version").value};
-    const result = await post(`/api/war-room/projects/${encodeURIComponent(selectedProjectId)}/tasks`, body);
-    out.textContent = `생성됨 ${result.task_id.slice(0,8)}`; document.getElementById("task-scope").value = ""; await load();
+    const instruction = document.getElementById("task-scope").value;
+    const body = {instruction,scope:instruction,assignee_agent_id,reviewer_agent_id:document.getElementById("task-reviewer").value,agent_ids,execution_mode:"FAST_GATEWAY",call_limit:Number(document.getElementById("task-call-limit").value),turn_limit:Number(document.getElementById("task-turn-limit").value),deadline_at:Math.floor(Date.now()/1000)+Number(document.getElementById("task-deadline").value),document_version:document.getElementById("task-document-version").value};
+    const result = await post(`/api/war-room/projects/${encodeURIComponent(selectedProjectId)}/prepare`, body);
+    out.textContent = `승인 요청 준비됨 ${result.task_id.slice(0,8)} · 아직 Agent를 호출하지 않았습니다`; document.getElementById("task-scope").value = ""; selectedTaskId = result.task_id; await load();
   } catch (error) { out.textContent = error.message; }
-});
-
-document.getElementById("quick-execution-mode").addEventListener("change", event => {
-  document.getElementById("command-center-panel").hidden = event.target.value !== "command_center";
-});
-
-document.getElementById("command-center-dispatch").addEventListener("click", async () => {
-  const button = document.getElementById("command-center-dispatch");
-  const out = document.getElementById("command-center-status");
-  try {
-    const task = window.commandCenterTask;
-    if (!task) throw new Error("Command Center task가 없습니다");
-    button.disabled = true; out.textContent = "명시적 dispatch 중…";
-    const result = await post(`/api/war-room/command-center/tasks/${encodeURIComponent(task.task_id)}/dispatch`, {});
-    out.textContent = `Dispatch 완료 · ${result.run_status || result.status || "accepted"}`;
-    const [status, summary] = await Promise.all([
-      get(`/api/war-room/command-center/${encodeURIComponent(task.war_project_id)}/tasks/${encodeURIComponent(task.war_task_id)}`),
-      get(`/api/war-room/command-center/${encodeURIComponent(task.war_project_id)}/tasks/${encodeURIComponent(task.war_task_id)}/summary`),
-    ]);
-    out.textContent += ` · 상태 ${summary.overall || status.tasks?.[0]?.run_status || "확인됨"}`;
-  } catch (error) { button.disabled = false; out.textContent = `Command Center 실패 · ${error.message}`; }
 });
 
 document.getElementById("quick-task-form").addEventListener("submit", async event => {
   event.preventDefault();
   const out = document.getElementById("quick-result");
   try {
+    if (pinnedTaskId !== null) {
+      const task = taskById(pinnedTaskId);
+      if (!task) throw new Error(`고정 task를 찾을 수 없습니다: ${pinnedTaskId}`);
+      quickTaskId = task.id; selectedTaskId = task.id; openTask(task.id);
+      out.textContent = `기존 task ${task.id}를 선택했습니다. 새 task는 생성하지 않았습니다.`;
+      return;
+    }
     const instruction = document.getElementById("quick-instruction").value.trim();
-    const agent_ids = [...document.querySelectorAll('#quick-agent-targets input:checked')].map(input => input.value);
+    const assignee_agent_id = document.getElementById("quick-assignee").value;
+    const reviewer_agent_id = document.getElementById("quick-reviewer").value;
+    // Quick start is the one-worker path: the selected assignee is the only
+    // execution target; reviewer remains an independent QA principal.
+    const agent_ids = assignee_agent_id ? [assignee_agent_id] : [];
     if (!instruction) throw new Error("작업 내용을 입력하세요");
     if (!agent_ids.length) throw new Error("담당 에이전트를 한 명 이상 선택하세요");
     out.textContent = "작업을 준비하고 있습니다…";
-    if (document.getElementById("quick-execution-mode").value === "command_center") {
-      const result = await post("/api/war-room/command-center/submit", {
-        war_project_id: selectedProjectId,
-        war_task_id: `ui-${crypto.randomUUID()}`,
-        scope: instruction,
-        requested_agents: agent_ids,
-        assignee_agent_id: agent_ids[0],
-        workspace_id: "command-center",
-      });
-      const first = result.command_tasks?.[0];
-      if (!first) throw new Error("Command Center가 실행 후보를 반환하지 않았습니다");
-      window.commandCenterTask = { ...first, war_project_id: result.war_project_id, war_task_id: result.war_task_id };
-      const candidates = await get(`/api/war-room/command-center/${encodeURIComponent(result.war_project_id)}/tasks/${encodeURIComponent(result.war_task_id)}/candidates`);
-      document.getElementById("command-center-panel").hidden = false;
-      document.getElementById("command-center-dispatch").hidden = !candidates.candidates?.length;
-      document.getElementById("command-center-status").textContent = candidates.candidates?.length ? `Accepted · READY 후보 ${candidates.candidates.length}개` : "Accepted · READY 후보 없음";
-      out.textContent = "Command Center 작업이 접수되었습니다. 후보를 확인한 뒤 명시적으로 Dispatch하세요.";
-      return;
-    }
     const base = `/api/war-room/projects/${encodeURIComponent(selectedProjectId)}`;
     const task = await post(`${base}/prepare`, {
       instruction,
+      scope: instruction,
+      assignee_agent_id,
+      reviewer_agent_id,
+      execution_mode: "FAST_GATEWAY",
       agent_ids,
       deadline_at: Math.floor(Date.now() / 1000) + 1800,
       document_version: selectedDocumentVersion,
     });
     quickTaskId = task.task_id;
     document.getElementById("quick-instruction").value = "";
-    await post(`/api/war-room/tasks/${task.task_id}/approve-execute`, {expires_at:Math.floor(Date.now()/1000)+1800});
     await load();
-    out.textContent = `${agent_ids.join(", ")}에게 작업을 시작했습니다. 결과 검토 단계에서 충돌과 다음 행동을 확인하세요.`;
+    out.textContent = `승인 요청을 준비했습니다. Agent 호출 0건 · 대표 승인 후 한 번 실행됩니다.`;
   } catch (error) { out.textContent = `준비 실패: ${error.message}`; }
 });
 
+function ensureExecutionModeControls() {
+  [["quick-task-form", "quick-execution-mode", "빠른 시작 실행 모드"], ["task-form", "task-execution-mode", "작업 실행 모드"]].forEach(([formId, id, labelText]) => {
+    const form = document.getElementById(formId);
+    if (!form || document.getElementById(id)) return;
+    const label = document.createElement("label"); label.textContent = `${labelText} `;
+    const select = document.createElement("select"); select.id = id;
+    select.innerHTML = '<option value="FAST_GATEWAY">Fast Gateway · 공통 Core/Broker/Harness</option>';
+    select.disabled = true;
+    label.appendChild(select); form.insertBefore(label, form.firstChild);
+  });
+}
+
 async function quickApproveAndRun() {
   const out = document.getElementById("quick-result");
-  try {
-    const task = taskById(quickTaskId);
-    if (!task || !["awaiting_approval","running"].includes(task.status)) throw new Error("먼저 작업을 준비하세요");
+  const id = pinnedTaskId !== null ? pinnedTaskId : quickTaskId;
+  try { await withMutation(`quick-run:${id}`, "quick-result", async () => {
+    const task = await requireFreshTask(id, ["awaiting_approval","running"]);
     out.textContent = "승인하고 에이전트에게 전달하고 있습니다…";
     try {
       if (task.status === "awaiting_approval") await post(`/api/war-room/tasks/${task.id}/approve-execute`, {expires_at:Math.floor(Date.now()/1000)+1800});
@@ -474,26 +841,26 @@ async function quickApproveAndRun() {
     await load();
     out.textContent = "실행을 시작했습니다. 아래 결과 카드에서 진행 상태를 확인하세요.";
     if (demoMode) document.getElementById("quick-demo-process").hidden = false;
-  } catch (error) {
-    out.textContent = `실행 실패: ${error.message}`;
-  }
+  }); } catch (error) { out.textContent = `실행 실패: ${error.message}`; }
 }
 
 function quickOpenQa() {
-  const task = taskById(quickTaskId);
+  const task = taskById(pinnedTaskId !== null ? pinnedTaskId : quickTaskId);
   if (!task || task.status !== "qa") return;
   const area = document.getElementById("advanced-area");
   area.hidden = false;
   document.getElementById("qa-task").value = task.id;
+  navigateScreen("review");
   document.getElementById("qa-task").focus();
+  document.getElementById("task-review").scrollIntoView({behavior:"smooth",block:"center"});
   document.getElementById("results-qa").scrollIntoView({behavior:"smooth",block:"center"});
 }
 
 async function quickCompleteTask() {
   const out = document.getElementById("quick-result");
   try {
-    const task = taskById(quickTaskId);
-    if (!task || task.status !== "qa") throw new Error("QA 단계 작업이 없습니다");
+    const task = await requireFreshTask(pinnedTaskId !== null ? pinnedTaskId : quickTaskId, ["qa"]);
+    if (task.latest_qa_verdict?.verdict !== "PASS" || Number(task.evidence_count || 0) < 1) throw new Error("QA PASS와 필수 증거가 필요합니다");
     await post(`/api/war-room/tasks/${task.id}/representative-completion`, {decision:"approved"});
     await load(); out.textContent = "최종 완료 처리했습니다.";
   } catch (error) { out.textContent = `완료 실패: ${error.message}`; }
@@ -533,7 +900,10 @@ document.getElementById("participant-form").addEventListener("submit", async eve
     const suffix = exists ? `/participants/${encodeURIComponent(principal_id)}` : "/participants";
     const url = `/api/war-room/projects/${encodeURIComponent(selectedProjectId)}${suffix}`;
     await post(url, body, exists ? "PATCH" : "POST");
-    out.textContent = `${principal_id} 저장 완료`; await load();
+    out.textContent = `${principal_id} 저장 완료`;
+    const principalSelect = document.getElementById("participant-principal");
+    delete principalSelect.dataset.editingPrincipal; principalSelect.disabled = false;
+    await load();
   } catch (error) { out.textContent = error.message; }
 });
 
@@ -542,16 +912,46 @@ document.getElementById("message-form").addEventListener("submit", async event =
   try {
     const base = `/api/war-room/projects/${encodeURIComponent(selectedProjectId)}`;
     const taskId = document.getElementById("message-task").value;
-    if (!taskId) throw new Error("작업을 먼저 생성하고 선택하세요");
-    const result = await post(`${base}/instructions`, {task_id:taskId, body:document.getElementById("message-body").value});
-    out.textContent = `선택 작업에 지시 연결 · ${result.task_id.slice(0,8)} · 승인 후 실행하세요`;
+    const selectedAgent = document.getElementById("message-agent").value;
+    const messageType = document.getElementById("message-type").value;
+    if (messageType === "opinion") throw new Error("Agent 의견 실제 요청 기능은 미구현입니다. 기록만 생성하지 않습니다.");
+    const task = taskById(taskId);
+    const bodyText = document.getElementById("message-body").value;
+    const result = await post(`${base}/instructions`, {task_id:taskId, body:bodyText});
+    out.textContent = `연결 지시 기록 · ${(result.id || result.message_id).slice(0,8)}`;
     document.getElementById("message-body").value = "";
-    await load(); document.getElementById("approval-task").value = taskId;
+    await load(); if (taskId) document.getElementById("approval-task").value = taskId;
   } catch (error) { out.textContent = `지시·작업 생성 실패: ${error.message}`; }
 });
 
 async function bindDemoSession(){const agent=document.getElementById("demo-session-agent").value; await post(`/api/war-room/projects/${encodeURIComponent(selectedProjectId)}/participants/${agent}/test-session`,{session_key:document.getElementById("demo-session-key").value,session_id:document.getElementById("demo-session-id").value},"PUT"); await load();}
 async function processDemoQueue(){await post('/api/war-room/demo/process',{}); await load();}
 async function retryDemoDelivery(id){await post(`/api/war-room/deliveries/${id}/retry`,{}); await load();}
+window.addEventListener("popstate", () => {
+  const params = new URLSearchParams(window.location.search);
+  selectedProjectId = params.get("project_id");
+  selectedTaskId = params.get("task_id");
+  quickTaskId = selectedTaskId;
+  pinnedTaskId = selectedTaskId;
+  currentScreen = params.get("screen") || (selectedTaskId ? "task" : "dashboard");
+  navigateScreen(currentScreen, {push:false});
+  load();
+});
+
+document.getElementById("approval-task")?.addEventListener("change", event => {
+  if (event.target.value) openTask(event.target.value, "task");
+});
+document.getElementById("qa-task")?.addEventListener("change", event => {
+  if (event.target.value) openTask(event.target.value, "task");
+});
+
+const restoredUi = storedUiState();
+if (!selectedProjectId) selectedProjectId = new URLSearchParams(window.location.search).get("project_id") || restoredUi.projectId || null;
+if (!selectedTaskId) selectedTaskId = pinnedTaskId || restoredUi.taskId || null;
+currentScreen = new URLSearchParams(window.location.search).get("screen") || restoredUi.screen || (selectedTaskId ? "task" : "dashboard");
+if (document.getElementById("task-status-filter")) document.getElementById("task-status-filter").value = restoredUi.statusFilter || "";
+if (document.getElementById("task-search-filter")) document.getElementById("task-search-filter").value = restoredUi.searchFilter || "";
+navigateScreen(currentScreen, {push:false});
+ensureExecutionModeControls();
 get('/api/war-room/demo-mode').then(()=>{demoMode=true;document.getElementById('demo-controls').hidden=false;}).catch(()=>{}).finally(load);
-setInterval(() => { if (!document.querySelector("form:focus-within")) load(); }, 15000);
+setInterval(() => { if (!document.querySelector("form:focus-within") && mutationInFlight.size === 0) load(); }, 15000);
