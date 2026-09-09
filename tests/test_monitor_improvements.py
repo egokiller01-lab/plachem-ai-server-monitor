@@ -71,8 +71,9 @@ class MonitorImprovementTests(unittest.TestCase):
     def test_ui_exposes_all_gpu_rows_and_independent_connector_columns(self):
         html = (app.STATIC_DIR / "index.html").read_text(encoding="utf-8")
         self.assertIn("gpus.forEach", html)
-        self.assertIn("연결 설정 수정", html)
-        self.assertIn("최근 READ", html)
+        self.assertIn("연결 관리", html)
+        self.assertIn("최근 실제 성공", html)
+        self.assertIn("Provider 만료정보 등록 필요", html)
         self.assertIn("vram_headroom_gb", html)
 
     def test_no_unprotected_monitor_write_routes_are_added(self):

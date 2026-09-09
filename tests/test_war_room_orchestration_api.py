@@ -74,10 +74,17 @@ class WarRoomOrchestrationApiTests(unittest.TestCase):
         root = Path(self.temp.name)
         self.old = {key: os.environ.get(key) for key in (
             "PLACHEM_WAR_ROOM_DB", "OPENCLAW_HOME", "PLACHEM_WAR_ROOM_PRINCIPAL_TOKENS",
+            "PLACHEM_OPENCLAW_CONFIG", "PLACHEM_FAST_GATEWAY_AGENTS",
         )}
         os.environ["PLACHEM_WAR_ROOM_DB"] = str(root / "war-room.sqlite3")
         os.environ["OPENCLAW_HOME"] = str(root / "openclaw")
         os.environ["PLACHEM_WAR_ROOM_PRINCIPAL_TOKENS"] = '{"main":"main-token","ERPcoder":"coder-token"}'
+        openclaw = root / "openclaw.json"
+        gateway = root / "agents.json"
+        openclaw.write_text('{"agents":{"list":[{"id":"ERPcoder"},{"id":"ERPqa"}]}}', encoding="utf-8")
+        gateway.write_text('{"ERPcoder":{"enabled":true,"allowed":true,"capabilities":["safe-smoke"]},"ERPqa":{"enabled":true,"allowed":true,"capabilities":["safe-smoke"]}}', encoding="utf-8")
+        os.environ["PLACHEM_OPENCLAW_CONFIG"] = str(openclaw)
+        os.environ["PLACHEM_FAST_GATEWAY_AGENTS"] = str(gateway)
         import war_room
         import war_room_actions
         import fast_gateway_service

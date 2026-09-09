@@ -33,6 +33,24 @@ class FastGatewayWarRoomAdapter:
         return agent_id.casefold()
 
     def deliver(self, *, delivery_id: str, agent_id: str, instruction_id: str, body: str) -> DeliveryReceipt:
+        # Compose from the immutable stored original and grounding packet at
+        # the final adapter boundary.  This keeps storage/display lossless and
+        # prevents a caller-supplied replacement body from changing the
+        # Broker-authorized task digest.
+        with sqlite3.connect(self.db_path) as con:
+            row = con.execute(
+                """SELECT m.body,t.execution_mode,g.packet_json
+                   FROM war_deliveries d
+                   JOIN war_messages m ON m.id=d.message_id
+                   JOIN war_tasks t ON t.source_message_id=m.id
+                   JOIN war_grounding_packets g ON g.task_id=t.id
+                   WHERE d.id=? AND m.id=? AND lower(d.agent_id)=lower(?)""",
+                (delivery_id, instruction_id, agent_id),
+            ).fetchone()
+        if row is None:
+            return DeliveryReceipt(delivery_id, "failed", error_code="FAST_GATEWAY_APPROVED_SOURCE_MISSING")
+        from war_room_actions import _grounded_instruction
+        body = _grounded_instruction(row[0], json.loads(row[2]), row[1])
         record = self.engine.dispatch(
             agent_id=self._agent(agent_id), message=body, timeout_seconds=300.0,
             core_run_id=self.core_id(delivery_id), idempotency_key=delivery_id,
@@ -78,7 +96,9 @@ class FastGatewayWarRoomAdapter:
             return DeliveryReceipt(run_id, "stopped", run_id=run_id, error_code=record.get("cancel_reason") or "CORE_CANCELLED")
         if status in {CoreRunStatus.PASS.value, CoreRunStatus.FAIL.value, CoreRunStatus.BLOCKED.value, CoreRunStatus.TIMEOUT.value}:
             result = record.get("result")
-            body = json.dumps(result, ensure_ascii=False) if isinstance(result, dict) else None
+            body = record.get("raw_response")
+            if not isinstance(body, str) or not body.strip():
+                body = json.dumps(result, ensure_ascii=False) if isinstance(result, dict) else None
             return DeliveryReceipt(run_id, "responded" if status == CoreRunStatus.PASS.value else "failed", run_id=run_id, response_body=body, error_code=None if status == CoreRunStatus.PASS.value else record.get("reason") or status)
         return DeliveryReceipt(run_id, "failed", run_id=run_id, error_code="FAST_GATEWAY_STATUS_INVALID")
 
@@ -160,15 +180,20 @@ class FastGatewayWarRoomAdapter:
         record = self.engine.status(self.core_id(delivery_id))
         binding = record.get("openclaw_binding") or {}
         result = record.get("result") if isinstance(record.get("result"), dict) else {}
+        rejected = record.get("rejected_result") if isinstance(record.get("rejected_result"), dict) else {}
         return {
             "core_run_id": record.get("core_run_id"), "openclaw_run_id": binding.get("openclaw_run_id"),
             "agent_id": record.get("agent_id"), "session_key": binding.get("session_key"),
             "run_status": record.get("status"), "runtime_seconds": record.get("runtime_seconds"),
-            "result_summary": result.get("summary") or result.get("status") or None,
+            "result_summary": result.get("summary") or rejected.get("summary") or result.get("status") or rejected.get("status") or None,
             "result_json": json.dumps(record.get("result"), ensure_ascii=False) if record.get("result") is not None else None,
+            "raw_response": record.get("raw_response") if isinstance(record.get("raw_response"), str) else None,
+            "rejected_result_json": json.dumps(record.get("rejected_result"), ensure_ascii=False) if record.get("rejected_result") is not None else None,
+            "validation_error": record.get("reason") if record.get("rejected_result") is not None else None,
             "evidence_json": json.dumps(result.get("evidence"), ensure_ascii=False) if result.get("evidence") is not None else None,
             "artifacts_json": json.dumps(result.get("artifacts"), ensure_ascii=False) if result.get("artifacts") is not None else None,
-            "policy_status": record.get("policy_status"), "cancel_reason": record.get("cancel_reason"),
+            "policy_status": record.get("policy_status"),
+            "cancel_reason": record.get("cancel_reason") or record.get("reason"),
             "escalation_required": int(bool(record.get("escalation_required"))),
         }
 

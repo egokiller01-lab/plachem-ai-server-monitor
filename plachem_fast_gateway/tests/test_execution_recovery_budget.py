@@ -169,7 +169,7 @@ class ExecutionRecoveryBudgetTests(unittest.TestCase):
         self.dispatch()
         record = self.engine.wait("run-local", timeout_seconds=999)
         self.assertEqual("CANCELLED", record["status"])
-        self.assertEqual("LOCAL_LLM_RUNTIME_LIMIT", record["cancel_reason"])
+        self.assertEqual("EXECUTION_RUNTIME_LIMIT", record["cancel_reason"])
         self.assertLessEqual(record["runtime_seconds"], 300.0)
         self.assertEqual(["run-local"], self.adapter.cancel_calls)
 

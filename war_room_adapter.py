@@ -228,12 +228,10 @@ class OpenClawSessionAdapter:
             return DeliveryReceipt(delivery_id, "failed", error_code="openclaw_session_missing")
         session_key, session_id = session
         gateway_agent_id = agent_id.lower()
-        try:
-            import war_room
-            if agent_id not in war_room.ALLOWED_AGENT_IDS:
-                return DeliveryReceipt(delivery_id, "failed", session_id=session_id, error_code="openclaw_invalid_agent_id")
-        except ImportError:
-            pass
+        from war_room_agents import canonical_agent_id, load_agent_catalog
+        canonical = canonical_agent_id(agent_id)
+        if canonical is None or not load_agent_catalog()[canonical].execution_eligible:
+            return DeliveryReceipt(delivery_id, "failed", session_id=session_id, error_code="openclaw_invalid_agent_id")
         if not session_key.startswith(self._test_session_prefix(agent_id)):
             return DeliveryReceipt(delivery_id, "failed", session_id=session_id, error_code="openclaw_session_agent_mismatch")
         data, error = self._gateway("agent", {

@@ -926,6 +926,33 @@
     .auth-mobile-tabs { display: none; gap: 6px; overflow-x: auto; margin-bottom: 12px; padding-bottom: 3px; }
     .auth-mobile-tabs button { flex: 0 0 auto; padding: 7px 10px; border: 1px solid rgba(75,148,210,.25); border-radius: 7px; color: #aebed3; background: rgba(5,23,40,.82); font-size: 9px; }
     .auth-mobile-tabs button.active { color: var(--cyan); border-color: var(--cyan); }
+    .auth-one-page { display: block; min-height: 0; }
+    .auth-one-page .auth-main { padding: 22px; }
+    .auth-header-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+    .auth-header-actions button, .auth-detail-actions button { padding: 9px 12px; border: 1px solid rgba(32,217,246,.42); border-radius: 8px; color: #eafaff; background: rgba(7,35,58,.9); font: inherit; font-size: 10px; cursor: pointer; }
+    .auth-ops-grid { display: grid; grid-template-columns: minmax(0,1.05fr) minmax(330px,.95fr); gap: 12px; margin-bottom: 12px; }
+    .auth-queue { max-height: 315px; overflow: auto; padding: 8px; }
+    .auth-queue-item { display: grid; grid-template-columns: 120px 145px 1fr; align-items: center; gap: 10px; padding: 11px 10px; border-bottom: 1px solid rgba(154,179,214,.1); }
+    .auth-queue-item:last-child { border-bottom: 0; }
+    .auth-queue-item b { color: #eef8ff; font-size: 11px; text-transform: capitalize; }
+    .auth-queue-item span { color: var(--amber); font-size: 10px; font-weight: 750; }
+    .auth-queue-item.error span { color: var(--red); }
+    .auth-queue-item small { color: var(--muted); font-size: 9px; line-height: 1.45; }
+    .auth-detail-card { padding: 16px; }
+    .auth-detail-title { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 13px; }
+    .auth-detail-title span { color: var(--cyan); font-size: 9px; letter-spacing: .08em; text-transform: uppercase; }
+    .auth-detail-title h3 { margin: 4px 0 0; font-size: 19px; text-transform: capitalize; }
+    .auth-detail-card dl { display: grid; grid-template-columns: 105px minmax(0,1fr); gap: 8px 11px; margin: 0; font-size: 10px; }
+    .auth-detail-card dt { color: var(--muted); }
+    .auth-detail-card dd { margin: 0; color: #e8f2fd; line-height: 1.45; word-break: break-word; }
+    .auth-detail-actions { display: flex; gap: 8px; margin-top: 15px; }
+    .auth-detail-actions a { padding: 9px 12px; border-radius: 8px; color: #04131f; background: var(--cyan); font-size: 10px; font-weight: 800; text-decoration: none; }
+    .auth-live-services { margin-bottom: 12px; }
+    .auth-live-row { cursor: pointer; transition: background 140ms ease; }
+    .auth-live-row:hover, .auth-live-row.selected { background: rgba(34,211,238,.08); }
+    .auth-live-row.selected td:first-child { box-shadow: inset 3px 0 var(--cyan); }
+    .auth-live-row td small { display: block; max-width: 300px; margin-top: 5px; color: var(--muted); font-size: 8px; line-height: 1.4; }
+    .auth-lower-grid { display: grid; grid-template-columns: minmax(0,1.2fr) minmax(360px,.8fr); gap: 12px; margin-bottom: 12px; }
     body.auth-control-open #detail-view > .detail-header { display: none; }
     .wide { grid-column: 1 / -1; }
     .status-normal, .status-running, .status-ok { color: var(--green); }
@@ -952,6 +979,8 @@
       .auth-main { padding: 14px 10px 18px; }
       .auth-mobile-tabs { display: flex; }
       .auth-insights { grid-template-columns: 1fr; }
+      .auth-ops-grid, .auth-lower-grid { grid-template-columns: 1fr; }
+      .auth-queue-item { grid-template-columns: 95px 115px 1fr; }
     }
     @media (max-width: 480px) {
       .auth-instruments { grid-template-columns: 1fr; }
@@ -1633,6 +1662,7 @@
     };
     let currentDetail = null;
     let currentAuthView = "overview";
+    let currentAuthDashboardData = null;
 
     function escapeHtml(value) {
       return String(value ?? "Unknown").replace(/[&<>'"]/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;","\"":"&quot;"}[char]));
@@ -1661,7 +1691,27 @@
     function authDate(value) {
       if (!value) return "Never";
       const date = new Date(value);
-      return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString([], { month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+      return Number.isNaN(date.getTime()) ? String(value) : `${new Intl.DateTimeFormat("ko-KR", { timeZone: "Asia/Bangkok", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }).format(date)} ICT`;
+    }
+
+    function authRemaining(value) {
+      if (!value) return "남은 시간 미확인";
+      const milliseconds = new Date(value).getTime() - Date.now();
+      if (!Number.isFinite(milliseconds)) return "남은 시간 미확인";
+      const minutes = Math.floor(Math.abs(milliseconds) / 60000);
+      const text = minutes < 60 ? `${minutes}분` : `${Math.floor(minutes / 60)}시간 ${minutes % 60}분`;
+      return milliseconds < 0 ? `${text} 초과` : `${text} 남음`;
+    }
+
+    function authExpiryBadge(status) {
+      const labels = {normal:"정상", due_24h:"24시간 이내", due_2h:"2시간 이내", overdue:"기한 초과", permanent:"무기한", unknown:"미확인"};
+      const tone = status === "overdue" ? "error" : status === "due_24h" || status === "due_2h" ? "warning" : status === "normal" || status === "permanent" ? "healthy" : "unverified";
+      return authBadge(tone, labels[status] || "미확인");
+    }
+
+    function authShortId(value) {
+      const text = String(value || "미확인");
+      return text.length > 12 ? `${text.slice(0, 8)}…` : text;
     }
 
     function authBadge(state, label = null) {
@@ -1675,108 +1725,64 @@
       return `<article class="auth-dial-card"><div class="auth-dial-title">${escapeHtml(title)}</div><div class="auth-dial" style="--dial-value:${safeValue};--dial-color:${color}"><div class="auth-dial-center"><span class="auth-dial-value">${shown}</span><span class="auth-dial-state">${escapeHtml(state)}</span></div></div><div class="auth-dial-foot">${escapeHtml(foot)}</div></article>`;
     }
 
-    function setAuthView(button, view) {
-      const dashboard = button.closest(".auth-dashboard");
-      if (!dashboard) return;
-      currentAuthView = view;
-      dashboard.querySelectorAll("[data-auth-view]").forEach(node => { node.hidden = node.dataset.authView !== view; });
-      dashboard.querySelectorAll("[data-auth-target]").forEach(node => node.classList.toggle("active", node.dataset.authTarget === view));
+    function setAuthView() { currentAuthView = "overview"; }
+
+    function authServiceDetail(item, consoleUrl) {
+      if (!item) return `<div class="auth-empty">서비스를 선택하세요.</div>`;
+      const activity = item.last_verified_at
+        ? `${authDate(item.last_verified_at)} · ${item.last_verified_action || "실사용"} · ${item.last_duration_ms || 0} ms`
+        : "실사용 기록을 만들기 위한 READ 점검 필요";
+      const expiry = item.credential_expires_at
+        ? `${authDate(item.credential_expires_at)} · ${authRemaining(item.credential_expires_at)}`
+        : item.lifecycle_detail;
+      return `<div class="auth-detail-card">
+        <div class="auth-detail-title"><div><span>선택한 인증</span><h3>${escapeHtml(item.service.replace(/_/g," "))}</h3></div>${authBadge(item.state, ({healthy:"정상",warning:"점검",error:"장애",attention:"조치 대기"}[item.state] || item.state))}</div>
+        <dl><dt>인증 방식</dt><dd>${escapeHtml(item.auth_type)}</dd><dt>수명주기</dt><dd>${escapeHtml(item.lifecycle_label)}</dd><dt>유효기간/정책</dt><dd>${escapeHtml(expiry)}</dd><dt>최근 실제 성공</dt><dd>${escapeHtml(activity)}</dd><dt>24시간 사용</dt><dd>${item.calls_24h}회 · 성공 ${item.successes_24h} · 인증실패 ${item.auth_failures_24h}</dd><dt>연결 변경</dt><dd>${escapeHtml(item.connection_last_modified_at ? authDate(item.connection_last_modified_at) : "변경 기록 없음")}</dd></dl>
+        <div class="auth-detail-actions"><a href="${escapeHtml(consoleUrl)}" target="_blank" rel="noopener noreferrer">연결 관리</a><button onclick="refreshDetail()">실데이터 새로고침</button></div>
+      </div>`;
     }
 
-    function renderAuthDashboard(dashboard, connector, serviceRows) {
+    function selectAuthService(button) {
+      const service = button.dataset.authService;
+      const dashboard = button.closest(".auth-dashboard");
+      const item = (currentAuthDashboardData?.services || []).find(row => row.service === service);
+      dashboard?.querySelectorAll("[data-auth-service]").forEach(row => row.classList.toggle("selected", row.dataset.authService === service));
+      const detail = dashboard?.querySelector("#auth-selected-detail");
+      if (detail) detail.innerHTML = authServiceDetail(item, currentAuthDashboardData?.console_url || "#");
+    }
+
+    function renderAuthDashboard(dashboard, connector) {
+      currentAuthDashboardData = dashboard;
       const summary = dashboard.summary || {};
       const services = dashboard.services || [];
-      const alerts = dashboard.alerts || [];
+      const runtimeTokens = dashboard.runtime_tokens || [];
+      const leaseReviews = dashboard.lease_reviews || [];
+      const actions = dashboard.action_queue || [];
       const activity = dashboard.recent_activity || [];
-      const serviceUsage = dashboard.service_usage_24h || [];
-      const callerUsage = dashboard.caller_usage_24h || [];
-      const insights = dashboard.operational_insights || [];
-      const authStateLabel = state => ({healthy:"정상", warning:"주의", error:"장애", unverified:"미검증", pass:"성공", fail:"실패"}[state] || state);
-      const authStateReasonLabel = reason => ({recent_read_ok:"최근 READ 성공", recent_read_failed:"최근 READ 실패", not_configured:"연결 미설정", no_run_record:"검증 기록 없음", stale_verification:"검증 24시간 초과"}[reason] || (reason ? String(reason) : "미확인"));
-      const authMetadataSourceLabel = source => ({"openconnector_admin_api+local_read_only_db":"OpenConnector Admin API + Read-only DB"}[source] || (source ? String(source).replace(/_/g, " ") : "미확인"));
-      const authMetadataCollectedAt = (services) => services && services.length ? services[0].metadata_collected_at : null;
-      const serviceTable = services.map(item => `<tr>
-        <td class="auth-service">${escapeHtml(item.service.replace(/_/g, " "))}</td>
-        <td>${escapeHtml(item.manager)}</td>
-        <td>${authBadge(item.state, authStateLabel(item.state))}</td>
-        <td>${escapeHtml(authDate(item.last_verified_at))}</td>
-        <td>${escapeHtml(item.last_duration_ms == null ? "—" : `${item.last_duration_ms} ms`)}</td>
-        <td class="auth-action">${escapeHtml(item.verification_action)}</td>
-      </tr>`).join("");
-      const alertBody = alerts.length ? `<div class="auth-table-wrap"><table class="auth-table"><thead><tr><th>등급</th><th>서비스</th><th>문제</th><th>필요 조치</th></tr></thead><tbody>${alerts.map(item => `<tr><td>${authBadge(item.severity === "error" ? "error" : "warning", item.severity === "error" ? "장애" : "주의")}</td><td class="auth-service">${escapeHtml(item.service.replace(/_/g, " "))}</td><td>${escapeHtml(item.message)}</td><td>${escapeHtml(item.action)}</td></tr>`).join("")}</tbody></table></div>` : `<div class="auth-empty">● 현재 인증 경보가 없습니다</div>`;
-      const activityTable = activity.map(item => `<tr>
-        <td>${escapeHtml(authDate(item.completed_at))}</td><td class="auth-service">${escapeHtml(item.service || "미확인")}</td>
-        <td class="auth-action">${escapeHtml(item.action || "미확인")}</td><td>${escapeHtml(item.caller || "미확인")}</td>
-        <td>${authBadge(item.ok ? "pass" : "fail", item.ok ? "성공" : "실패")}</td><td>${escapeHtml(item.duration_ms == null ? "—" : `${item.duration_ms} ms`)}</td>
-      </tr>`).join("");
-      const usageTable = serviceUsage.map((item, index) => `<tr><td>${index + 1}</td><td class="auth-service">${escapeHtml((item.service || "미확인").replace(/_/g, " "))}</td><td>${escapeHtml(item.runs)}</td><td>${escapeHtml(item.success_rate)}%</td><td>${escapeHtml(item.failures)}</td><td>${item.average_duration_ms == null ? "—" : `${escapeHtml(item.average_duration_ms)} ms`}</td><td>${item.max_duration_ms == null ? "—" : `${escapeHtml(item.max_duration_ms)} ms`}</td></tr>`).join("");
-      const callerTable = callerUsage.map((item, index) => `<tr><td>${index + 1}</td><td>${escapeHtml(item.caller)}</td><td>${escapeHtml(item.runs)}</td><td>${escapeHtml(item.success_rate)}%</td><td>${escapeHtml(item.failures)}</td><td>${item.average_duration_ms == null ? "—" : `${escapeHtml(item.average_duration_ms)} ms`}</td></tr>`).join("");
-      const credentialTable = services.map(item => `<tr><td class="auth-service">${escapeHtml(item.service.replace(/_/g, " "))}</td><td>${escapeHtml(item.auth_type || "미확인")}</td><td>${authBadge(item.state, authStateLabel(item.state))}</td><td>${escapeHtml(authStateReasonLabel(item.state_reason))}</td><td>${escapeHtml(item.token_expiry)}</td><td>${item.last_read_at ? escapeHtml(authDate(item.last_read_at)) : "미확인"}</td><td>${item.connection_last_modified_at ? escapeHtml(authDate(item.connection_last_modified_at)) : "미확인"}</td><td>${item.oauth_client_last_modified_at ? escapeHtml(authDate(item.oauth_client_last_modified_at)) : "미확인"}</td><td>${escapeHtml(item.verification_action)}</td></tr>`).join("");
-      const insightBody = insights.length ? `<div class="auth-insights">${insights.map(item => `<div class="auth-insight" style="--insight-color:${item.level === "warning" ? "var(--amber)" : item.level === "error" ? "var(--red)" : "var(--cyan)"}"><strong>${escapeHtml(item.title)}</strong><span>${escapeHtml(item.message)}</span></div>`).join("")}</div>` : "";
-      const runtimeState = connector.api_ok && connector.container_health === "healthy" ? "healthy" : connector.api_ok ? "warning" : "error";
-      const managed = Number(summary.managed || 0);
-      const healthy = Number(summary.healthy || 0);
-      const warning = Number(summary.warning || 0);
-      const unverified = Number(summary.unverified || 0);
-      const errors = Number(summary.error || 0);
-      const healthRate = managed ? healthy / managed * 100 : 0;
-      const verifiedRate = managed ? (managed - unverified) / managed * 100 : 0;
-      const successRate = summary.success_rate_24h;
-      const healthColor = errors ? "var(--red)" : warning || unverified ? "var(--amber)" : "var(--green)";
-      const successColor = successRate == null ? "#64748b" : successRate >= 95 ? "var(--green)" : successRate >= 80 ? "var(--amber)" : "var(--red)";
-      const verifiedColor = unverified ? "var(--amber)" : "var(--cyan)";
-      const verdict = errors ? `연결 장애 ${errors}건을 즉시 확인해야 합니다.` : warning || unverified ? `주의가 필요한 연결이 ${warning + unverified}건 있습니다.` : "모든 중앙 연결이 정상이며 최근 검증을 완료했습니다.";
-      return `<div class="auth-dashboard">
-        <aside class="auth-sidebar">
-          <nav class="auth-side-nav" aria-label="Authentication control sections">
-            <button class="auth-side-item active" data-auth-target="overview" onclick="setAuthView(this,'overview')"><i>⌂</i>Overview</button>
-            <button class="auth-side-item" data-auth-target="credentials" onclick="setAuthView(this,'credentials')"><i>◉</i>Credentials</button>
-            <button class="auth-side-item" data-auth-target="services" onclick="setAuthView(this,'services')"><i>⚙</i>Services</button>
-            <button class="auth-side-item" data-auth-target="agents" onclick="setAuthView(this,'agents')"><i>◆</i>Agents</button>
-            <button class="auth-side-item" data-auth-target="alerts" onclick="setAuthView(this,'alerts')"><i>♧</i>Alerts</button>
-            <button class="auth-side-item" data-auth-target="activity" onclick="setAuthView(this,'activity')"><i>▤</i>Activity</button>
-            <button class="auth-side-item" data-auth-target="permissions" onclick="setAuthView(this,'permissions')"><i>♢</i>Permissions</button>
-            <button class="auth-side-item" data-auth-target="settings" onclick="setAuthView(this,'settings')"><i>⚙</i>Settings</button>
-          </nav>
-          <div class="auth-side-foot">
-            <div class="auth-manager-pill"><span>◉ OpenConnector</span><b>LIVE</b></div>
-            <div class="auth-system-state">시스템 정상</div>
-            <small>최종 갱신 ${escapeHtml(authDate(dashboard.generated_at))}</small>
-          </div>
-        </aside>
-        <main class="auth-main">
-          <section class="auth-hero"><div><div class="auth-eyebrow">PLACHEM 보안 운영</div><h2>인증 통합 관제센터</h2><p>중앙 인증, 연결 상태와 READ 검증 활동을 실시간으로 확인합니다.</p></div><a class="auth-console-link" href="${escapeHtml(connector.console_url || dashboard.console_url)}" target="_blank" rel="noopener noreferrer">관리 콘솔 열기&nbsp; ›</a></section>
-          <nav class="auth-mobile-tabs">${["overview","credentials","services","agents","alerts","activity","permissions","settings"].map((view,index)=>`<button class="${index===0?"active":""}" data-auth-target="${view}" onclick="setAuthView(this,'${view}')">${view[0].toUpperCase()+view.slice(1)}</button>`).join("")}</nav>
-          <div class="auth-view" data-auth-view="overview">
-          ${insightBody}
-          <section class="auth-instruments">
-            ${authDial("연결 건강도", healthRate, errors ? "긴급" : warning || unverified ? "주의" : "정상", `전체 ${managed}개 중 ${healthy}개 정상`, healthColor)}
-            ${authDial("24시간 실행 성공률", successRate, successRate == null ? "표본 없음" : successRate >= 95 ? "안정" : successRate >= 80 ? "관찰" : "저하", `인증 실행 ${summary.runs_24h || 0}건 기준`, successColor)}
-            ${authDial("검증 완료율", verifiedRate, unverified ? "미완료" : "검증 완료", `전체 ${managed}개 중 ${managed - unverified}개 READ 결과 보유`, verifiedColor)}
-            <article class="auth-situation"><h3>현재 상황 요약</h3><p>중앙 인증 연결의 실시간 구성</p><div class="auth-state-list">
-              <div class="auth-state-row" style="--state-color:var(--green)"><i></i><span>정상</span><strong>${healthy}</strong></div>
-              <div class="auth-state-row" style="--state-color:var(--amber)"><i></i><span>주의</span><strong>${warning + unverified}</strong></div>
-              <div class="auth-state-row" style="--state-color:var(--red)"><i></i><span>장애</span><strong>${errors}</strong></div>
-              <div class="auth-state-row" style="--state-color:var(--cyan)"><i></i><span>전체 관리</span><strong>${managed}</strong></div>
-            </div><div class="auth-verdict" style="--verdict-color:${healthColor}">${escapeHtml(verdict)}</div></article>
-          </section>
-          <section class="auth-panel"><div class="auth-panel-head"><h3>연결 목록</h3><span>실제 연결 · 비밀값 미표시 · ${authBadge(runtimeState, connector.api_ok ? "온라인" : "오프라인")}</span></div><div class="auth-table-wrap"><table class="auth-table"><thead><tr><th>서비스</th><th>관리자</th><th>연결 가능/configured</th><th>상태</th><th>최근 READ 검증</th><th>최근 READ 성공</th><th>소요시간</th><th>검증 작업</th></tr></thead><tbody>${services.map(item => `<tr><td class="auth-service">${escapeHtml(item.service.replace(/_/g, " "))}</td><td>${escapeHtml(item.manager)}</td><td>${item.configured ? "예" : "아니오"}</td><td>${authBadge(item.state, authStateLabel(item.state))}<br><small>${escapeHtml(authStateReasonLabel(item.state_reason))}</small></td><td>${escapeHtml(authDate(item.last_verified_at))}</td><td>${escapeHtml(authDate(item.last_read_at))}</td><td>${escapeHtml(item.last_duration_ms == null ? "—" : `${item.last_duration_ms} ms`)}</td><td class="auth-action">${escapeHtml(item.verification_action)}</td></tr>`).join("")}</tbody></table></div></section>
-          <div class="auth-two-col">
-            <section class="auth-panel"><div class="auth-panel-head"><h3>경보 및 필요 조치</h3><span>${escapeHtml(alerts.length)}건 활성</span></div>${alertBody}</section>
-            <section class="auth-panel"><div class="auth-panel-head"><h3>실행 환경 상태</h3><span>OpenConnector 인프라</span></div>${kv([["API 상태", connector.api_ok ? "정상" : "실패"], ["응답시간", connector.response_ms == null ? "미확인" : `${connector.response_ms} ms`], ["컨테이너", connector.container_status || "미확인"], ["Docker 상태", connector.container_health || "미확인"], ["재시작 횟수", connector.restart_count ?? "미확인"]])}</section>
-          </div>
-          <section class="auth-panel" style="margin-top:12px"><div class="auth-panel-head"><h3>최근 인증 활동</h3><span>최근 실행 표본</span></div><div class="auth-table-wrap"><table class="auth-table"><thead><tr><th>완료시각</th><th>서비스</th><th>작업</th><th>호출자</th><th>결과</th><th>소요시간</th></tr></thead><tbody>${activityTable}</tbody></table></div></section>
-          <div class="auth-scope-note">ManyFast, Postiz SNS 채널과 Producer YouTube는 전용 인증 관리자를 사용합니다. ack/담당자/조치이력 쓰기와 토큰 만료일은 현재 미구현·Provider 미제공이며, 인증 없는 HTTP에 저장하지 않습니다.</div>
-          </div>
-          <div class="auth-view" data-auth-view="credentials" hidden><div class="auth-view-title"><div><h3>인증 수명주기</h3><p>유효기간 확인, 최근 검증과 갱신 준비 상태</p></div>${authBadge(summary.expiry_unknown ? "warning" : "healthy", `유효기간 미확인 ${summary.expiry_unknown || 0}건`)}</div><section class="auth-panel"><div class="auth-table-wrap"><table class="auth-table"><thead><tr><th>서비스</th><th>인증 유형</th><th>상태</th><th>상태 원인</th><th>유효기간 확인</th><th>마지막 READ</th><th>연결 설정 수정</th><th>OAuth Client 설정 수정</th><th>검증 작업</th></tr></thead><tbody>${credentialTable}</tbody></table></div></section><div class="auth-scope-note">메타데이터 출처: ${authMetadataSourceLabel(services[0] && services[0].metadata_source)} · 수집시각: ${authMetadataCollectedAt(services) ? escapeHtml(authDate(authMetadataCollectedAt(services))) : "미확인"}. 유효기간 미확인은 정상이 아니라 관제 공백입니다.</div></div>
-          <div class="auth-view" data-auth-view="services" hidden><div class="auth-view-title"><div><h3>서비스 사용 순위</h3><p>최근 24시간 · 인증 실행 최대 100건 표본</p></div><span>사용 서비스 ${serviceUsage.length}개</span></div><section class="auth-panel"><div class="auth-table-wrap"><table class="auth-table"><thead><tr><th>순위</th><th>서비스</th><th>실행</th><th>성공률</th><th>실패</th><th>평균</th><th>최대</th></tr></thead><tbody>${usageTable}</tbody></table></div></section></div>
-          <div class="auth-view" data-auth-view="agents" hidden><div class="auth-view-title"><div><h3>에이전트 및 호출자 사용 현황</h3><p>OpenConnector 실행 로그의 호출자 식별 정보</p></div></div><section class="auth-panel"><div class="auth-table-wrap"><table class="auth-table"><thead><tr><th>순위</th><th>호출자</th><th>실행</th><th>성공률</th><th>실패</th><th>평균</th></tr></thead><tbody>${callerTable}</tbody></table></div></section><div class="auth-scope-note">호출자가 “http”로만 표시되면 런타임에서 에이전트 식별정보를 아직 전달하지 않는 상태입니다. 추정한 에이전트 이름을 배정하지 않고 식별 공백을 그대로 표시합니다.</div></div>
-          <div class="auth-view" data-auth-view="alerts" hidden><div class="auth-view-title"><div><h3>경보 및 필요 조치</h3><p>현재 장애, 오래된 점검과 관제 공백</p></div>${authBadge(alerts.length ? "warning" : "healthy", `활성 ${alerts.length}건`)}</div>${insightBody}<section class="auth-panel">${alertBody}</section></div>
-          <div class="auth-view" data-auth-view="activity" hidden><div class="auth-view-title"><div><h3>인증 활동</h3><p>비밀값을 제외한 최근 실행 이력</p></div></div><section class="auth-panel"><div class="auth-table-wrap"><table class="auth-table"><thead><tr><th>완료시각</th><th>서비스</th><th>작업</th><th>호출자</th><th>결과</th><th>소요시간</th></tr></thead><tbody>${activityTable}</tbody></table></div></section></div>
-          <div class="auth-view" data-auth-view="permissions" hidden><div class="auth-view-title"><div><h3>권한 현황</h3><p>런타임 범위와 최소 권한 확인</p></div>${authBadge("warning","목록 연동 대기")}</div><section class="auth-panel"><div class="auth-empty" style="color:var(--amber)">OpenConnector가 아직 권한 대여 이벤트를 제공하지 않습니다. 현재 작업 사용량은 Activity에서 확인할 수 있으며, 검증 가능한 감사 데이터가 연결되기 전까지 WRITE 및 ADMIN 권한은 표시되지 않습니다.</div></section></div>
-          <div class="auth-view" data-auth-view="settings" hidden><div class="auth-view-title"><div><h3>관제 정책</h3><p>현재 적용 중인 읽기 전용 운영 기준</p></div></div><section class="auth-panel" style="padding:15px">${kv([["최신 검증","24시간 이내"],["주의","24시간 초과 또는 미검증"],["긴급","연결 누락 또는 최근 READ 실패"],["유효기간 경보","Provider 메타데이터 연동 대기"],["표본 범위","최근 100건 / 24시간"],["비밀값 표시","항상 비활성"]])}</section></div>
-        </main>
-      </div>`;
+      const selected = services.find(item => item.state === "error") || services.find(item => item.action_required) || services[0];
+      const stateLabel = state => ({healthy:"정상",warning:"점검",error:"장애",attention:"조치 대기"}[state] || state);
+      const lifecycleTone = item => item.lifecycle_kind === "provider_registration" ? "warning" : item.lifecycle_kind === "fixed_expiry" && item.action_required ? "error" : "healthy";
+      const serviceRows = services.map(item => `<tr class="auth-live-row ${selected?.service===item.service?"selected":""}" data-auth-service="${escapeHtml(item.service)}" onclick="selectAuthService(this)"><td class="auth-service">${escapeHtml(item.service.replace(/_/g," "))}</td><td>${authBadge(item.state,stateLabel(item.state))}<small>${item.last_activity_error ? escapeHtml(item.last_activity_error) : ""}</small></td><td>${authBadge(lifecycleTone(item),item.lifecycle_label)}${item.credential_expires_at ? `<small>${escapeHtml(authRemaining(item.credential_expires_at))}</small>` : `<small>${escapeHtml(item.lifecycle_detail)}</small>`}</td><td><strong>${item.calls_24h}</strong>회<small>${item.success_rate_24h == null ? "24시간 사용 없음" : `성공률 ${item.success_rate_24h}%`}</small></td><td>${item.last_verified_at ? escapeHtml(authDate(item.last_verified_at)) : "READ 점검 필요"}<small>${escapeHtml(item.last_verified_action || "")}</small></td></tr>`).join("");
+      const queue = actions.length ? actions.slice(0,8).map(item => `<div class="auth-queue-item ${item.severity}"><b>${escapeHtml(item.service.replace(/_/g," "))}</b><span>${escapeHtml(item.title)}</span><small>${escapeHtml(item.detail)}</small></div>`).join("") : `<div class="auth-empty">현재 필요한 인증 조치가 없습니다.</div>`;
+      const tokenRows = runtimeTokens.map(item => `<tr><td><b>${escapeHtml(item.agent)}</b></td><td>${item.has_current_grant ? authBadge("warning","현재 권한 있음") : authBadge("healthy","기본 대기")}</td><td>${item.allowed_action_count}</td><td>${item.allowed_connection_count}</td><td>${escapeHtml(item.last_used_at ? authDate(item.last_used_at) : "사용 기록 없음")}</td><td class="auth-action">${escapeHtml(item.allowed_actions.slice(0,3).join(", ") || "작업 승인 없음")}${item.allowed_action_count>3?` 외 ${item.allowed_action_count-3}개`:""}</td></tr>`).join("");
+      const activityRows = activity.slice(0,10).map(item => `<tr><td>${escapeHtml(authDate(item.completed_at))}</td><td class="auth-service">${escapeHtml((item.service||"서비스 없음").replace(/_/g," "))}</td><td class="auth-action">${escapeHtml(item.action||"작업 없음")}</td><td>${authBadge(item.ok?"pass":"fail",item.ok?"성공":(item.error_code||"실패"))}</td><td>${item.duration_ms==null?"—":`${escapeHtml(item.duration_ms)} ms`}</td></tr>`).join("");
+      const leaseRows = leaseReviews.slice(0,8).map(item => `<tr><td>${escapeHtml(item.token_name.replace("OpenClaw agent:",""))}</td><td>${escapeHtml(item.access_class)}</td><td>${item.action_count}</td><td>${escapeHtml(authDate(item.created_at))}</td><td>${authBadge(item.review_status==="overdue"?"warning":"healthy",item.review_status==="overdue"?"검토 필요":"검토기한 내")}</td></tr>`).join("");
+      const runtimeTone = connector.api_ok && connector.container_health === "healthy" ? "healthy" : "error";
+      return `<div class="auth-dashboard auth-one-page"><main class="auth-main">
+        <section class="auth-hero"><div><div class="auth-eyebrow">실데이터 기반 인증 운영</div><h2>인증 통합 관제센터</h2><p>실제 연결, 실행 성공, 수명주기와 Agent 권한을 한 화면에서 확인합니다.</p></div><div class="auth-header-actions">${authBadge(runtimeTone,connector.api_ok?"OpenConnector LIVE":"연결 오류")}<button onclick="refreshDetail()">새로고침</button><a class="auth-console-link" href="${escapeHtml(connector.console_url||dashboard.console_url)}" target="_blank" rel="noopener noreferrer">인증 관리</a></div></section>
+        <section class="auth-kpis">
+          <article class="auth-kpi info"><span>관리 인증</span><strong>${summary.managed||0}</strong><small>실제 credential 연결만 집계</small></article>
+          <article class="auth-kpi good"><span>최근 24시간 실사용</span><strong>${summary.runs_24h||0}</strong><small>성공률 ${summary.success_rate_24h==null?"표본 없음":`${summary.success_rate_24h}%`}</small></article>
+          <article class="auth-kpi warn"><span>필요 조치</span><strong>${summary.action_count||0}</strong><small>장애·첫 점검·만료정보 등록</small></article>
+          <article class="auth-kpi info"><span>자동 갱신 OAuth</span><strong>${summary.oauth_auto_refresh||0}</strong><small>Refresh Token 보유</small></article>
+          <article class="auth-kpi warn"><span>현재 권한 Agent</span><strong>${summary.current_grants||0}</strong><small>실제 허용 작업이 있는 Token</small></article>
+        </section>
+        <section class="auth-ops-grid"><article class="auth-panel"><div class="auth-panel-head"><h3>지금 처리할 일</h3><span>${actions.length}건 · 중요도순</span></div><div class="auth-queue">${queue}</div></article><article id="auth-selected-detail" class="auth-panel">${authServiceDetail(selected,connector.console_url||dashboard.console_url)}</article></section>
+        <section class="auth-panel auth-live-services"><div class="auth-panel-head"><h3>서비스 인증 현황</h3><span>행을 누르면 상세와 관리 경로 표시 · ${escapeHtml(authDate(dashboard.metadata_collected_at))}</span></div><div class="auth-table-wrap"><table class="auth-table"><thead><tr><th>서비스</th><th>현재 상태</th><th>유효기간 관리 방식</th><th>24시간 사용</th><th>최근 실제 성공</th></tr></thead><tbody>${serviceRows}</tbody></table></div></section>
+        <section class="auth-lower-grid"><article class="auth-panel"><div class="auth-panel-head"><h3>Agent 현재 권한</h3><span>${summary.runtime_tokens||0}개 Token · 권한 보유 ${summary.current_grants||0}</span></div><div class="auth-table-wrap"><table class="auth-table"><thead><tr><th>Agent</th><th>정책</th><th>작업</th><th>연결</th><th>마지막 사용</th><th>허용 범위</th></tr></thead><tbody>${tokenRows}</tbody></table></div></article><article class="auth-panel"><div class="auth-panel-head"><h3>권한 원장 검토</h3><span>만료가 아닌 수동 검토기한 · 초과 ${summary.lease_review_overdue||0}</span></div><div class="auth-table-wrap"><table class="auth-table"><thead><tr><th>Token</th><th>등급</th><th>작업</th><th>생성</th><th>상태</th></tr></thead><tbody>${leaseRows}</tbody></table></div></article></section>
+        <section class="auth-panel"><div class="auth-panel-head"><h3>최근 인증 사용 기록</h3><span>OpenConnector 최신 10건 · 입력 오류는 인증장애로 오판하지 않음</span></div><div class="auth-table-wrap"><table class="auth-table"><thead><tr><th>시각</th><th>서비스</th><th>실행 작업</th><th>결과</th><th>시간</th></tr></thead><tbody>${activityRows}</tbody></table></div></section>
+        <div class="auth-scope-note">고정 목록이나 임의 만료일을 사용하지 않습니다. OAuth는 실제 만료·자동갱신을 표시하고, 고정 만료일이 없는 API Key는 ‘폐기 전까지 유효’ 또는 ‘Provider 만료정보 등록 필요’로 관리합니다. 토큰 원문과 비밀값은 수집하지 않습니다.</div>
+      </main></div>`;
     }
 
     function renderDetail(type, data) {
@@ -1964,7 +1970,8 @@
     refresh();
     refreshErpmanager();
     refreshSecretary();
-    setInterval(() => { refresh(); refreshDetail(); refreshOpenclaw(); refreshOpenclawMain(); }, 2000);
+    setInterval(() => { refresh(); refreshOpenclaw(); refreshOpenclawMain(); }, 2000);
+    setInterval(refreshDetail, 15000);
     setInterval(refreshErpmanager, 10000);
     setInterval(refreshSecretary, 10000);
     refreshCodex();

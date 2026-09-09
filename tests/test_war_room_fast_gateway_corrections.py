@@ -103,21 +103,46 @@ class WarRoomFastGatewayCorrectionTests(unittest.TestCase):
         _persist_execution(con, snapshot=base, project_id="p", task_id="t", agent_id="ERPcoder", now=2)
         self.assertEqual(("[\"new-e\"]", "[\"new-a\"]"), con.execute("SELECT evidence_json,artifacts_json FROM war_execution_runs").fetchone())
 
+    def test_rejected_projection_preserves_raw_candidate_and_reason(self):
+        con = sqlite3.connect(":memory:")
+        con.execute("CREATE TABLE war_execution_runs (core_run_id TEXT PRIMARY KEY, war_project_id TEXT, war_task_id TEXT, agent_id TEXT, openclaw_run_id TEXT, session_key TEXT, run_status TEXT, runtime_seconds REAL, result_summary TEXT, result_json TEXT, evidence_json TEXT, artifacts_json TEXT, raw_response TEXT, rejected_result_json TEXT, validation_error TEXT, policy_status TEXT, cancel_reason TEXT, escalation_required INTEGER, created_at INTEGER, updated_at INTEGER)")
+        snapshot = {
+            "core_run_id":"c-rejected", "openclaw_run_id":"o-rejected", "session_key":"agent:x:main",
+            "run_status":"FAIL", "result_summary":"inspected", "result_json":None,
+            "evidence_json":None, "artifacts_json":None,
+            "raw_response":'{"status":"completed","artifacts":[{"path":"AGENTS.md"}]}',
+            "rejected_result_json":'{"status":"completed","artifacts":[{"path":"AGENTS.md"}]}',
+            "validation_error":"SCOPE_VALIDATION_FAILED:READ_ONLY_ARTIFACT_REUSE",
+            "policy_status":"NORMAL", "cancel_reason":"READ_ONLY_ARTIFACT_REUSE", "escalation_required":0,
+        }
+        _persist_execution(con, snapshot=snapshot, project_id="p", task_id="t", agent_id="ERPmanager", now=1)
+        row = con.execute("SELECT raw_response,rejected_result_json,validation_error FROM war_execution_runs").fetchone()
+        self.assertEqual((snapshot["raw_response"], snapshot["rejected_result_json"], snapshot["validation_error"]), row)
+
+    def test_fast_instruction_distinguishes_read_only_evidence_from_new_artifacts(self):
+        packet = {"worktree": "/safe", "branch": "main", "revision": "abc1234", "api_base": "/api", "db_label": "isolated", "forbidden": ["writes"], "completion_conditions": ["inspect"]}
+        message = _grounded_instruction("read-only inspect AGENTS.md", packet, "FAST_GATEWAY")
+        self.assertIn("Artifacts are outputs newly produced by this run", message)
+        self.assertIn("return an empty artifacts array", message)
+
     def test_fast_cancel_is_core_cancel_and_snapshot_is_cancelled(self):
         path = Path(tempfile.mktemp())
         with sqlite3.connect(path) as con:
             con.executescript("""
                 CREATE TABLE war_deliveries (id TEXT PRIMARY KEY, message_id TEXT, agent_id TEXT);
-                CREATE TABLE war_messages (id TEXT PRIMARY KEY, project_id TEXT);
-                CREATE TABLE war_tasks (id TEXT PRIMARY KEY, source_message_id TEXT);
+                CREATE TABLE war_messages (id TEXT PRIMARY KEY, project_id TEXT, body TEXT);
+                CREATE TABLE war_tasks (id TEXT PRIMARY KEY, source_message_id TEXT, execution_mode TEXT);
+                CREATE TABLE war_grounding_packets (task_id TEXT PRIMARY KEY, packet_json TEXT);
                 CREATE TABLE war_execution_runs (
                     core_run_id TEXT PRIMARY KEY, war_project_id TEXT, war_task_id TEXT,
                     agent_id TEXT, openclaw_run_id TEXT, session_key TEXT, run_status TEXT, updated_at INTEGER
                 );
             """)
             con.execute("INSERT INTO war_deliveries VALUES ('d1','m1','ERPcoder')")
-            con.execute("INSERT INTO war_messages VALUES ('m1','p1')")
-            con.execute("INSERT INTO war_tasks VALUES ('t1','m1')")
+            con.execute("INSERT INTO war_messages VALUES ('m1','p1','intent')")
+            con.execute("INSERT INTO war_tasks VALUES ('t1','m1','FAST_GATEWAY')")
+            packet = {"worktree":"/tmp/test","branch":"main","revision":"abcdef0","api_base":"/api","db_label":"test","forbidden":["live"],"completion_conditions":["done"],"required_evidence":["test"],"session_integrity_required":False}
+            con.execute("INSERT INTO war_grounding_packets VALUES ('t1',?)", (json.dumps(packet),))
             con.execute("INSERT INTO war_execution_runs VALUES ('war-d1','p1','t1','erpcoder','oc-1','agent:erpcoder:war-room-test','RUNNING',1)")
         core = FakeCore(); adapter = FastGatewayWarRoomAdapter(core, path, control_rpc=FakeControl())
         adapter.deliver(delivery_id="d1", agent_id="ERPcoder", instruction_id="m1", body="intent")

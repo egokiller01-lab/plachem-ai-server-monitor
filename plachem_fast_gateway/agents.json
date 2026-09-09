@@ -40,5 +40,47 @@
     "runtime_model_id": "openai/gpt-5.6-luna",
     "allowed_model_ids": ["openai/gpt-5.6-luna"],
     "allowed_policy_profiles": ["CLOUD_STANDARD"]
+  },
+  "main": {
+    "enabled": true,
+    "capabilities": ["coordination", "final-review"],
+    "runtime_model_id": "openai/gpt-5.6-sol",
+    "allowed_model_ids": ["openai/gpt-5.6-sol", "openai/gpt-5.6-luna"],
+    "allowed_policy_profiles": ["CLOUD_STANDARD"]
+  },
+  "cliper": {
+    "enabled": true,
+    "capabilities": ["paperclip", "publishing-coordination"],
+    "runtime_model_id": "openai/gpt-5.6-luna",
+    "allowed_model_ids": ["openai/gpt-5.6-luna", "openai/gpt-5.5"],
+    "allowed_policy_profiles": ["CLOUD_STANDARD"]
+  },
+  "producer": {
+    "enabled": true,
+    "capabilities": ["media-production"],
+    "runtime_model_id": "openai/gpt-5.6-luna",
+    "allowed_model_ids": ["openai/gpt-5.6-luna", "openai/gpt-5.5"],
+    "allowed_policy_profiles": ["CLOUD_STANDARD"]
+  },
+  "processdata": {
+    "enabled": true,
+    "capabilities": ["backend", "data"],
+    "runtime_model_id": "openai/gpt-5.6-luna",
+    "allowed_model_ids": ["openai/gpt-5.6-luna", "openai/gpt-5.5"],
+    "allowed_policy_profiles": ["CLOUD_STANDARD"]
+  },
+  "processsupport": {
+    "enabled": true,
+    "capabilities": ["support", "integration"],
+    "runtime_model_id": "openai/gpt-5.6-luna",
+    "allowed_model_ids": ["openai/gpt-5.6-luna"],
+    "allowed_policy_profiles": ["CLOUD_STANDARD"]
+  },
+  "erpqa": {
+    "enabled": true,
+    "capabilities": ["qa", "verification"],
+    "runtime_model_id": "openai/gpt-5.6-luna",
+    "allowed_model_ids": ["openai/gpt-5.6-luna", "openai/gpt-5.5"],
+    "allowed_policy_profiles": ["CLOUD_STANDARD"]
   }
 }

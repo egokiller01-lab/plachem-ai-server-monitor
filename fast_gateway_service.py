@@ -249,6 +249,7 @@ def create_core_engine(*, run_path: str | Path | None = None,
         result_recovery=recover_production_result_format,
         result_recovery_agent_ids=local_recovery_agents,
     )
+    from direct_gateway_authorization import CompositeGrantAuthorizer, DirectIngressGrantAuthorizer
     from war_room_authorization import WarRoomGrantAuthorizer
     import war_room
     broker = (create_production_auth_broker()
@@ -257,7 +258,10 @@ def create_core_engine(*, run_path: str | Path | None = None,
     return CoreEngine(
         RunRegistry(run_file), agent_registry, model_registry, gateway_adapter,
         auth_broker=broker, auth_required=True,
-        grant_authorizer=WarRoomGrantAuthorizer(war_room._db_path()),
+        grant_authorizer=CompositeGrantAuthorizer(
+            WarRoomGrantAuthorizer(war_room._db_path()),
+            DirectIngressGrantAuthorizer(),
+        ),
     )
 
 

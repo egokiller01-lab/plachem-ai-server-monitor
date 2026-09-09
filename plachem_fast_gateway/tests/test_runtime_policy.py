@@ -138,7 +138,7 @@ class RuntimePolicyTests(unittest.TestCase):
         self.assertEqual(1, first["retry_count"])
         final = engine.observe_runtime_event("run-1", {"kind": "retry", "reason_code": "SAME_CAUSE"})
         self.assertEqual("CANCELLED", final["status"])
-        self.assertEqual("LOCAL_LLM_RETRY_LIMIT", final["cancel_reason"])
+        self.assertEqual("RETRY_LIMIT", final["cancel_reason"])
         self.assertEqual(["run-1"], adapter.cancel_calls)
 
     def test_04a_model_specific_timer_does_not_override_neutral_deadline(self):
@@ -163,7 +163,7 @@ class RuntimePolicyTests(unittest.TestCase):
         engine.observe_runtime_event("run-1", {**event, "arguments": {"line": 1}})
         final = engine.observe_runtime_event("run-1", event)
         self.assertEqual("CANCELLED", final["status"])
-        self.assertEqual("LOCAL_LLM_LOOP_GUARD", final["cancel_reason"])
+        self.assertEqual("REPETITIVE_TOOL_CALL", final["cancel_reason"])
         self.assertEqual("LOOP_SUSPECTED", final["policy_events"][-1]["code"])
         self.assertEqual(["run-1"], adapter.cancel_calls)
 
@@ -177,7 +177,7 @@ class RuntimePolicyTests(unittest.TestCase):
         engine.observe_runtime_event("run-1", event)
         final = engine.observe_runtime_event("run-1", event)
         self.assertEqual("CANCELLED", final["status"])
-        self.assertEqual("LOCAL_LLM_LOOP_GUARD", final["cancel_reason"])
+        self.assertEqual("LOOP_DETECTED", final["cancel_reason"])
 
     def test_07_tool_budget_enforcement_is_unsupported(self):
         engine, _, _, _, _ = self.build(

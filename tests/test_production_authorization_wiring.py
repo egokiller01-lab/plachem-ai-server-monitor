@@ -57,15 +57,23 @@ class Transport:
 def production(tmp_path, monkeypatch):
     agents = tmp_path / "agents.json"
     agents.write_text(json.dumps({a: {"enabled": True, "capabilities": ["safe-smoke"]}
-                                 for a in ["erpcoder", "erpqa"]}))
+                                 for a in ["erpcoder", "erpmanager", "erpqa"]}))
+    openclaw = tmp_path / "openclaw.json"
+    openclaw.write_text(json.dumps({"agents": {"list": [
+        {"id": "erpcoder"}, {"id": "erpmanager"}, {"id": "erpqa"}
+    ]}}))
     settings = {
         "PLACHEM_FAST_GATEWAY_AGENTS": str(agents),
+        "PLACHEM_OPENCLAW_CONFIG": str(openclaw),
         "PLACHEM_FAST_GATEWAY_RUNS": str(tmp_path / "runs.jsonl"),
         "PLACHEM_FAST_GATEWAY_BINDINGS": str(tmp_path / "bindings.sqlite3"),
         "PLACHEM_WAR_ROOM_DB": str(tmp_path / "war-room.sqlite3"),
         "OPENCLAW_HOME": str(tmp_path / "openclaw"),
         "PLACHEM_WAR_ROOM_REAL_ADAPTER": "0",
         "PLACHEM_WAR_ROOM_PRINCIPAL_TOKENS": '{"main":"fixture-main"}',
+        "PLACHEM_WAR_ROOM_REPRESENTATIVE_PRINCIPALS": "human-representative",
+        "PLACHEM_WAR_ROOM_REVERSE_PROXY_SECRET": "fixture-proxy-secret",
+        "PLACHEM_WAR_ROOM_SESSION_SECRET": "fixture-session-secret",
         "PLACHEM_FAST_GATEWAY_ENABLED": "1",
         "PLACHEM_FAST_GATEWAY_ADMIN_SECRET": "fixture-admin",
         "PLACHEM_AUTH_BROKER_DB": str(tmp_path / "broker.sqlite3"),
@@ -93,23 +101,28 @@ def production(tmp_path, monkeypatch):
 
 def prepared(production, *, agents=None, approved=True, key="fixture"):
     root, client, _, _ = production
-    headers = {"X-War-Room-Actor": "main", "X-War-Room-Token": "fixture-main",
-               "Idempotency-Key": "prepare-" + key}
+    main_headers = {"X-War-Room-Actor": "main", "X-War-Room-Token": "fixture-main",
+                    "Idempotency-Key": "prepare-" + key}
+    representative_headers = {"X-Authenticated-Principal": "human-representative",
+                              "X-War-Room-Proxy-Secret": "fixture-proxy-secret",
+                              "Idempotency-Key": "approve-" + key}
     response = client.post("/api/war-room/projects/plachem-agent-war-room/prepare", json={
         "instruction": "Return the approved fixture response only.",
         "agent_ids": agents or ["ERPcoder"], "deadline_at": int(time.time()) + 900,
         "document_version": "baseline-2026-08-23", "execution_mode": "FAST_GATEWAY",
-    }, headers=headers)
+    }, headers=main_headers)
     assert response.status_code == 201, response.text
     item = response.json()
     if approved:
         response = client.post(f"/api/war-room/tasks/{item['task_id']}/approve-execute",
                                json={"expires_at": int(time.time()) + 600},
-                               headers={**headers, "Idempotency-Key": "approve-" + key})
+                               headers=representative_headers)
         assert response.status_code == 200, response.text
         item.update(response.json())
     with sqlite3.connect(root / "war-room.sqlite3") as db:
         item["body"] = db.execute("SELECT body FROM war_messages WHERE id=?", (item["message_id"],)).fetchone()[0]
+        packet = json.loads(db.execute("SELECT packet_json FROM war_grounding_packets WHERE task_id=?", (item["task_id"],)).fetchone()[0])
+        item["grounding_packet"] = packet
         if approved:
             # Simulate only the existing worker's durable lease claim.
             db.execute("UPDATE war_deliveries SET status='sent',claim_token='fixture-lease',claim_expires_at=?",
@@ -119,8 +132,9 @@ def prepared(production, *, agents=None, approved=True, key="fixture"):
 
 def send(item, delivery=None):
     delivery = delivery or item["deliveries"][0]
+    delivery_body = war_room_actions._grounded_instruction(item["body"], item["grounding_packet"], "FAST_GATEWAY")
     return service.get_persistent_harness().engine.dispatch(
-        agent_id=delivery["agent_id"].casefold(), message=item["body"], timeout_seconds=300,
+        agent_id=delivery["agent_id"].casefold(), message=delivery_body, timeout_seconds=300,
         core_run_id="war-" + delivery["delivery_id"], idempotency_key=delivery["delivery_id"],
     )
 
@@ -280,12 +294,12 @@ def test_manual_grant_lifecycle_and_no_secret_leak(production, state):
 @pytest.mark.parametrize("revoke_child", [False, True])
 def test_phase2_continuation_rechecks_authorization(production, revoke_child):
     root, _, owner, broker = production
-    item = prepared(production, agents=["ERPcoder", "ERPqa"])
+    item = prepared(production, agents=["ERPcoder", "ERPmanager"])
     orchestrator = war_room_actions._execution_orchestrator()
     compiled = orchestrator.compile_and_persist(
-        war_project_id="plachem-agent-war-room", war_task_id=item["task_id"], agents=["erpcoder", "erpqa"],
+        war_project_id="plachem-agent-war-room", war_task_id=item["task_id"], agents=["erpcoder", "erpmanager"],
         workflow={"erpcoder": {"depends_on": [], "message": item["body"], "timeout_seconds": 300},
-                  "erpqa": {"depends_on": ["erpcoder"], "message": item["body"], "timeout_seconds": 300}},
+                  "erpmanager": {"depends_on": ["erpcoder"], "message": item["body"], "timeout_seconds": 300}},
     )
     units = compiled["execution_units"]
     first = orchestrator.dispatch_execution(execution_id=units[0]["execution_id"], message=item["body"], timeout_seconds=300)
@@ -316,7 +330,9 @@ def test_worker_reserves_call_once_and_http_projects_same_run(production):
         db.execute("UPDATE war_deliveries SET status='queued'")
     runtime = WarRoomRuntime(adapter=object())
     result = runtime.tick(db_path=root / "war-room.sqlite3")
-    assert result[0]["status"] == "received"
+    with sqlite3.connect(root / "war-room.sqlite3") as db:
+        delivery_error = db.execute("SELECT status,error_code FROM war_deliveries").fetchone()
+    assert result[0]["status"] == "received", (result, delivery_error)
     run_id = "war-" + item["deliveries"][0]["delivery_id"]
     assert client.get(f"/api/fast-gateway/runs/{run_id}").json()["status"] == "RUNNING"
     assert len(client.get("/api/fast-gateway/runs").json()["runs"]) == 1
@@ -382,7 +398,7 @@ def test_phase2_cannot_self_approve_dispatch_input(production, mutation):
 def test_concurrent_admission_respects_existing_task_call_limit(production):
     from concurrent.futures import ThreadPoolExecutor
     root, _, owner, broker = production
-    item = prepared(production, agents=["ERPcoder", "ERPqa"])
+    item = prepared(production, agents=["ERPcoder", "ERPmanager"])
     with sqlite3.connect(root / "war-room.sqlite3") as db:
         db.execute("UPDATE war_tasks SET call_limit=1")
     with ThreadPoolExecutor(max_workers=2) as pool:

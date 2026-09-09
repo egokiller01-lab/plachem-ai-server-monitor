@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hmac
+import hashlib
 import os
 from pathlib import Path
 from typing import Any
@@ -10,9 +11,11 @@ from typing import Any
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
-from plachem_fast_gateway import CoreEngine
+from plachem_fast_gateway import CoreEngine, TaskRuntimeClass
 from plachem_fast_gateway.core_engine import RunRegistry
 from plachem_fast_gateway.auth_broker import AuthBrokerError
+from plachem_fast_gateway.auth_broker import execution_auth_scope
+from plachem_fast_gateway.runtime_policy import normalize_goal_contract
 from fast_gateway_service import get_persistent_harness
 
 
@@ -34,6 +37,7 @@ class DispatchRequest(BaseModel):
     action: str = Field(default="dispatch", min_length=1, max_length=128)
     workspace_id: str = Field(default="command-center", min_length=1, max_length=256)
     project_id: str = Field(default="fast-gateway", min_length=1, max_length=256)
+    task_runtime_class: TaskRuntimeClass = TaskRuntimeClass.STANDARD
 
 
 class GoalContractRequest(BaseModel):
@@ -50,6 +54,16 @@ class WaitRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     timeout_seconds: float = Field(gt=0, le=3600)
+
+
+class DirectDispatchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    agent_id: str = Field(min_length=1, max_length=128)
+    message: str = Field(min_length=1, max_length=100_000)
+    source_run_id: str = Field(min_length=8, max_length=256)
+    source_session_key: str = Field(min_length=8, max_length=512)
+    task_runtime_class: TaskRuntimeClass = TaskRuntimeClass.STANDARD
 
 
 def _present(record: dict[str, Any]) -> dict[str, Any]:
@@ -70,6 +84,7 @@ def _present(record: dict[str, Any]) -> dict[str, Any]:
             "format_recovery_attempts",
             "format_recovery_rejection",
             "runtime_class",
+            "task_class",
             "model_profile",
             "policy_profile",
             "max_runtime",
@@ -99,6 +114,34 @@ def _require_write(secret: str | None) -> None:
     expected = os.environ.get("PLACHEM_FAST_GATEWAY_ADMIN_SECRET", "")
     if not expected or not secret or not hmac.compare_digest(expected, secret):
         raise HTTPException(status_code=401, detail="AUTHENTICATION_REQUIRED")
+
+
+def _require_ingress(secret: str | None) -> None:
+    if os.environ.get("PLACHEM_FAST_GATEWAY_ENABLED") != "1":
+        raise HTTPException(status_code=503, detail="FAST_GATEWAY_DISABLED")
+    expected = os.environ.get("PLACHEM_FAST_GATEWAY_INGRESS_SECRET", "")
+    if not expected or not secret or not hmac.compare_digest(expected, secret):
+        raise HTTPException(status_code=401, detail="AUTHENTICATION_REQUIRED")
+
+
+def _direct_goal(agent_id: str) -> dict[str, Any]:
+    return {
+        "primary_objective": f"Fulfill the owner's direct request through {agent_id}",
+        "allowed_scope": [f"Exact direct request within the {agent_id} role and workspace"],
+        "forbidden_scope": ["Unrequested work", "Direct subagent spawning", "Fast Gateway bypass"],
+        "expected_result": "Verified result with a user-facing summary",
+        "completion_conditions": ["Requested work is completed or an exact blocker is reported"],
+    }
+
+
+def _direct_message(message: str) -> str:
+    contract = (
+        'Return exactly one raw JSON object with fields: '
+        '"status" (completed|failed|blocked), "summary" (complete user-facing answer), '
+        '"evidence" (non-empty array of {"type","detail"}), "artifacts" (array of {"path"}), '
+        'and "scope" ({"compliant":true,"violations":[]}). Do not use Markdown fences.'
+    )
+    return f"Owner direct request routed by Fast Gateway. Execute exactly this request:\n{message}\n\n{contract}"
 
 
 def _engine() -> CoreEngine:
@@ -146,6 +189,49 @@ def dispatch_run(
         return _present(_engine().dispatch(**payload))
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc).split(":", 1)[0]) from exc
+
+
+@router.post("/direct/runs/dispatch-and-wait")
+def direct_dispatch_and_wait(
+    request: DirectDispatchRequest,
+    x_fast_gateway_ingress_secret: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Run one owner-authenticated direct agent turn under Core protection."""
+    _require_ingress(x_fast_gateway_ingress_secret)
+    if request.agent_id == "main":
+        raise HTTPException(status_code=409, detail="MAIN_DIRECT_SESSION_NOT_DELEGATED")
+    seed = f"{request.agent_id}\0{request.source_session_key}\0{request.source_run_id}"
+    digest = hashlib.sha256(seed.encode()).hexdigest()[:32]
+    core_run_id = f"direct-{digest}"
+    idempotency_key = f"direct:{digest}"
+    goal = _direct_goal(request.agent_id)
+    message = _direct_message(request.message)
+    contract = normalize_goal_contract(goal)
+    scope = execution_auth_scope(
+        agent_id=request.agent_id,
+        message=message,
+        core_run_id=core_run_id,
+        idempotency_key=idempotency_key,
+        goal_contract=contract.as_dict(),
+    )
+    engine = _engine()
+    try:
+        engine.grant_authorizer.direct().register(core_run_id, scope)
+        record = engine.dispatch(
+            agent_id=request.agent_id,
+            message=message,
+            timeout_seconds=300,
+            core_run_id=core_run_id,
+            idempotency_key=idempotency_key,
+            goal_contract=goal,
+            task_runtime_class=request.task_runtime_class,
+        )
+        if record.get("status") not in {"PASS", "FAIL", "BLOCKED", "TIMEOUT", "CANCELLED"}:
+            record = engine.wait(core_run_id, timeout_seconds=305)
+        return _present(record)
+    except (AuthBrokerError, ValueError) as exc:
+        detail = exc.code if isinstance(exc, AuthBrokerError) else str(exc).split(":", 1)[0]
+        raise HTTPException(status_code=409, detail=detail) from exc
 
 
 @router.post("/runs/{core_run_id}/wait")

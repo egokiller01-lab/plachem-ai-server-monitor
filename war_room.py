@@ -12,6 +12,8 @@ import time
 from pathlib import Path
 from typing import Annotated, Any
 
+from war_room_agents import canonical_agent_id, catalog_items, load_agent_catalog
+
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 
 
@@ -57,6 +59,25 @@ OPAQUE_SECRET_PATTERN = re.compile(
 )
 MAX_PUBLIC_STRING_LENGTH = 4096
 _OPERATIONS_LAST_GOOD: dict[tuple[str, str], dict[str, Any]] = {}
+
+
+def representative_principals() -> set[str]:
+    """Return only dedicated, non-Agent representative identities.
+
+    A principal that resolves to an OpenClaw Agent is deliberately excluded,
+    even if it is accidentally included in the environment setting.  This
+    prevents an Agent token or legacy Agent session from becoming a human
+    representative credential.
+    """
+    configured = {
+        item.strip()
+        for item in os.environ.get("PLACHEM_WAR_ROOM_REPRESENTATIVE_PRINCIPALS", "").split(",")
+        if item.strip()
+    }
+    if (os.environ.get("PLACHEM_WAR_ROOM_TEST_ADAPTER") == "1"
+            and os.environ.get("PLACHEM_WAR_ROOM_TEST_ALLOW_AGENT_REPRESENTATIVE") == "1"):
+        return configured
+    return {value for value in configured if canonical_agent_id(value) is None}
 
 
 def _openclaw_home() -> Path:
@@ -165,6 +186,20 @@ def provision_database(path: str | Path | None = None) -> Path:
                 """,
                 (row_id, PROJECT_ID, agent_id, role, can_comment, can_approve, can_execute),
             )
+        for principal in representative_principals():
+            if canonical_agent_id(principal) is not None:
+                # An Agent representative is supported only by the explicit
+                # isolated-test compatibility switch and already has a row.
+                continue
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO war_participants
+                (id, project_id, principal_type, principal_id, role,
+                 can_read, can_comment, can_approve, can_execute)
+                VALUES (?, ?, 'human', ?, 'project_manager', 1, 1, 1, 1)
+                """,
+                (f"participant-human-{hashlib.sha256(principal.encode()).hexdigest()[:16]}", PROJECT_ID, principal),
+            )
         connection.execute(
             """
             INSERT OR IGNORE INTO war_messages
@@ -229,6 +264,25 @@ def _redact_string(value: str) -> str:
     return value
 
 
+def _sanitize_stored_string(value: str) -> str:
+    """Block secrets without truncating an already validated source string."""
+    if SENSITIVE_VALUE_PATTERN.search(value) or OPAQUE_SECRET_PATTERN.search(value):
+        return "***REDACTED***"
+    return value
+
+
+def _known_principal(value: str | None) -> bool:
+    if not value:
+        return False
+    if canonical_agent_id(value) is not None:
+        return True
+    try:
+        token_map = json.loads(os.environ.get("PLACHEM_WAR_ROOM_PRINCIPAL_TOKENS", "{}"))
+    except json.JSONDecodeError:
+        token_map = {}
+    return value in token_map or value in representative_principals()
+
+
 def _redact(value: Any) -> Any:
     if isinstance(value, dict):
         result: dict[str, Any] = {}
@@ -263,7 +317,7 @@ def _request_principal(request: Request | None, actor: str | None, token: str | 
         presented_proxy_secret = request.headers.get("X-War-Room-Proxy-Secret", "")
         if (
             proxy_secret
-            and proxy_principal in ALLOWED_AGENT_IDS
+            and _known_principal(proxy_principal)
             and hmac.compare_digest(proxy_secret, presented_proxy_secret)
         ):
             return proxy_principal
@@ -273,7 +327,7 @@ def _request_principal(request: Request | None, actor: str | None, token: str | 
                 principal, signature = cookie.split(".", 1)
                 secret = os.environ.get("PLACHEM_WAR_ROOM_SESSION_SECRET", "")
                 if secret and hmac.compare_digest(signature, hmac.new(secret.encode(), principal.encode(), hashlib.sha256).hexdigest()):
-                    return principal if principal in ALLOWED_AGENT_IDS else None
+                    return principal if _known_principal(principal) else None
             except ValueError:
                 pass
     supplied_token = token or (request.headers.get("X-War-Room-Token") if request is not None else None)
@@ -438,8 +492,8 @@ def list_projects(request: Request = None, status: str | None = None, q: str | N
             rows = connection.execute(
             """
             SELECT p.*,
-                   (SELECT COUNT(*) FROM war_participants x
-                    WHERE x.project_id = p.id AND x.principal_id IN ('main', 'ERPcoder', 'ERPmanager', 'ERPqa')) AS participant_count,
+                       (SELECT COUNT(*) FROM war_participants x
+                    WHERE x.project_id = p.id AND x.active=1) AS participant_count,
                    (SELECT MAX(created_at) FROM war_messages m WHERE m.project_id = p.id) AS last_activity,
                    (SELECT COUNT(*) FROM war_tasks t WHERE t.project_id = p.id) AS task_count,
                    (SELECT COUNT(*) FROM war_tasks t WHERE t.project_id = p.id AND t.status = 'running') AS running_task_count,
@@ -448,9 +502,10 @@ def list_projects(request: Request = None, status: str | None = None, q: str | N
                    (SELECT COUNT(*) FROM war_tasks t WHERE t.project_id = p.id AND t.status = 'awaiting_approval') AS approval_task_count,
                    (SELECT COUNT(*) FROM war_tasks t WHERE t.project_id = p.id AND t.status = 'completed') AS completed_task_count
             FROM war_projects p
-            WHERE p.id IN ('plachem-agent-war-room')
+            WHERE p.id = ?
             ORDER BY updated_at DESC
             """,
+            (PROJECT_ID,),
             ).fetchall()
     # FastAPI may expose Query marker defaults when this route function is
     # called directly by the read-model unit tests. Normalize those markers
@@ -475,12 +530,42 @@ def get_participants(project_id: str) -> dict[str, Any]:
         rows = connection.execute(
             """
             SELECT * FROM war_participants
-            WHERE project_id = ? AND principal_id IN ('main', 'ERPcoder', 'ERPmanager', 'ERPqa')
+            WHERE project_id = ?
             ORDER BY id
             """,
             (project_id,),
         ).fetchall()
     return {"mode": "readonly", "items": _redact([dict(row) for row in rows])}
+
+
+@router.get("/projects/{project_id}/agent-candidates")
+def get_agent_candidates(
+    project_id: str,
+    request: Request,
+    x_war_room_actor: str | None = Header(default=None),
+    x_war_room_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """List OpenClaw registrations joined to Gateway admission metadata."""
+    with _connect_readonly() as connection:
+        _project_or_404(connection, project_id)
+        principal = _request_principal(request, x_war_room_actor, x_war_room_token)
+        row = connection.execute(
+            "SELECT 1 FROM war_participants WHERE project_id=? AND principal_id=? AND active=1 AND can_read=1",
+            (project_id, principal),
+        ).fetchone()
+        if not principal:
+            raise HTTPException(401, "War Room authentication required")
+        if not row:
+            raise HTTPException(403, "War Room permission denied")
+        participants = {
+            item[0] for item in connection.execute(
+                "SELECT principal_id FROM war_participants WHERE project_id=?", (project_id,)
+            )
+        }
+    items = catalog_items()
+    for item in items:
+        item["participating"] = item["agent_id"] in participants
+    return {"mode": "readonly", "items": _redact(items)}
 
 
 @router.get("/projects/{project_id}/access")
@@ -511,9 +596,7 @@ def get_project_access(
     return {
         "mode": "readonly", "principal_id": row["principal_id"], "role": row["role"],
         "permissions": permissions,
-        "is_representative": row["principal_id"] in {
-            value.strip() for value in os.environ.get("PLACHEM_WAR_ROOM_REPRESENTATIVE_PRINCIPALS", "main").split(",") if value.strip()
-        },
+        "is_representative": row["principal_id"] in representative_principals(),
         "capabilities": {column: bool(row[column]) for column in ("can_read", "can_comment", "can_approve", "can_execute")},
     }
 
@@ -599,12 +682,11 @@ def get_operations(project_id: str) -> dict[str, Any]:
             SELECT project_id, agent_id, session_key, session_id, enabled
             FROM war_project_sessions
             WHERE project_id = ? AND enabled = 1
-              AND agent_id IN ('main', 'ERPcoder', 'ERPmanager', 'ERPqa')
             ORDER BY agent_id, session_key, session_id
             """,
             (project_id,),
         ).fetchall()
-    by_agent: dict[str, list[sqlite3.Row]] = {agent_id: [] for agent_id in ALLOWED_AGENT_IDS}
+    by_agent: dict[str, list[sqlite3.Row]] = {}
     for binding in bindings:
         by_agent.setdefault(str(binding["agent_id"]), []).append(binding)
     checked_at = int(time.time())

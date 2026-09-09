@@ -54,6 +54,7 @@ class WarRoomGrantAuthorizer:
                 source = con.execute(
                     """SELECT t.*,m.body AS instruction_body,m.project_id AS instruction_project,
                               d.agent_id AS dispatch_agent,d.deadline_at AS delivery_deadline,
+                              d.task_revision AS delivery_revision,
                               d.status AS delivery_status,d.claim_token,d.claim_expires_at
                        FROM war_deliveries d JOIN war_messages m ON m.id=d.message_id
                        JOIN war_tasks t ON t.source_message_id=m.id WHERE d.id=?""", (key,),
@@ -86,7 +87,21 @@ class WarRoomGrantAuthorizer:
                     or not source["document_version"]
                     or source["document_version"] != source["manyfast_version"]):
                 raise AuthBrokerError("BINDING_MISMATCH")
-            if envelope["instruction_sha256"] != hashlib.sha256(source["instruction_body"].encode()).hexdigest():
+            authorized_instruction = source["instruction_body"]
+            if run_id.startswith("war-"):
+                packet_row = con.execute(
+                    "SELECT packet_json FROM war_grounding_packets WHERE task_id=?",
+                    (task_id,),
+                ).fetchone()
+                if packet_row is None:
+                    raise AuthBrokerError("AUTH_REQUIRED")
+                from war_room_actions import _grounded_instruction
+                authorized_instruction = _grounded_instruction(
+                    source["instruction_body"],
+                    json.loads(packet_row[0]),
+                    source["execution_mode"],
+                )
+            if envelope["instruction_sha256"] != hashlib.sha256(authorized_instruction.encode()).hexdigest():
                 raise AuthBrokerError("TASK_DIGEST_MISMATCH")
             project = con.execute("SELECT status FROM war_projects WHERE id=?", (project_id,)).fetchone()
             control = con.execute("SELECT * FROM war_project_control WHERE project_id=?", (project_id,)).fetchone()
@@ -123,7 +138,13 @@ class WarRoomGrantAuthorizer:
             if (not approver or not approver["active"] or not approver["can_read"] or not approver["can_approve"]
                     or "approve" not in ROLE_PERMISSIONS.get(approver["role"], set())):
                 raise AuthBrokerError("AUTH_REQUIRED")
-            calls = con.execute("SELECT call_count,turn_count FROM war_task_calls WHERE task_id=?", (task_id,)).fetchone()
+            task_revision = int(source["revision"] or 1)
+            if run_id.startswith("war-") and int(source["delivery_revision"] or 1) != task_revision:
+                raise AuthBrokerError("BINDING_MISMATCH")
+            calls = con.execute(
+                "SELECT call_count,turn_count FROM war_task_calls WHERE task_id=? AND task_revision=?",
+                (task_id, task_revision),
+            ).fetchone()
             if ((calls["call_count"] if calls else 0) >= (source["call_limit"] or 0)
                     or (calls["turn_count"] if calls else 0) >= (source["turn_limit"] or 0)):
                 raise AuthBrokerError("AUTH_REQUIRED")
@@ -132,9 +153,9 @@ class WarRoomGrantAuthorizer:
             grant = broker.issue(authorized_scope, ttl_seconds=ttl, created_by=approval["approver_id"])
             yield authorized_scope, grant.token
             con.execute(
-                """INSERT INTO war_task_calls(task_id,call_count,turn_count,updated_at) VALUES (?,1,0,?)
-                   ON CONFLICT(task_id) DO UPDATE SET call_count=call_count+1,updated_at=excluded.updated_at""",
-                (task_id, now),
+                """INSERT INTO war_task_calls(task_id,task_revision,call_count,turn_count,updated_at) VALUES (?,?,1,0,?)
+                   ON CONFLICT(task_id,task_revision) DO UPDATE SET call_count=call_count+1,updated_at=excluded.updated_at""",
+                (task_id, task_revision, now),
             )
             con.commit()
         except sqlite3.Error as exc:

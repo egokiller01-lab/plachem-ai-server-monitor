@@ -120,7 +120,7 @@ def test_retry_limit_is_independent_of_record_model(running, timers, case):
     assert first["status"] == "RUNNING"
     second = engine.observe_runtime_event("run-1", {"kind": "retry"})
     assert second["status"] == "CANCELLED"
-    assert second["cancel_reason"] == "LOCAL_LLM_RETRY_LIMIT"
+    assert second["cancel_reason"] == "RETRY_LIMIT"
     assert adapter.cancelled == ["run-1"]
     assert len(timers) == 1  # Events must not reset the original deadline.
     assert timers[0].seconds == 240.0
@@ -144,7 +144,7 @@ def test_poll_uses_original_server_deadline(running, timers, case, elapsed, expe
     if expected == "RUNNING":
         assert adapter.cancelled == []
     else:
-        assert result["cancel_reason"] == "LOCAL_LLM_RUNTIME_LIMIT"
+        assert result["cancel_reason"] == "EXECUTION_RUNTIME_LIMIT"
 
 
 @pytest.mark.parametrize("case", ["legacy-local", "legacy-cloud", "__neutral__"])
@@ -156,7 +156,7 @@ def test_deadline_callback_preserves_reserved_result_collection(running, case):
     exhausted = next(e for e in result["policy_events"] if e["code"] == "EXECUTION_BUDGET_EXHAUSTED")
     assert exhausted["details"] == {"execution_budget": 240.0, "finalization_recovery_budget": 60.0}
     assert adapter.waits == [("run-1", 10.0)]
-    assert result["cancel_reason"] == "LOCAL_LLM_RUNTIME_LIMIT"
+    assert result["cancel_reason"] == "EXECUTION_RUNTIME_LIMIT"
     assert adapter.cancelled == ["run-1"]
 
 
@@ -168,7 +168,7 @@ def test_trusted_no_progress_guard_uses_server_threshold(running, case):
         assert engine.observe_runtime_event("run-1", event)["status"] == "RUNNING"
     result = engine.observe_runtime_event("run-1", event)
     assert result["status"] == "CANCELLED"
-    assert result["cancel_reason"] == "LOCAL_LLM_LOOP_GUARD"
+    assert result["cancel_reason"] == "LOOP_DETECTED"
     assert adapter.cancelled == ["run-1"]
 
 

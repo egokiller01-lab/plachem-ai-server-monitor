@@ -34,9 +34,11 @@ from .runtime_policy import (
     RuntimeClass,
     RuntimeModelProfile,
     RuntimePolicyEngine,
+    TaskRuntimeClass,
     normalize_goal_contract,
     normalize_progress_checkpoint,
     neutral_runtime_profile,
+    task_runtime_profile,
 )
 from .loop_detector import RunScope, RunScopedLoopDetector
 from .auth_broker import AuthBrokerError, SQLiteAuthBroker, execution_auth_scope
@@ -139,9 +141,18 @@ class AgentRegistry:
 
     def require(self, agent_id: str) -> AgentRegistration:
         registration = self._registrations.get(agent_id)
+        if registration is None:
+            registration = next(
+                (value for key, value in self._registrations.items() if key.casefold() == agent_id.casefold()),
+                None,
+            )
         if registration is None or not registration.enabled:
             raise ValueError(f"UNKNOWN_AGENT:{agent_id}")
         return registration
+
+    def registrations(self) -> tuple[AgentRegistration, ...]:
+        """Expose immutable descriptive admission data without model overrides."""
+        return tuple(self._registrations.values())
 
     def candidate_agent_ids(self, required_capabilities: list[str] | None = None) -> list[str]:
         required = {value.strip().casefold() for value in (required_capabilities or []) if isinstance(value, str) and value.strip()}
@@ -205,11 +216,14 @@ class RunRegistry:
                 "completed_at": None,
                 "reason": "",
                 "result": None,
+                "raw_response": None,
+                "rejected_result": None,
                 "format_error": "",
                 "format_recovery_attempts": 0,
                 "format_recovery_rejection": "",
                 "openclaw_binding": None,
                 "runtime_class": policy.get("runtime_class", RuntimeClass.UNKNOWN.value),
+                "task_class": policy.get("task_class", TaskRuntimeClass.STANDARD.value),
                 "model_profile": policy.get("model_profile"),
                 "policy_profile": policy.get("policy_profile", "UNKNOWN"),
                 "max_runtime": policy.get("max_runtime"),
@@ -283,6 +297,11 @@ class RunRegistry:
                     record["format_error"] = outcome.format_error
                     record["format_recovery_attempts"] = outcome.format_recovery_attempts
                     record["format_recovery_rejection"] = outcome.format_recovery_rejection
+                    record["raw_response"] = outcome.raw_response
+                    record["rejected_result"] = (
+                        copy.deepcopy(dict(outcome.rejected_result))
+                        if outcome.rejected_result is not None else None
+                    )
                 if status == CoreRunStatus.CANCELLED:
                     record["cancel_reason"] = record["reason"]
                     record["policy_status"] = "CANCELLED"
@@ -516,7 +535,10 @@ def production_result_validator() -> CompositeResultValidator:
                     observed["file"] = True
                 if name in {"write", "edit", "apply_patch"} or re.search(r"(?:^|\s)(?:tee|touch|cp|mv)\s|(?<![0-9])>(?![>&])", joined):
                     observed["file"] = True
-                if name in {"read", "view_image"} or re.search(r"(?:^|\s)(?:cat|sed|rg|head|tail|stat)\s", joined):
+                if name in {"read", "view_image"} or re.search(
+                    r"\b(?:cat|sed|rg|head|tail|stat|ls|find|pwd|tree|file|realpath|readlink)\b",
+                    joined,
+                ):
                     observed["file"] = True
                 if "memory" in name or "/memory/" in arguments or "memory.md" in arguments:
                     observed["memory"] = True
@@ -538,12 +560,56 @@ def production_result_validator() -> CompositeResultValidator:
             return "INVALID_SUMMARY"
         return None
 
+    def _immutable_evidence(item: Mapping[str, Any], result: Mapping[str, Any], envelope: Mapping[str, Any]) -> str | None:
+        metadata = item.get("metadata") if isinstance(item.get("metadata"), Mapping) else item
+        required = ("task_id", "run_id", "evidence_id", "evidence_type", "source_command", "created_at", "sha256", "immutable")
+        if any(key not in metadata for key in required) or metadata.get("immutable") is not True:
+            return "EVIDENCE_UNVERIFIED"
+        if not all(isinstance(metadata[key], str) and metadata[key].strip() for key in required if key != "immutable"):
+            return "EVIDENCE_UNVERIFIED"
+        if item.get("purpose", metadata.get("purpose")) != "verification":
+            return "EVIDENCE_UNVERIFIED"
+        task_id = result.get("task_id") or envelope.get("task_id")
+        run_id = result.get("run_id") or envelope.get("run_id") or envelope.get("core_run_id")
+        if task_id is None or run_id is None or str(metadata["task_id"]) != str(task_id) or str(metadata["run_id"]) != str(run_id):
+            return "EVIDENCE_IDENTITY_MISMATCH"
+        path = item.get("path") or item.get("uri")
+        if not isinstance(path, str) or not path.startswith("/"):
+            return "EVIDENCE_SCOPE_VIOLATION"
+        approved = envelope.get("approved_paths") or result.get("approved_paths")
+        if approved is not None and (not isinstance(approved, list) or not any(path == p or path.startswith(str(p).rstrip("/") + "/") for p in approved if isinstance(p, str))):
+            return "EVIDENCE_SCOPE_VIOLATION"
+        try:
+            data = Path(path).expanduser().read_bytes()
+        except (OSError, ValueError):
+            return "EVIDENCE_UNVERIFIED"
+        if not hmac.compare_digest(hashlib.sha256(data).hexdigest(), str(metadata["sha256"])):
+            return "EVIDENCE_TAMPERED"
+        marker = metadata.get("expected_contains")
+        if not isinstance(marker, str):
+            return "EVIDENCE_UNVERIFIED"
+        try:
+            content = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return "EVIDENCE_UNVERIFIED"
+        if marker not in content:
+            return "EVIDENCE_UNVERIFIED"
+        return None
+
     def evidence(result: Mapping[str, Any], envelope: Mapping[str, Any]) -> str | None:
         items = result.get("evidence")
         if not isinstance(items, list) or not items:
             return "MISSING_EVIDENCE"
         if not all(isinstance(item, Mapping) and isinstance(item.get("type"), str) for item in items):
             return "INVALID_EVIDENCE"
+        mode = result.get("evidence_mode", "CREATE_EVIDENCE")
+        if mode not in {"CREATE_EVIDENCE", "VERIFY_EVIDENCE"}:
+            return "INVALID_EVIDENCE_MODE"
+        if mode == "VERIFY_EVIDENCE":
+            for item in items:
+                reason = _immutable_evidence(item, result, envelope)
+                if reason:
+                    return reason
         observed = observed_actions(envelope, result)
         for item in items:
             claim = f"{item.get('type', '')} {item.get('detail', '')}"
@@ -566,13 +632,46 @@ def production_result_validator() -> CompositeResultValidator:
                 return "ARTIFACT_NOT_FOUND"
         return None
 
-    def scope(result: Mapping[str, Any], _envelope: Mapping[str, Any]) -> str | None:
+    def scope(result: Mapping[str, Any], envelope: Mapping[str, Any]) -> str | None:
         value = result.get("scope")
         if not isinstance(value, Mapping) or value.get("compliant") is not True:
             return "NON_COMPLIANT"
         violations = value.get("violations", [])
         if not isinstance(violations, list) or violations:
             return "SCOPE_VIOLATION"
+        history = envelope.get("history")
+        messages = history.get("messages") if isinstance(history, Mapping) else None
+        if isinstance(messages, list):
+            user_text = "\n".join(
+                str(item.get("content") or "") for item in messages
+                if isinstance(item, Mapping) and item.get("role") == "user"
+            ).casefold()
+            read_only = any(marker in user_text for marker in (
+                "read-only", "read only", "읽기 전용", "조회만", "변경하지",
+            ))
+            if read_only:
+                if result.get("artifacts"):
+                    return "READ_ONLY_ARTIFACT_REUSE"
+                for message in messages:
+                    if not isinstance(message, Mapping):
+                        continue
+                    content = message.get("content")
+                    blocks = content if isinstance(content, list) else [content]
+                    for block in blocks:
+                        if not isinstance(block, Mapping):
+                            continue
+                        kind = str(block.get("type") or "").lower().replace("_", "")
+                        if kind not in {"toolcall", "tooluse"}:
+                            continue
+                        name = str(block.get("name") or block.get("toolName") or "").casefold()
+                        args = json.dumps(block.get("arguments") or block.get("input") or {}, ensure_ascii=False).casefold()
+                        command = f"{name} {args}"
+                        if name in {"write", "edit", "apply_patch"} or re.search(
+                            r"(?:^|\s)(?:tee|touch|cp|mv)\s|(?<![0-9])>(?![>&])", command
+                        ):
+                            return "READ_ONLY_WRITE_ATTEMPT"
+                        if re.search(r"\b(?:pytest|unittest|npm\s+(?:run\s+)?test|node\s+[^\n]*test)\b", command):
+                            return "READ_ONLY_SCOPE_EXPANSION"
         return None
 
     return CompositeResultValidator(
@@ -652,12 +751,14 @@ class CoreEngine:
         action: str = "dispatch",
         workspace_id: str = "command-center",
         project_id: str = "fast-gateway",
+        task_runtime_class: str | TaskRuntimeClass = TaskRuntimeClass.STANDARD,
     ) -> dict[str, Any]:
         return self._dispatch(
             agent_id=agent_id, message=message, timeout_seconds=timeout_seconds,
             core_run_id=core_run_id, idempotency_key=idempotency_key,
             goal_contract=goal_contract, session_key=None, parent_core_run_id=None, context_reset_count=0,
             auth_token=auth_token, action=action, workspace_id=workspace_id, project_id=project_id,
+            task_runtime_class=task_runtime_class,
         )
 
     def _dispatch(
@@ -676,6 +777,7 @@ class CoreEngine:
         action: str = "dispatch",
         workspace_id: str = "command-center",
         project_id: str = "fast-gateway",
+        task_runtime_class: str | TaskRuntimeClass = TaskRuntimeClass.STANDARD,
     ) -> dict[str, Any]:
         with self._lock:
             registration = self.agents.require(agent_id)
@@ -688,7 +790,7 @@ class CoreEngine:
             contract = normalize_goal_contract(goal_contract)
             # Agent model metadata is descriptive routing data only.  Gateway
             # lifecycle policy is deliberately a single neutral profile.
-            profile = self._neutral_profile
+            profile = task_runtime_profile(task_runtime_class)
             policy = self._policy_metadata(profile)
             effective_timeout = profile.max_runtime
             digest = _request_hash(agent_id, message, float(timeout_seconds), contract.goal_id,
@@ -872,7 +974,10 @@ class CoreEngine:
                     "Never claim a tool call, file read or write, memory operation, artifact, database action, Git action, "
                     "or deployment unless that action actually occurred in this run"
                 ),
-                "artifacts": "required array: use [] when none exist; every item must be an object with a string path",
+                "artifacts": (
+                    "required array of outputs newly produced by this run: use [] when none exist; every item must be "
+                    "an object with a string path. An existing path inspected by a read-only task is evidence, not an artifact"
+                ),
                 "scope": {
                     "compliant": "required boolean: true",
                     "violations": "required array: []",
@@ -913,6 +1018,7 @@ class CoreEngine:
                 core_run_id=child_id, idempotency_key=f"{source['idempotency_key']}:ctx:{reset_count + 1}",
                 goal_contract={key: contract[key] for key in _GOAL_INPUT_FIELDS},
                 session_key=session_key, parent_core_run_id=core_run_id, context_reset_count=reset_count + 1,
+                task_runtime_class=source.get("task_class", TaskRuntimeClass.STANDARD.value),
             )
             return self.registry.update_goal_state(
                 child["core_run_id"],
@@ -1242,6 +1348,7 @@ class CoreEngine:
     def _policy_metadata(profile: RuntimeModelProfile) -> dict[str, Any]:
         return {
             "runtime_class": profile.runtime_class.value,
+            "task_class": profile.task_class.value,
             "model_profile": profile.model_id,
             "policy_profile": profile.policy_profile,
             "max_runtime": profile.max_runtime,
@@ -1283,7 +1390,10 @@ class CoreEngine:
         Keep the existing server profile and dispatch-based time accounting;
         do not reset budgets or rewrite historical records on observation.
         """
-        return self._neutral_profile
+        try:
+            return task_runtime_profile(record.get("task_class", TaskRuntimeClass.STANDARD.value))
+        except ValueError:
+            return self._neutral_profile
 
     def _runtime_seconds(self, record: Mapping[str, Any]) -> float:
         started_at = record.get("started_at")

@@ -241,6 +241,26 @@ class CoreEngineTests(unittest.TestCase):
         ]}}
         self.assertEqual(CoreRunStatus.PASS, production_result_validator()(payload).status)
 
+    def test_read_only_existing_path_is_rejected_when_claimed_as_new_artifact(self):
+        existing = Path(tempfile.mkstemp()[1])
+        try:
+            payload = {"status": "ok", "result": {
+                "status": "completed", "summary": "inspected",
+                "evidence": [{"type": "file_read", "detail": f"ls -l {existing}"}],
+                "artifacts": [{"path": str(existing)}],
+                "scope": {"compliant": True, "violations": []},
+            }, "history": {"messages": [
+                {"role": "user", "content": f"read-only inspect {existing}"},
+                {"role": "assistant", "content": [
+                    {"type": "toolCall", "name": "exec", "arguments": {"command": f"ls -l {existing}"}},
+                ]},
+            ]}}
+            decision = production_result_validator()(payload)
+            self.assertEqual(CoreRunStatus.FAIL, decision.status)
+            self.assertEqual("SCOPE_VALIDATION_FAILED:READ_ONLY_ARTIFACT_REUSE", decision.reason)
+        finally:
+            existing.unlink(missing_ok=True)
+
     def test_stale_bounded_history_without_user_boundary_is_not_current_run_evidence(self):
         payload = {"status": "ok", "result": {
             "status": "completed", "summary": "done",
@@ -304,7 +324,7 @@ class CoreEngineTests(unittest.TestCase):
         self.dispatch()
         record = self.engine.wait("core-1", timeout_seconds=180)
         self.assertEqual("CANCELLED", record["status"])
-        self.assertEqual("LOCAL_LLM_RUNTIME_LIMIT", record["cancel_reason"])
+        self.assertEqual("EXECUTION_RUNTIME_LIMIT", record["cancel_reason"])
         self.assertEqual([180.0, 60.0, 10.0], [call[1] for call in self.adapter.wait_calls])
         self.assertEqual(["core-1"], self.adapter.cancel_calls)
 
@@ -321,7 +341,7 @@ class CoreEngineTests(unittest.TestCase):
         self.clock.advance(301)
         record = self.engine.wait("core-1", timeout_seconds=10)
         self.assertEqual("CANCELLED", record["status"])
-        self.assertEqual("LOCAL_LLM_RUNTIME_LIMIT", record["cancel_reason"])
+        self.assertEqual("EXECUTION_RUNTIME_LIMIT", record["cancel_reason"])
         self.assertEqual(["core-1"], self.adapter.cancel_calls)
         self.assertEqual("RUNTIME_LIMIT", record["policy_events"][-1]["code"])
 

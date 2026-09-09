@@ -21,6 +21,13 @@ class RuntimeClass(StrEnum):
     UNKNOWN = "UNKNOWN"
 
 
+class TaskRuntimeClass(StrEnum):
+    QUICK = "QUICK"
+    STANDARD = "STANDARD"
+    LONG_CODING = "LONG_CODING"
+    HEAVY_VALIDATION = "HEAVY_VALIDATION"
+
+
 class PolicyResolutionError(ValueError):
     """A registered agent/model/profile relationship could not be proven."""
 
@@ -39,6 +46,7 @@ class RuntimeModelProfile:
     max_context_resets: int
     execution_budget: float | None = None
     finalization_recovery_budget: float | None = None
+    task_class: TaskRuntimeClass = TaskRuntimeClass.STANDARD
 
     def __post_init__(self) -> None:
         if self.execution_budget is None and self.finalization_recovery_budget is None:
@@ -54,15 +62,30 @@ class RuntimeModelProfile:
 def neutral_runtime_profile() -> RuntimeModelProfile:
     """Model-independent server policy for admission and subsequent handling.
 
-    LOCAL and LOCAL_LLM reason labels are retained for existing consumers;
-    they do not identify or select the actual OpenClaw model/provider.
+    The default is the task-based STANDARD class. Model/provider metadata is
+    descriptive only and never selects a lifecycle budget.
     """
+    return task_runtime_profile(TaskRuntimeClass.STANDARD)
+
+
+def task_runtime_profile(task_class: TaskRuntimeClass | str) -> RuntimeModelProfile:
+    """Return the server-owned profile for a task category, not a model."""
+    selected = TaskRuntimeClass(task_class)
+    runtimes = {
+        TaskRuntimeClass.QUICK: 120.0,
+        TaskRuntimeClass.STANDARD: 300.0,
+        TaskRuntimeClass.LONG_CODING: 600.0,
+        TaskRuntimeClass.HEAVY_VALIDATION: 900.0,
+    }
+    maximum = runtimes[selected]
+    reserve = min(60.0, maximum / 5.0)
     return RuntimeModelProfile(
         model_id="__neutral__", runtime_class=RuntimeClass.LOCAL,
-        policy_profile="NEUTRAL", max_runtime=300.0, max_retries=1,
-        max_tool_calls=20, loop_guard={"consecutive_threshold": 3},
+        policy_profile="NEUTRAL", max_runtime=maximum, max_retries=1,
+        max_tool_calls=30, loop_guard={"consecutive_threshold": 3},
         context_policy="FRESH_ON_LOOP", fallback_policy="MANUAL", max_context_resets=1,
-        execution_budget=240.0, finalization_recovery_budget=60.0,
+        execution_budget=maximum - reserve, finalization_recovery_budget=reserve,
+        task_class=selected,
     )
 
 
@@ -391,7 +414,7 @@ class RuntimePolicyEngine:
             current.update(last_progress_signature=signature, progress_repeats=repeats)
             if repeats >= threshold:
                 return PolicyDecision(
-                    "LOOP_SUSPECTED", self._reason(profile, "LOOP_GUARD"), retry_count, tool_count, current
+                    "LOOP_SUSPECTED", self._reason(profile, "LOOP_DETECTED"), retry_count, tool_count, current
                 )
         elif event.get("state_changed") is True:
             current.pop("last_progress_signature", None)
@@ -400,5 +423,11 @@ class RuntimePolicyEngine:
 
     @staticmethod
     def _reason(profile: RuntimeModelProfile, suffix: str) -> str:
-        prefix = "LOCAL_LLM" if profile.runtime_class is RuntimeClass.LOCAL else "RUNTIME_POLICY"
-        return f"{prefix}_{suffix}"
+        return {
+            "RUNTIME_LIMIT": "EXECUTION_RUNTIME_LIMIT",
+            "TOOL_BUDGET": "TOOL_CALL_LIMIT",
+            "LOOP_GUARD": "REPETITIVE_TOOL_CALL",
+            "LOOP_DETECTED": "LOOP_DETECTED",
+            "RETRY_LIMIT": "RETRY_LIMIT",
+            "GOAL_DRIFT": "LOOP_DETECTED",
+        }.get(suffix, f"EXECUTION_{suffix}")

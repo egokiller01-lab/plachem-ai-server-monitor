@@ -672,6 +672,8 @@ class AdapterOutcome:
     format_error: str = ""
     format_recovery_attempts: int = 0
     format_recovery_rejection: str = ""
+    raw_response: str | None = None
+    rejected_result: Mapping[str, Any] | None = None
 
 
 ValidationCheck = Callable[[Mapping[str, Any], Mapping[str, Any]], str | None]
@@ -709,7 +711,14 @@ class CompositeResultValidator:
             except Exception:
                 return ValidationDecision(CoreRunStatus.FAIL, f"{name}_VALIDATION_ERROR")
             if reason:
-                return ValidationDecision(CoreRunStatus.FAIL, f"{name}_VALIDATION_FAILED:{reason}")
+                # Preserve the normalized worker result even when it is
+                # rejected.  Validation state must not erase the response
+                # operators need to diagnose the failure.
+                return ValidationDecision(
+                    CoreRunStatus.FAIL,
+                    f"{name}_VALIDATION_FAILED:{reason}",
+                    result,
+                )
         worker_status = str(result.get("status") or "").lower()
         if worker_status == "completed":
             return ValidationDecision(CoreRunStatus.PASS, result=result)
@@ -753,6 +762,34 @@ class CompositeResultValidator:
 ResultFormatRecovery = Callable[
     [Mapping[str, Any], Mapping[str, Any]], Mapping[str, Any] | None
 ]
+
+
+def _close_result_containers(text: str) -> Mapping[str, Any] | None:
+    """Repair only missing terminal container closers, never values or strings."""
+    stack: list[str] = []
+    quoted = escaped = False
+    for ch in text:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                quoted = False
+        elif ch == '"':
+            quoted = True
+        elif ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]":
+            if not stack or stack.pop() != ch:
+                return None
+    if quoted or not stack:
+        return None
+    try:
+        value = json.loads(text + "".join(reversed(stack)))
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, Mapping) else None
 
 
 def recover_production_result_format(
@@ -800,15 +837,30 @@ def recover_production_result_format(
         try:
             parsed = json.loads(json_text)
         except json.JSONDecodeError:
+            # Some Gateway history frames prepend a short assistant label.
+            # Decode the first JSON object without treating words inside the
+            # result (for example, "failed services: 0") as its status.
             parsed = None
+            start = json_text.find("{")
+            if start >= 0:
+                try:
+                    parsed, _ = json.JSONDecoder().raw_decode(json_text[start:])
+                except json.JSONDecodeError:
+                    parsed = _close_result_containers(json_text[start:])
         if isinstance(parsed, Mapping):
             candidate = dict(parsed)
     if candidate is None:
         if not raw:
             return None
+        # A malformed structured result must not become a fabricated success
+        # just because its text contains a status word.
+        if raw.lstrip().startswith(("{", "[", "```")) or '"status"' in raw:
+            return None
         candidate = {}
 
     normalized = dict(candidate)
+    if isinstance(normalized.get("status"), str):
+        normalized["status"] = normalized["status"].strip().lower()
     if normalized.get("status") not in {"completed", "blocked", "failed"}:
         status_source = f"{normalized.get('status', '')} {normalized.get('summary', '')} {raw or ''}".casefold()
         if re.search(r"\bblocked\b|차단|진행\s*불가", status_source):
@@ -826,10 +878,25 @@ def recover_production_result_format(
             "type": "runtime_observation",
             "detail": "Agent terminal response observed by execution harness",
         }]
-    if "artifacts" not in normalized:
-        normalized["artifacts"] = []
+    if "artifacts" not in normalized or normalized["artifacts"] == []:
+        # Accept the legacy worker shape where artifacts were attached to the
+        # evidence item that described the produced report.  Preserve the
+        # actual artifact objects in the canonical top-level contract.
+        recovered_artifacts = []
+        evidence_items = normalized.get("evidence")
+        for item in evidence_items if isinstance(evidence_items, list) else []:
+            if isinstance(item, Mapping) and isinstance(item.get("artifacts"), list):
+                recovered_artifacts.extend(item["artifacts"])
+        normalized["artifacts"] = recovered_artifacts
     if "scope" not in normalized:
-        normalized["scope"] = {"compliant": True, "violations": []}
+        evidence_items = normalized.get("evidence")
+        nested_scopes = [item["scope"] for item in evidence_items
+                         if isinstance(item, Mapping) and "scope" in item] if isinstance(evidence_items, list) else []
+        # Keep a legacy scope claim, including violations, for validation.
+        normalized["scope"] = next((value for value in nested_scopes
+            if not isinstance(value, Mapping) or value.get("compliant") is not True
+            or value.get("violations")), nested_scopes[0] if nested_scopes else
+            {"compliant": True, "violations": []})
 
     return {**dict(payload), "result": normalized, "observed_run": dict(observed_run)}
 
@@ -1039,24 +1106,22 @@ class OpenClawAdapter:
         if preparation.history_was_empty:
             candidates = list(messages)
         elif preparation.watermark_seq is not None:
-            boundary_found = any(
-                isinstance(message, Mapping)
+            boundary = next((
+                index for index, message in enumerate(messages)
+                if isinstance(message, Mapping)
                 and cls._message_cursor(message)[0] == preparation.watermark_seq
                 and (
                     preparation.watermark_message_id is None
                     or cls._message_cursor(message)[1] == preparation.watermark_message_id
                 )
-                for message in messages
-            )
-            if not boundary_found:
+            ), None)
+            if boundary is None:
                 raise GatewayContractError("HISTORY_WATERMARK_UNVERIFIABLE")
-            candidates = []
-            for message in messages:
-                if not isinstance(message, Mapping):
-                    continue
-                seq, _ = cls._message_cursor(message)
-                if seq is not None and seq > preparation.watermark_seq:
-                    candidates.append(message)
+            # Preserve the complete post-submit turn, including the user
+            # boundary, assistant tool calls and tool results.  Filtering this
+            # down to assistant messages discarded the only provenance the
+            # evidence validator can use to attribute an action to this run.
+            candidates = messages[boundary + 1:]
         elif preparation.watermark_message_id is not None:
             boundary = next(
                 (index for index, message in enumerate(messages)
@@ -1072,7 +1137,7 @@ class OpenClawAdapter:
         assistants = [item for item in candidates if isinstance(item, Mapping) and item.get("role") == "assistant"]
         if not assistants:
             raise GatewayContractError("MISSING_POST_SUBMIT_RESULT")
-        return {**dict(history), "messages": assistants}
+        return {**dict(history), "messages": candidates}
 
     def wait(self, core_run_id: str, *, timeout_seconds: float) -> AdapterOutcome:
         binding = self._require_binding(core_run_id)
@@ -1135,8 +1200,10 @@ class OpenClawAdapter:
             if key not in {"result", "evidence", "artifacts", "messages", "history"}
         }
         validation_payload: Mapping[str, Any] = {**control_payload, "history": history}
+        raw_response = self._terminal_assistant_text(history)
         decision = self.result_validator(validation_payload)
         original_decision = decision
+        rejected_candidate = decision.result
         format_error = ""
         recovery_attempts = 0
         recovery_rejection = ""
@@ -1165,6 +1232,12 @@ class OpenClawAdapter:
             if recovered_payload is not None:
                 recovered_decision = self.result_validator(recovered_payload)
                 if recovered_decision.result is not None:
+                    rejected_candidate = recovered_decision.result
+                if (
+                    recovered_decision.result is not None
+                    and "_VALIDATION_FAILED:" not in recovered_decision.reason
+                    and not recovered_decision.reason.endswith("_VALIDATION_ERROR")
+                ):
                     decision = recovered_decision
                 else:
                     recovery_rejection = recovered_decision.reason or "RECOVERY_VALIDATION_FAILED"
@@ -1173,14 +1246,46 @@ class OpenClawAdapter:
             if decision is original_decision and not recovery_rejection:
                 recovery_rejection = "RECOVERY_VALIDATION_FAILED"
         self._set_status(binding, decision.status)
-        return AdapterOutcome(
-            decision.status,
-            decision.reason,
-            decision.result,
-            format_error,
-            recovery_attempts,
-            recovery_rejection,
+        validation_rejected = (
+            decision.reason == "MISSING_RESULT"
+            or "_VALIDATION_FAILED:" in decision.reason
+            or decision.reason.endswith("_VALIDATION_ERROR")
         )
+        return AdapterOutcome(
+            status=decision.status,
+            reason=decision.reason,
+            result=None if validation_rejected else decision.result,
+            format_error=format_error,
+            format_recovery_attempts=recovery_attempts,
+            format_recovery_rejection=recovery_rejection,
+            raw_response=raw_response,
+            rejected_result=rejected_candidate if validation_rejected else None,
+        )
+
+    @staticmethod
+    def _terminal_assistant_text(history: Mapping[str, Any]) -> str | None:
+        """Return the exact terminal assistant text from this run's window."""
+
+        messages = history.get("messages")
+        if not isinstance(messages, list):
+            return None
+        for message in reversed(messages):
+            if not isinstance(message, Mapping) or message.get("role") != "assistant":
+                continue
+            content = message.get("content")
+            if isinstance(content, str) and content.strip():
+                return content
+            if isinstance(content, list):
+                parts: list[str] = []
+                for block in content:
+                    if isinstance(block, str):
+                        parts.append(block)
+                    elif isinstance(block, Mapping) and isinstance(block.get("text"), str):
+                        parts.append(block["text"])
+                value = "".join(parts)
+                if value.strip():
+                    return value
+        return None
 
     @staticmethod
     def _contains_result(payload: Mapping[str, Any]) -> bool:

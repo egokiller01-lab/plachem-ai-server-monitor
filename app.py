@@ -83,7 +83,7 @@ async def war_room_read_rbac(request: Request, call_next):
         proxy_secret = os.environ.get("PLACHEM_WAR_ROOM_REVERSE_PROXY_SECRET", "")
         proxy_principal = request.headers.get("X-Authenticated-Principal") or request.headers.get("X-Forwarded-User")
         presented_secret = request.headers.get("X-War-Room-Proxy-Secret")
-        if proxy_secret and proxy_principal and hmac.compare_digest(proxy_secret, presented_secret or "") and proxy_principal in war_room.ALLOWED_AGENT_IDS and os.environ.get("PLACHEM_WAR_ROOM_SESSION_SECRET"):
+        if proxy_secret and proxy_principal and hmac.compare_digest(proxy_secret, presented_secret or "") and war_room._known_principal(proxy_principal) and os.environ.get("PLACHEM_WAR_ROOM_SESSION_SECRET"):
             session_secret = os.environ["PLACHEM_WAR_ROOM_SESSION_SECRET"]
             signature = hmac.new(session_secret.encode(), proxy_principal.encode(), hashlib.sha256).hexdigest()
             response.set_cookie("war_room_session", f"{proxy_principal}.{signature}", httponly=True, samesite="lax", secure=request.url.scheme == "https", path="/")
@@ -896,9 +896,15 @@ OPENCONNECTOR_HEALTH_URL = "http://127.0.0.1:3001/health"
 OPENCONNECTOR_CONSOLE_URL = "https://openclaw.tail8eba4b.ts.net:3001/"
 OPENCONNECTOR_API_BASE = "http://127.0.0.1:3001"
 OPENCONNECTOR_ENV_FILE = Path("/opt/openconnector/.env")
+OPENCONNECTOR_LEASE_LEDGER = Path(
+    "/home/plachem-sever/.openclaw/workspace-secretary/operations/openconnector-auth-leases.json"
+)
 OPENCONNECTOR_MANAGED_ACTIONS = {
     "github": "github.get_current_user",
-    "gmail": "gmail.get_profile",
+    # Gmail operations use the centrally managed IMAP connection.  The old
+    # gmail OAuth connection is retained in OpenConnector history, but it is
+    # not part of the 13-item operational verification set.
+    "gmail": "generic_imap.list_folders",
     "googledrive": "googledrive.about.get",
     "google_search_console": "google_search_console.list_sites",
     "google_analytics": "google_analytics.list_account_summaries",
@@ -911,6 +917,26 @@ OPENCONNECTOR_MANAGED_ACTIONS = {
     "gemini": "gemini.list_models",
     "telegram": "telegram.get_me",
 }
+OPENCONNECTOR_MANAGED_CONNECTION_SERVICES = {
+    **{service: service for service in OPENCONNECTOR_MANAGED_ACTIONS},
+    "gmail": "generic_imap",
+}
+
+OPENCONNECTOR_UNTIL_REVOKED_SERVICES = {
+    "gemini", "notion", "supabase", "telegram", "wordpress",
+}
+OPENCONNECTOR_PROVIDER_EXPIRY_SERVICES = {
+    "cloudflare_dns", "cloudflare_worker", "elevenlabs", "github",
+}
+OPENCONNECTOR_PROVIDER_EXPIRY_GUIDANCE = {
+    "cloudflare_dns": "Cloudflare token verify의 expires_on 연동 필요",
+    "cloudflare_worker": "Cloudflare token verify의 expires_on 연동 필요",
+    "elevenlabs": "ElevenLabs API Key 목록의 expires_at 연동 필요",
+    "github": "GitHub PAT 만료 헤더 또는 조직 정책의 만료일 연동 필요",
+}
+OPENCONNECTOR_AUTH_ERROR_MARKERS = (
+    "auth", "credential", "forbidden", "oauth", "permission", "token", "unauthorized",
+)
 
 
 def _read_env_value(path: Path, key: str) -> str | None:
@@ -979,167 +1005,317 @@ def _parse_iso_timestamp(value: Any) -> float | None:
         return None
 
 
-def get_openconnector_dashboard() -> dict[str, Any]:
-    """Return a secret-free authentication operations view from real run logs."""
-    now = time.time()
-    metadata_collected_at = datetime.fromtimestamp(now, tz=timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-    connections = _openconnector_admin_get("/api/connections")
-    run_page = _openconnector_admin_get("/api/runs?limit=100")
-    runs = run_page.get("items", []) if isinstance(run_page, dict) else []
-    connection_by_service = {
-        item.get("service"): item
-        for item in connections
-        if isinstance(item, dict) and item.get("service") in OPENCONNECTOR_MANAGED_ACTIONS
-    }
-    recent_by_action: dict[str, dict[str, Any]] = {}
-    successful_read_by_action: dict[str, dict[str, Any]] = {}
-    for run in runs:
-        if not isinstance(run, dict):
-            continue
-        action_id = run.get("actionId")
-        if action_id in OPENCONNECTOR_MANAGED_ACTIONS.values() and action_id not in recent_by_action:
-            recent_by_action[action_id] = run
-        if action_id in OPENCONNECTOR_MANAGED_ACTIONS.values() and run.get("ok") is True and action_id not in successful_read_by_action:
-            successful_read_by_action[action_id] = run
+def _expiration_status(value: Any, now: float) -> str:
+    expires_at = _parse_iso_timestamp(value)
+    if expires_at is None:
+        return "unknown"
+    remaining = expires_at - now
+    if remaining <= 0:
+        return "overdue"
+    if remaining <= 2 * 60 * 60:
+        return "due_2h"
+    if remaining <= 24 * 60 * 60:
+        return "due_24h"
+    return "normal"
 
+
+def _is_authentication_failure(run: dict[str, Any]) -> bool:
+    """Only credential failures affect authentication health.
+
+    Invalid input, business validation and provider-side data errors are still
+    useful activity records, but they do not prove that a credential is bad.
+    """
+    if run.get("ok") is not False:
+        return False
+    text = " ".join(str(run.get(key) or "") for key in ("errorCode", "error", "message")).lower()
+    return any(marker in text for marker in OPENCONNECTOR_AUTH_ERROR_MARKERS)
+
+
+def _credential_lifecycle(connection: dict[str, Any], now: float) -> dict[str, Any]:
+    service = str(connection.get("service") or "")
+    auth_type = str(connection.get("authType") or "")
+    expires_at = connection.get("credentialExpiresAt")
+    refreshable = bool(connection.get("refreshable"))
+    auth_health = str(connection.get("authHealth") or "")
+    expiry_status = _expiration_status(expires_at, now)
+    if expires_at:
+        if refreshable:
+            return {
+                "kind": "oauth_auto_refresh", "label": "자동 갱신 관리",
+                "detail": "액세스 토큰 만료 후 Refresh Token으로 자동 갱신",
+                "expires_at": expires_at, "expiration_status": expiry_status,
+                "action_required": auth_health == "reauth_required",
+            }
+        return {
+            "kind": "fixed_expiry", "label": "실제 만료일",
+            "detail": "Provider가 제공한 실제 만료시각",
+            "expires_at": expires_at, "expiration_status": expiry_status,
+            "action_required": expiry_status in {"overdue", "due_2h"},
+        }
+    if auth_type == "oauth2" and refreshable:
+        return {
+            "kind": "oauth_auto_refresh", "label": "자동 갱신 관리",
+            "detail": "Refresh Token 보유 · 다음 사용 시 액세스 토큰 갱신",
+            "expires_at": None, "expiration_status": "managed",
+            "action_required": auth_health == "reauth_required",
+        }
+    if service in OPENCONNECTOR_UNTIL_REVOKED_SERVICES:
+        return {
+            "kind": "until_revoked", "label": "폐기 전까지 유효",
+            "detail": "Provider가 고정 만료일을 제공하지 않음 · 연결 성공과 회전일로 관리",
+            "expires_at": None, "expiration_status": "until_revoked", "action_required": False,
+        }
+    if service in OPENCONNECTOR_PROVIDER_EXPIRY_SERVICES:
+        return {
+            "kind": "provider_registration", "label": "Provider 만료정보 등록 필요",
+            "detail": OPENCONNECTOR_PROVIDER_EXPIRY_GUIDANCE[service],
+            "expires_at": None, "expiration_status": "registration_required", "action_required": True,
+        }
+    return {
+        "kind": "rotation_policy", "label": "회전 정책으로 관리",
+        "detail": "실제 사용 성공과 마지막 연결 변경일을 기준으로 관리",
+        "expires_at": None, "expiration_status": "policy_managed", "action_required": False,
+    }
+
+
+def _lease_access_class(actions: list[str]) -> str:
+    lowered = [str(action).lower() for action in actions]
+    if any(
+        "production" in action
+        and any(word in action for word in ("deploy", "migration", "merge", "rollback", "execute"))
+        for action in lowered
+    ):
+        return "production_high"
+    read_markers = (
+        ".get", ".list", ".search", ".read", ".about", ".inspect",
+        "read_only", "health", "status", "whoami", "current_user",
+    )
+    return "read" if lowered and all(any(marker in action for marker in read_markers) for action in lowered) else "write"
+
+
+def get_openconnector_lease_review(now: float | None = None) -> dict[str, Any]:
+    """Return secret-free lease age/review metadata from the central broker ledger.
+
+    The ledger has no enforced expiry. ``review_due_at`` is therefore labelled
+    as an operational review deadline, never as credential expiration.
+    """
+    checked_at = time.time() if now is None else now
+    try:
+        payload = json.loads(OPENCONNECTOR_LEASE_LEDGER.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"items": [], "error": _sanitize_error(exc)}
+    tokens = payload.get("tokens") if isinstance(payload, dict) else None
+    if not isinstance(tokens, dict):
+        return {"items": [], "error": "lease ledger schema is invalid"}
+
+    items: list[dict[str, Any]] = []
+    for token_id, entry in tokens.items():
+        if not isinstance(entry, dict):
+            continue
+        token_name = str(entry.get("tokenName") or "등록 이름 없음")
+        leases = entry.get("leases")
+        if not isinstance(leases, dict):
+            continue
+        for request_id, lease in leases.items():
+            if not isinstance(lease, dict):
+                continue
+            actions = [str(action) for action in lease.get("actions", []) if isinstance(action, str)]
+            connections = [str(value) for value in lease.get("connections", []) if isinstance(value, str)]
+            access_class = _lease_access_class(actions)
+            created_at = lease.get("createdAt")
+            created_epoch = _parse_iso_timestamp(created_at)
+            review_hours = 24 if access_class == "read" else 8
+            review_due_epoch = created_epoch + review_hours * 60 * 60 if created_epoch is not None else None
+            review_due_at = (
+                datetime.fromtimestamp(review_due_epoch, tz=timezone.utc)
+                .isoformat(timespec="milliseconds")
+                .replace("+00:00", "Z")
+                if review_due_epoch is not None
+                else None
+            )
+            items.append({
+                "token_id": str(token_id),
+                "token_name": token_name,
+                "request_id": str(request_id),
+                "created_at": created_at if isinstance(created_at, str) else None,
+                "review_due_at": review_due_at,
+                "review_status": "overdue" if review_due_epoch is not None and review_due_epoch <= checked_at else "normal" if review_due_epoch is not None else "unknown",
+                "access_class": access_class,
+                "action_count": len(actions),
+                "connection_count": len(connections),
+                "expiration_kind": "review_deadline",
+            })
+    items.sort(key=lambda item: (item["review_status"] != "overdue", item["review_due_at"] or ""))
+    return {"items": items, "error": None}
+
+
+def get_openconnector_dashboard() -> dict[str, Any]:
+    """Return a secret-free, live authentication control view."""
+    now = time.time()
+    collected_at = datetime.fromtimestamp(now, tz=timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    raw_connections = _openconnector_admin_get("/api/connections")
+    runtime_tokens = _openconnector_admin_get("/api/runtime-tokens")
+    run_page = _openconnector_admin_get("/api/runs?limit=100")
+    runs = [item for item in (run_page.get("items", []) if isinstance(run_page, dict) else []) if isinstance(item, dict)]
+
+    # The control screen follows the same canonical 13-item inventory as the
+    # fixed verification job.  Legacy/extra OpenConnector connections remain
+    # available in its own console but must not distort this dashboard.
+    by_service: dict[str, dict[str, Any]] = {}
+    canonical_by_source = {
+        source: canonical
+        for canonical, source in OPENCONNECTOR_MANAGED_CONNECTION_SERVICES.items()
+    }
+    for item in raw_connections if isinstance(raw_connections, list) else []:
+        if not isinstance(item, dict) or item.get("authType") == "no_auth":
+            continue
+        source_service = str(item.get("service") or "")
+        service = canonical_by_source.get(source_service)
+        if not service:
+            continue
+        if service not in by_service or item.get("default") is True:
+            by_service[service] = item
     try:
         updates = get_openconnector_connection_updates() or {}
     except Exception:
         updates = {}
 
+    managed_sources = set(canonical_by_source)
+    day_runs = [
+        run for run in runs
+        if str(run.get("service") or "") in managed_sources
+        and (_parse_iso_timestamp(run.get("completedAt")) or 0) >= now - 86400
+    ]
+    service_runs: dict[str, list[dict[str, Any]]] = {}
+    for run in runs:
+        canonical = canonical_by_source.get(str(run.get("service") or ""))
+        if canonical:
+            service_runs.setdefault(canonical, []).append(run)
+
     services: list[dict[str, Any]] = []
-    alerts: list[dict[str, str]] = []
-    for service, action_id in OPENCONNECTOR_MANAGED_ACTIONS.items():
-        connection = connection_by_service.get(service)
-        run = recent_by_action.get(action_id)
-        verified_at = run.get("completedAt") if run else None
-        updates_for_service = updates.get(service) or {}
-        verified_epoch = _parse_iso_timestamp(verified_at)
-        configured = bool(connection and connection.get("configured"))
-        state: str
-        state_reason: str
-        if run and run.get("ok") is False:
-            state = "error"
-            state_reason = "recent_read_failed"
-            message = str(run.get("errorCode") or run.get("error") or "최근 READ 검증 실패")
-            alerts.append({"severity": "error", "service": service, "message": message[:160], "action": "중앙 연결 상태를 확인하고 READ 검증을 다시 실행하세요"})
-        elif not configured:
-            state = "error"
-            state_reason = "not_configured"
-            alerts.append({"severity": "error", "service": service, "message": "연결이 설정되지 않았습니다", "action": "중앙 연결을 복구하세요"})
-        elif verified_epoch is None:
-            state = "unverified"
-            state_reason = "no_run_record"
-            alerts.append({"severity": "warning", "service": service, "message": "READ 검증 기록이 없습니다", "action": "서비스 READ 점검을 실행하세요"})
-        elif now - verified_epoch > 86400:
-            state = "warning"
-            state_reason = "stale_verification"
-            alerts.append({"severity": "warning", "service": service, "message": "마지막 READ 검증이 24시간을 초과했습니다", "action": "서비스 READ 점검을 실행하세요"})
+    actions: list[dict[str, str]] = []
+    for service, connection in sorted(by_service.items()):
+        source_service = OPENCONNECTOR_MANAGED_CONNECTION_SERVICES[service]
+        related = service_runs.get(service, [])
+        latest = related[0] if related else None
+        latest_success = next((run for run in related if run.get("ok") is True), None)
+        latest_auth_failure = next((run for run in related if _is_authentication_failure(run)), None)
+        success_epoch = _parse_iso_timestamp(latest_success.get("completedAt")) if latest_success else None
+        configured = bool(connection.get("configured"))
+        if not configured:
+            state, reason = "error", "not_configured"
+        elif latest_auth_failure and (not latest_success or (_parse_iso_timestamp(latest_auth_failure.get("completedAt")) or 0) > (success_epoch or 0)):
+            state, reason = "error", "authentication_failed"
+        elif success_epoch is not None and now - success_epoch <= 86400:
+            state, reason = "healthy", "recent_authenticated_use"
+        elif success_epoch is not None:
+            state, reason = "warning", "authenticated_use_stale"
         else:
-            state = "healthy"
-            state_reason = "recent_read_ok"
+            state, reason = "attention", "first_verification_required"
 
-        auth_type_value = connection.get("authType") if connection else None
-        auth_type_provided = auth_type_value not in (None, "")
-        # Token expiry is only considered "known" when the Provider actually
-        # exposes an expiry timestamp. API-key style credentials have no
-        # refreshable expiry, but that still counts as "Provider 미제공" for
-        # the monitoring gap until the Provider starts publishing it.
-        token_expiry = "Provider 미제공"
+        lifecycle = _credential_lifecycle({**connection, "service": service}, now)
+        if reason == "not_configured":
+            actions.append({"severity": "error", "service": service, "title": "연결 복구", "detail": "OpenConnector 연결 설정이 완료되지 않았습니다."})
+        elif reason == "authentication_failed":
+            actions.append({"severity": "error", "service": service, "title": "재인증 확인", "detail": str(latest_auth_failure.get("errorCode") or "인증 실패")[:120]})
+        elif reason == "first_verification_required":
+            actions.append({"severity": "warning", "service": service, "title": "첫 실사용 검증", "detail": f"{OPENCONNECTOR_MANAGED_ACTIONS.get(service, '안전한 READ 작업')}을 실행해 연결을 확인하세요."})
+        if lifecycle["action_required"]:
+            actions.append({"severity": "warning", "service": service, "title": lifecycle["label"], "detail": lifecycle["detail"]})
 
+        day_related = [run for run in day_runs if str(run.get("service") or "") == source_service]
+        successes = sum(1 for run in day_related if run.get("ok") is True)
+        auth_failures = sum(1 for run in day_related if _is_authentication_failure(run))
+        durations = [float(run["durationMs"]) for run in day_related if isinstance(run.get("durationMs"), (int, float))]
+        update = updates.get(source_service) or {}
         services.append({
-            "service": service,
-            "manager": "OpenConnector",
-            "metadata_source": "openconnector_admin_api+local_read_only_db",
-            "metadata_collected_at": metadata_collected_at,
-            "state": state,
-            "state_reason": state_reason,
-            "configured": configured,
-            "auth_type": auth_type_value,
-            "auth_type_provided": auth_type_provided,
-            "verification_action": action_id,
-            "last_verified_at": verified_at,
-            "last_read_at": successful_read_by_action.get(action_id, {}).get("completedAt"),
-            "connection_last_modified_at": updates_for_service.get("connection_last_modified_at"),
-            "oauth_client_last_modified_at": updates_for_service.get("oauth_client_last_modified_at"),
-            "last_verified_ok": run.get("ok") if run else None,
-            "last_duration_ms": run.get("durationMs") if run else None,
-            "caller": run.get("caller") if run else None,
-            "token_expiry": token_expiry,
+            "service": service, "connection_id": connection.get("id"), "configured": configured,
+            "auth_type": connection.get("authType"), "state": state, "state_reason": reason,
+            "last_activity_at": latest.get("completedAt") if latest else None,
+            "last_activity_ok": latest.get("ok") if latest else None,
+            "last_activity_error": latest.get("errorCode") if latest and latest.get("ok") is False else None,
+            "last_verified_at": latest_success.get("completedAt") if latest_success else None,
+            "last_verified_action": latest_success.get("actionId") if latest_success else None,
+            "last_duration_ms": latest_success.get("durationMs") if latest_success else None,
+            "calls_24h": len(day_related), "successes_24h": successes,
+            "failures_24h": len(day_related) - successes, "auth_failures_24h": auth_failures,
+            "success_rate_24h": round(successes / len(day_related) * 100, 1) if day_related else None,
+            "average_duration_ms": round(sum(durations) / len(durations), 1) if durations else None,
+            "connection_last_modified_at": update.get("connection_last_modified_at"),
+            "oauth_client_last_modified_at": update.get("oauth_client_last_modified_at"),
+            "refreshable": bool(connection.get("refreshable")), "auth_health": connection.get("authHealth"),
+            "credential_expires_at": lifecycle["expires_at"], "expiration_status": lifecycle["expiration_status"],
+            "lifecycle_kind": lifecycle["kind"], "lifecycle_label": lifecycle["label"],
+            "lifecycle_detail": lifecycle["detail"], "action_required": lifecycle["action_required"],
+            "metadata_source": "openconnector_live_api+local_read_only_db", "metadata_collected_at": collected_at,
         })
-
-    day_runs = [run for run in runs if (_parse_iso_timestamp(run.get("completedAt")) or 0) >= now - 86400]
-    success_count = sum(1 for run in day_runs if run.get("ok") is True)
-    success_rate = round(success_count / len(day_runs) * 100, 1) if day_runs else None
-    counts = {key: sum(1 for item in services if item["state"] == key) for key in ("healthy", "warning", "error", "unverified")}
 
     def summarize_runs(group_key: str) -> list[dict[str, Any]]:
         grouped: dict[str, list[dict[str, Any]]] = {}
         for run in day_runs:
-            label = str(run.get(group_key) or "unknown")
-            grouped.setdefault(label, []).append(run)
-        result = []
+            grouped.setdefault(str(run.get(group_key) or "식별자 없음"), []).append(run)
+        output = []
         for label, items in grouped.items():
-            durations = [float(item["durationMs"]) for item in items if isinstance(item.get("durationMs"), (int, float))]
             successes = sum(1 for item in items if item.get("ok") is True)
-            result.append({
-                group_key: label,
-                "runs": len(items),
-                "successes": successes,
-                "failures": len(items) - successes,
-                "success_rate": round(successes / len(items) * 100, 1),
-                "average_duration_ms": round(sum(durations) / len(durations), 1) if durations else None,
-                "max_duration_ms": round(max(durations), 1) if durations else None,
-            })
-        return sorted(result, key=lambda item: (-item["runs"], item[group_key]))
+            durations = [float(item["durationMs"]) for item in items if isinstance(item.get("durationMs"), (int, float))]
+            output.append({group_key: label, "runs": len(items), "successes": successes,
+                "failures": len(items) - successes, "success_rate": round(successes / len(items) * 100, 1),
+                "average_duration_ms": round(sum(durations) / len(durations), 1) if durations else None})
+        return sorted(output, key=lambda item: (-item["runs"], item[group_key]))
 
-    service_usage = summarize_runs("service")
-    caller_usage = summarize_runs("caller")
-    expiry_known = sum(1 for item in services if item["token_expiry"] != "Provider 미제공")
-    operational_insights: list[dict[str, str]] = []
-    if counts["error"] == 0 and success_rate is not None and success_rate < 95:
-        operational_insights.append({
-            "level": "info",
-            "title": "현재 연결 상태 복구 완료",
-            "message": f"현재 모든 연결은 정상이지만 24시간 실행 성공률은 {success_rate}%입니다. 복구 과정에서 발생한 과거 실패가 표본에 포함되어 있습니다.",
-        })
-    if service_usage:
-        busiest = service_usage[0]
-        operational_insights.append({
-            "level": "info",
-            "title": "사용량 1위 서비스",
-            "message": f"최근 24시간 표본 {len(day_runs)}건 중 {busiest['service']}가 {busiest['runs']}건으로 가장 많이 사용됐습니다.",
-        })
-        risky = max(service_usage, key=lambda item: (item["failures"], item["runs"]))
-        if risky["failures"]:
-            operational_insights.append({
-                "level": "warning",
-                "title": "실패 집중 서비스",
-                "message": f"{risky['service']}의 표본 실패가 {risky['failures']}건으로 가장 많습니다. 새 인증을 요청하기 전에 기존 연결의 복구 이력을 먼저 확인하세요.",
-            })
-    if expiry_known < len(services):
-        operational_insights.append({
-            "level": "warning",
-            "title": "유효기간 확인 공백",
-            "message": f"중앙 연결 {len(services)}개 중 {len(services) - expiry_known}개의 토큰 유효기간이 제공되지 않습니다. 이는 정상이 아니라 미확인 상태입니다.",
-        })
-    recent_activity = [{
-        "service": run.get("service"),
-        "action": run.get("actionId"),
-        "caller": run.get("caller"),
-        "ok": run.get("ok"),
-        "completed_at": run.get("completedAt"),
-        "duration_ms": run.get("durationMs"),
-    } for run in runs[:20] if isinstance(run, dict)]
+    safe_tokens: list[dict[str, Any]] = []
+    for token in runtime_tokens if isinstance(runtime_tokens, list) else []:
+        if not isinstance(token, dict):
+            continue
+        allowed_actions = [str(x) for x in token.get("allowedActions", []) if isinstance(x, str) and x != "broker.none"]
+        allowed_connections = [str(x) for x in token.get("allowedConnections", []) if isinstance(x, str) and x != "__lease_required__"]
+        name = str(token.get("name") or "등록 이름 없음")
+        agent = name.split("agent:", 1)[1].split()[0] if "agent:" in name else name
+        safe_tokens.append({"id": token.get("id"), "name": name, "agent": agent,
+            "created_at": token.get("createdAt"), "last_used_at": token.get("lastUsedAt"),
+            "allowed_action_count": len(allowed_actions), "allowed_connection_count": len(allowed_connections),
+            "allowed_actions": allowed_actions, "has_current_grant": bool(allowed_actions),
+            "nearest_lease_expires_at": token.get("nearestLeaseExpiresAt"),
+            "active_lease_count": token.get("activeLeaseCount", 0)})
+
+    lease_review = get_openconnector_lease_review(now)
+    lease_items = lease_review["items"]
+    lease_overdue = sum(1 for item in lease_items if item["review_status"] == "overdue")
+    if lease_overdue:
+        actions.append({"severity": "warning", "service": "권한 원장", "title": "검토기한 초과 정리", "detail": f"자동 만료가 아닌 수동 검토 대상 {lease_overdue}건"})
+    coalesced_actions: dict[str, dict[str, str]] = {}
+    for item in actions:
+        service = item["service"]
+        if service not in coalesced_actions:
+            coalesced_actions[service] = dict(item)
+            continue
+        current = coalesced_actions[service]
+        if item["title"] not in current["title"]:
+            current["title"] += f" · {item['title']}"
+        if item["detail"] not in current["detail"]:
+            current["detail"] += f" / {item['detail']}"
+        if item["severity"] == "error":
+            current["severity"] = "error"
+    actions = sorted(coalesced_actions.values(), key=lambda item: (item["severity"] != "error", item["service"]))
+    counts = {key: sum(1 for item in services if item["state"] == key) for key in ("healthy", "warning", "error", "attention")}
+    success_count = sum(1 for run in day_runs if run.get("ok") is True)
+    provider_registration = sum(1 for item in services if item["lifecycle_kind"] == "provider_registration")
     return {
-        "summary": {"managed": len(services), **counts, "runs_24h": len(day_runs), "success_rate_24h": success_rate, "expiry_known": expiry_known, "expiry_unknown": len(services) - expiry_known},
-        "services": services,
-        "service_usage_24h": service_usage,
-        "caller_usage_24h": caller_usage,
-        "operational_insights": operational_insights,
-        "alerts": alerts,
-        "recent_activity": recent_activity,
-        "checked_at": int(now),
+        "summary": {"managed": len(services), **counts, "runs_24h": len(day_runs),
+            "success_rate_24h": round(success_count / len(day_runs) * 100, 1) if day_runs else None,
+            "oauth_auto_refresh": sum(1 for item in services if item["lifecycle_kind"] == "oauth_auto_refresh"),
+            "until_revoked": sum(1 for item in services if item["lifecycle_kind"] == "until_revoked"),
+            "provider_registration": provider_registration, "action_count": len(actions),
+            "runtime_tokens": len(safe_tokens), "current_grants": sum(1 for item in safe_tokens if item["has_current_grant"]),
+            "lease_review_records": len(lease_items), "lease_review_overdue": lease_overdue},
+        "services": services, "runtime_tokens": safe_tokens, "lease_reviews": lease_items,
+        "lease_review_error": lease_review["error"], "service_usage_24h": summarize_runs("service"),
+        "caller_usage_24h": summarize_runs("caller"), "action_queue": actions,
+        "recent_activity": [{"service": run.get("service"), "action": run.get("actionId"),
+            "caller": run.get("caller"), "ok": run.get("ok"), "error_code": run.get("errorCode"),
+            "completed_at": run.get("completedAt"), "duration_ms": run.get("durationMs")}
+            for run in runs[:20]],
+        "checked_at": int(now), "metadata_collected_at": collected_at,
         "console_url": OPENCONNECTOR_CONSOLE_URL,
     }
 
@@ -1841,7 +2017,8 @@ def api_status() -> dict[str, Any]:
     oc_summary = openconnector.get("summary", {})
     oc_healthy = oc_summary.get("healthy", 0)
     oc_total = oc_summary.get("managed", 0)
-    oc_unverified = oc_summary.get("unverified", 0)
+    oc_attention = oc_summary.get("attention", oc_summary.get("unverified", 0))
+    oc_errors = oc_summary.get("error", 0)
 
     gpu_summary = gpu_risk_summary(gpus)
     gpu_risk = gpu_summary["risk"]
@@ -1854,7 +2031,7 @@ def api_status() -> dict[str, Any]:
     has_warning = any(item.get("status") in {"unknown", "warming"} for item in [network]) or any(
         state in {"stopped", "unknown"} for state in service_states
     ) or gateway_state == "degraded" or gpu_risk == "warning" or openconnector_error is not None or (
-        oc_total > 0 and oc_unverified > 0
+        oc_total > 0 and (oc_attention > 0 or oc_errors > 0)
     )
 
     overall = "error" if has_error else "warning" if has_warning else "normal"
@@ -1876,7 +2053,7 @@ def api_status() -> dict[str, Any]:
             "gpu": gpu_risk,
             "services": {k: v.get("state") for k, v in services.items()},
             "gateway": gateway_state,
-            "openconnector": {"healthy": oc_healthy, "total": oc_total, "unverified": oc_unverified, "state": "unavailable" if openconnector_error else "available"},
+            "openconnector": {"healthy": oc_healthy, "total": oc_total, "attention": oc_attention, "error": oc_errors, "state": "unavailable" if openconnector_error else "available"},
         },
         "cpu": cpu,
         "memory": memory,

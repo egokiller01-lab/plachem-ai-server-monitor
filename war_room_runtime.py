@@ -15,19 +15,22 @@ from typing import Any
 from war_room_adapter import OpenClawSessionAdapter, SessionAdapter
 from war_room_worker import process_due_deliveries, recover_received_deliveries, request_project_stop
 import war_room
+from war_room_agents import canonical_agent_id, load_agent_catalog
 from fast_gateway_service import get_persistent_harness
 from war_room_fast_gateway import FastGatewayWarRoomAdapter
 
 
 def provision_disposable_sessions(*, db_path: str | Path, adapter: Any, project_id: str, agent_ids: list[str]) -> list[dict[str, Any]]:
     """Provision and bind explicit test-only sessions without touching work sessions."""
-    canonical_by_casefold = {agent.casefold(): agent for agent in war_room.ALLOWED_AGENT_IDS}
-    canonical_ids = [canonical_by_casefold.get(agent.strip().casefold()) if isinstance(agent, str) else None for agent in agent_ids]
+    canonical_ids = [canonical_agent_id(agent) for agent in agent_ids]
     if (not agent_ids or any(agent is None for agent in canonical_ids)
             or len(canonical_ids) != len(set(canonical_ids))
             or any(agent == "main" for agent in canonical_ids)):
         raise ValueError("unique non-main allowlisted agent_ids required")
     agent_ids = [agent for agent in canonical_ids if agent is not None]
+    catalog = load_agent_catalog()
+    if any(not catalog[agent].execution_eligible for agent in agent_ids):
+        raise ValueError("all agents must be enabled Gateway execution candidates")
     with sqlite3.connect(Path(db_path)) as con:
         placeholders = ",".join("?" for _ in agent_ids)
         if not con.execute("SELECT 1 FROM war_projects WHERE id=?", (project_id,)).fetchone():
