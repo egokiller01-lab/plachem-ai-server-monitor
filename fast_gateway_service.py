@@ -85,9 +85,48 @@ class PersistentExecutionHarness:
         self._cancel_intents: set[str] = set()
         self._lock = threading.RLock()
         self._terminal_completion_subscriber: Any | None = None
+        self._recovery_layer: Any | None = None
         setter = getattr(core_engine, "set_terminal_transition_guard", None)
         if callable(setter):
             setter(self.is_cancel_requested)
+
+    def set_recovery_layer(self, layer: Any) -> None:
+        """Install the post-terminal Recovery Layer (v0.2 auto-wiring).
+
+        Only terminal FAIL records classified as recoverable by the layer
+        trigger a bounded one-shot recovery.  PASS, BLOCKED, TIMEOUT,
+        CANCELLED and policy/auth-blocked runs never reach recovery.
+        """
+        with self._lock:
+            self._recovery_layer = layer
+
+    def _handle_recovery(self, record: dict[str, Any]) -> None:
+        """Post-terminal recovery hook (v0.2).
+
+        Never mutates the original record: the parent run stays immutable.
+        All recovery accounting is appended by the RecoveryLayer to the
+        child run record it creates.
+        """
+        status = str(record.get("status") or "")
+        if status != "FAIL":
+            return  # PASS / BLOCKED / TIMEOUT / CANCELLED: no recovery
+        core_run_id = str(record.get("core_run_id") or "")
+        # A recovery child run reaching terminal state is the end of the
+        # chain; never recover a recovery child (max 1, no chaining).
+        goal_state = (record.get("policy_state") or {}).get("goal") or {}
+        if goal_state.get("recovery_source_run_id"):
+            return
+        with self._lock:
+            layer = self._recovery_layer
+        if layer is None:
+            return
+        try:
+            layer.recover(core_run_id)
+        except Exception:
+            # Recovery is best-effort post-processing.  The original FAIL
+            # record is immutable and authoritative; a layer error must not
+            # change the run's terminal status or raise into the observer.
+            pass
 
     @property
     def active_controllers(self) -> dict[str, ActiveRunController]:
@@ -166,6 +205,8 @@ class PersistentExecutionHarness:
                     close = getattr(self.core_engine.adapter, "close", None)
                     if callable(close):
                         close()
+                if status == "FAIL":
+                    self._handle_recovery(record)
             else:
                 controller = self._controller(core_run_id)
                 self._start_observer(controller)
@@ -282,5 +323,20 @@ def get_persistent_harness(*, run_path: str | Path | None = None,
             run_path=run_file, bindings_path=binding_file,
             agents_path=agents_path, models_path=models_path, adapter=adapter,
         ))
+        # v0.2: wire the post-terminal Recovery Layer.  Terminal FAIL runs
+        # that classify as recoverable get one bounded recovery attempt;
+        # PASS and policy/auth-blocked runs are never touched.  The layer
+        # reuses the engine's existing auth/policy/validator paths.
+        try:
+            from plachem_fast_gateway.recovery_layer import RecoveryLayer
+            harness.set_recovery_layer(RecoveryLayer(
+                harness.core_engine,
+                harness.core_engine.registry,
+            ))
+        except Exception:
+            # Recovery wiring is additive; a failure here must not break
+            # the primary dispatch path.  The service continues without
+            # auto-recovery.
+            pass
         _HARNESSES[key] = harness
         return harness
