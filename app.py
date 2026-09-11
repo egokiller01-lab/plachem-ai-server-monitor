@@ -212,15 +212,29 @@ def identity_paths(home: Path, agent_id: str, agent: dict[str, Any]) -> list[Pat
     return paths
 
 
+def configured_openclaw_agents(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Return only agents registered in the current OpenClaw config schema."""
+    agents_config = config.get("agents", {}) if isinstance(config.get("agents"), dict) else {}
+    entries = agents_config.get("entries")
+    if isinstance(entries, dict):
+        return {
+            str(agent_id): {**agent, "id": str(agent_id)}
+            for agent_id, agent in entries.items()
+            if isinstance(agent_id, str) and agent_id and isinstance(agent, dict)
+        }
+    legacy = agents_config.get("list")
+    if isinstance(legacy, list):
+        return {
+            str(agent["id"]): dict(agent)
+            for agent in legacy
+            if isinstance(agent, dict) and agent.get("id")
+        }
+    return {}
+
+
 def openclaw_agent_ids(config: dict[str, Any], home: Path) -> list[str]:
-    agents = config.get("agents", {}).get("list", [])
-    ids = [str(agent.get("id")) for agent in agents if isinstance(agent, dict) and agent.get("id")]
-    if ids:
-        return ids
-    try:
-        ids = sorted(path.name for path in (home / "agents").iterdir() if path.is_dir() and not path.name.startswith("."))
-    except Exception:
-        ids = []
+    del home  # Kept in the signature for compatibility with existing callers.
+    ids = list(configured_openclaw_agents(config))
     return ids or ["main"]
 
 
@@ -234,61 +248,59 @@ def parse_session_type(key: str) -> str:
     return "unknown"
 
 
-def read_agent_sessions(home: Path, agent_id: str) -> dict[str, Any]:
-    sessions_dir = home / "agents" / agent_id / "sessions"
-    raw = read_json_file(sessions_dir / "sessions.json")
-    sessions = raw if isinstance(raw, dict) else {}
+def read_openclaw_runtime_status() -> dict[str, Any]:
+    result = safe_run(["openclaw", "sessions", "--all-agents", "--limit", "all", "--json"], timeout=8.0)
+    if result is None or result.returncode != 0:
+        return {}
+    try:
+        payload = json.loads(result.stdout)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def read_agent_sessions(runtime_status: dict[str, Any], agent_id: str) -> dict[str, Any]:
+    all_sessions = runtime_status.get("sessions")
+    source = "openclaw sessions --all-agents --limit all --json"
+    if not isinstance(all_sessions, list):
+        return {"state": "unknown", "last_active": None, "session_count": None, "total_tokens": None, "context_tokens": None, "recent_sessions": [], "source": source, "error": "session_status_unavailable"}
+    sessions = [
+        item
+        for item in all_sessions
+        if isinstance(item, dict) and str(item.get("agentId")) == agent_id
+    ]
     rows: list[dict[str, Any]] = []
     last_active: int | None = None
     total_tokens = 0
     context_tokens = 0
-    for key, item in sessions.items():
+    for item in sessions:
         if not isinstance(item, dict):
             continue
+        key = str(item.get("key") or "")
         updated = int(item.get("updatedAt") or 0)
         last_active = max(last_active or 0, updated) or None
         total_tokens += int(item.get("totalTokens") or 0)
         context_tokens += int(item.get("contextTokens") or 0)
-        rows.append({"key": str(key), "type": parse_session_type(str(key)), "updated_at": updated, "total_tokens": int(item.get("totalTokens") or 0), "context_tokens": int(item.get("contextTokens") or 0), "system_sent": bool(item.get("systemSent", False))})
-    last_assistant: int | None = None
-    try:
-        files = sorted([path for path in sessions_dir.iterdir() if path.name.endswith(".jsonl") and ".deleted." not in path.name], key=lambda path: path.stat().st_mtime, reverse=True)[:5]
-        for path in files:
-            if time.time() - path.stat().st_mtime > 180:
-                continue
-            for line in reversed(path.read_text(encoding="utf-8", errors="ignore").splitlines()[-20:]):
-                try:
-                    entry = json.loads(line)
-                except Exception:
-                    continue
-                if entry.get("type") == "message" and entry.get("message", {}).get("role") == "assistant" and entry.get("timestamp"):
-                    try:
-                        ts = int(time.mktime(time.strptime(entry["timestamp"][:19], "%Y-%m-%dT%H:%M:%S"))) * 1000
-                    except Exception:
-                        continue
-                    last_assistant = max(last_assistant or 0, ts)
-                    last_active = max(last_active or 0, ts) or None
-                    break
-    except Exception:
-        pass
+        rows.append({"key": key, "type": parse_session_type(key), "updated_at": updated, "total_tokens": int(item.get("totalTokens") or 0), "context_tokens": int(item.get("contextTokens") or 0), "system_sent": bool(item.get("systemSent", False))})
     now_ms = int(time.time() * 1000)
     state = "offline"
     if last_active:
         diff = now_ms - last_active
-        if last_assistant and now_ms - last_assistant < 180000:
+        if diff < 180000:
             state = "working"
         elif diff < 600000:
             state = "online"
         elif diff < 86400000:
             state = "idle"
     rows.sort(key=lambda row: row["updated_at"], reverse=True)
-    return {"state": state, "last_active": last_active, "session_count": len(rows), "total_tokens": total_tokens, "context_tokens": context_tokens, "recent_sessions": redact_sensitive(rows[:8])}
+    return {"state": state, "last_active": last_active, "session_count": len(rows), "total_tokens": total_tokens, "context_tokens": context_tokens, "recent_sessions": redact_sensitive(rows[:8]), "source": source}
 
 
-def collect_openclaw_agents(config: dict[str, Any], home: Path) -> list[dict[str, Any]]:
+def collect_openclaw_agents(config: dict[str, Any], home: Path, runtime_status: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     defaults = config.get("agents", {}).get("defaults", {})
     default_model = normalize_model_ref(defaults.get("model"), "unknown")
-    configured = {str(agent.get("id")): agent for agent in config.get("agents", {}).get("list", []) if isinstance(agent, dict) and agent.get("id")}
+    configured = configured_openclaw_agents(config)
+    runtime_status = runtime_status if isinstance(runtime_status, dict) else read_openclaw_runtime_status()
     bindings = config.get("bindings", []) if isinstance(config.get("bindings"), list) else []
     channels = config.get("channels", {}) if isinstance(config.get("channels"), dict) else {}
     rows: list[dict[str, Any]] = []
@@ -307,7 +319,7 @@ def collect_openclaw_agents(config: dict[str, Any], home: Path) -> list[dict[str
             for channel, channel_config in channels.items():
                 if isinstance(channel_config, dict) and channel_config.get("enabled") is not False:
                     platforms.add(str(channel))
-        rows.append({"id": agent_id, "name": str(name), "emoji": str(emoji), "model": normalize_model_ref(agent.get("model"), default_model), "platforms": sorted(platforms), "session": read_agent_sessions(home, agent_id)})
+        rows.append({"id": agent_id, "name": str(name), "emoji": str(emoji), "model": normalize_model_ref(agent.get("model"), default_model), "platforms": sorted(platforms), "session": read_agent_sessions(runtime_status, agent_id)})
     return rows
 
 
@@ -382,7 +394,7 @@ def collect_openclaw_skills(config: dict[str, Any], home: Path) -> dict[str, Any
         skills.extend(scan_openclaw_skills(package_dir / "skills", "builtin"))
     skills.extend(scan_openclaw_skills(home / "skills", "custom"))
     skills.extend(scan_openclaw_skills(home / "workspace" / "skills", "workspace:main"))
-    for agent in config.get("agents", {}).get("list", []) or []:
+    for agent in configured_openclaw_agents(config).values():
         if isinstance(agent, dict):
             for key in ("workspace", "agentDir"):
                 raw = agent.get(key)
@@ -435,7 +447,8 @@ def collect_openclaw_status() -> dict[str, Any]:
     config = read_json_file(config_path)
     if not isinstance(config, dict):
         return {**base, **empty, "status": "error", "summary": {**empty["summary"], "connection": "Invalid config"}}
-    agents = collect_openclaw_agents(config, home)
+    runtime_status = read_openclaw_runtime_status()
+    agents = collect_openclaw_agents(config, home, runtime_status)
     providers = collect_openclaw_providers(config, agents)
     skills = collect_openclaw_skills(config, home)
     gateway = probe_openclaw_gateway(config)
@@ -2093,7 +2106,7 @@ def _select_erpmanager_session(sessions: dict[str, Any]) -> tuple[str, dict[str,
             continue
         status_active = item.get("status") in {"running", "working", "active"}
         priority = (
-            2 if is_webchat_direct and is_dashboard else 1 if is_webchat_direct else 0,
+            2 if is_dashboard else 1 if is_webchat_direct else 0,
             1 if status_active else 0,
             int(item.get("updatedAt") or 0),
         )
@@ -2104,10 +2117,22 @@ def _select_erpmanager_session(sessions: dict[str, Any]) -> tuple[str, dict[str,
     return key, item
 
 
+def _runtime_agent_sessions(runtime_status: dict[str, Any], agent_id: str) -> dict[str, Any]:
+    all_sessions = runtime_status.get("sessions")
+    if not isinstance(all_sessions, list):
+        raise RuntimeError("session status unavailable")
+    sessions: dict[str, Any] = {}
+    for item in all_sessions:
+        if not isinstance(item, dict) or str(item.get("agentId")) != agent_id:
+            continue
+        key = str(item.get("key") or item.get("sessionId") or "")
+        if key:
+            sessions[key] = item
+    return sessions
+
+
 def _collect_agent_context(agent_id: str) -> dict[str, Any]:
-    sessions = read_json_file(openclaw_home() / "agents" / agent_id / "sessions" / "sessions.json")
-    if not isinstance(sessions, dict):
-        raise RuntimeError("sessions.json not found or invalid")
+    sessions = _runtime_agent_sessions(read_openclaw_runtime_status(), agent_id)
     best_key, best_item, best_updated = None, None, 0
     if agent_id == "erpmanager":
         best_key, best_item = _select_erpmanager_session(sessions)
@@ -2268,3 +2293,175 @@ def detail_secretary() -> dict[str, Any]:
         return detail_response("secretary", _collect_agent_context("secretary"))
     except Exception as exc:
         return detail_response("secretary", {"error": _sanitize_error(exc)}, "error")
+
+
+# ---------------------------------------------------------------------------
+# Agent Watchdog (read-only consumer of agent-stall-detector results)
+#
+# Reads detection results already produced by the agent-stall-detector tool.
+# Never runs its own detection logic, never writes to the detector DB,
+# and never takes any action against agents (no kill/restart/recovery).
+# ---------------------------------------------------------------------------
+import sqlite3 as _sqlite3
+
+WATCHDOG_DB_PATH = os.environ.get(
+    "PLACHEM_STALL_DETECTIONS_DB",
+    "/home/plachem-sever/.openclaw/workspace/projects/agent-stall-detector/data/detections.sqlite",
+)
+WATCHDOG_MAX_AGE_MS = 30 * 60 * 1000  # detector output older than 30 min -> UNAVAILABLE
+
+# Map detector kinds to the 4 display buckets requested by the UI
+_KIND_BUCKET = {
+    "STALL": "STALL",
+    "LOOP": "LOOP",
+    "COMPACTION_STREAK": "CONTEXT",
+    "CONTEXT_EVIDENCE": "CONTEXT",
+    "FG_STALL": "STALL",
+    "FG_FAIL_RECOVERABLE": "FG_FAIL",
+}
+_BUCKET_LABEL = {
+    "STALL": "STALL",
+    "LOOP": "LOOP",
+    "CONTEXT": "CONTEXT/COMPACTION",
+    "FG_FAIL": "FG_FAIL",
+}
+
+def _wd_now_ms() -> int:
+    return int(time.time() * 1000)
+
+def _fmt_ts(ms):
+    if ms in (None, 0):
+        return None
+    try:
+        return time.strftime("%m-%d %H:%M:%S", time.localtime(ms / 1000.0))
+    except Exception:
+        return None
+
+def _wd_evidence_reason(kind: str, ev: dict) -> str:
+    """One-line human reason from evidence dict; no secrets, no truncation surprises."""
+    try:
+        if kind == "STALL":
+            return f"session idle {ev.get('idle_seconds', 'UNAVAILABLE')}s"
+        if kind == "FG_STALL":
+            secs = ev.get("running_seconds", ev.get("idle_seconds"))
+            return f"FastGateway run running {secs if secs is not None else 'UNAVAILABLE'}s"
+        if kind == "LOOP":
+            n = ev.get("count_in_window", "UNAVAILABLE")
+            lbl = str(ev.get("fingerprint_label") or ev.get("fingerprint") or "")[:60]
+            return f"same call repeated {n}x ({lbl})"
+        if kind == "COMPACTION_STREAK":
+            return f"{ev.get('count', 'UNAVAILABLE')} compactions in session"
+        if kind == "CONTEXT_EVIDENCE":
+            return f"context at {ev.get('percent', 'UNAVAILABLE')}% of budget"
+        if kind == "FG_FAIL_RECOVERABLE":
+            return f"FastGateway FAIL ({ev.get('reason', 'UNAVAILABLE')})"
+    except Exception:
+        pass
+    return "UNAVAILABLE"
+
+def _collect_agent_watchdog() -> dict[str, Any]:
+    now = _wd_now_ms()
+    agents: dict[str, dict[str, Any]] = {}
+    scan_ts = None
+    unavailable_reason = None
+    try:
+        con = _sqlite3.connect(f"file:{WATCHDOG_DB_PATH}?mode=ro", uri=True)
+        con.row_factory = _sqlite3.Row
+        try:
+            try:
+                row = con.execute(
+                    "SELECT max(ts_ms) AS ts FROM scan_runs"
+                ).fetchone()
+                if row is not None and row["ts"] is not None:
+                    scan_ts = int(row["ts"])
+            except Exception:
+                scan_ts = None
+            rows = con.execute(
+                """SELECT agent_id, kind, severity, status, label,
+                          ts_detected_ms, first_seen_ms, last_seen_ms,
+                          evidence_json
+                   FROM detections
+                   WHERE status IN ('NEW','CONFIRMED')
+                   ORDER BY ts_detected_ms DESC"""
+            ).fetchall()
+        finally:
+            con.close()
+    except Exception as exc:
+        return {
+            "available": False,
+            "unavailable_reason": _sanitize_error(exc),
+            "scan_ts": None,
+            "stale": True,
+            "agents": {"UNAVAILABLE": {"status": "UNAVAILABLE", "buckets": {}, "warnings": []}},
+        }
+
+    if scan_ts is not None and (now - scan_ts) > WATCHDOG_MAX_AGE_MS:
+        unavailable_reason = "detector output stale (>30 min)"
+    if scan_ts is None:
+        unavailable_reason = "no scan data found"
+
+    for r in rows:
+        agent = r["agent_id"] or "UNAVAILABLE"
+        kind = r["kind"] or "UNAVAILABLE"
+        bucket = _KIND_BUCKET.get(kind, "OTHER")
+        info = agents.setdefault(agent, {"status": "NORMAL", "buckets": {}, "warnings": []})
+        sev = r["severity"] or "WARN"
+        try:
+            ev = json.loads(r["evidence_json"]) if r["evidence_json"] else {}
+            if not isinstance(ev, dict):
+                ev = {}
+        except Exception:
+            ev = {}
+        b = info["buckets"].setdefault(bucket, {"count": 0, "worst": "WARN", "latest_ts": None})
+        b["count"] += 1
+        if sev == "FAIL":
+            b["worst"] = "FAIL"
+        ts = r["ts_detected_ms"] or r["last_seen_ms"]
+        if ts and (b["latest_ts"] is None or ts > b["latest_ts"]):
+            b["latest_ts"] = ts
+        if len(info["warnings"]) < 5:
+            info["warnings"].append({
+                "kind": kind,
+                "bucket": _BUCKET_LABEL.get(bucket, bucket),
+                "severity": sev,
+                "ts": ts,
+                "ts_text": _fmt_ts(ts) or "UNAVAILABLE",
+                "reason": r["label"] or _wd_evidence_reason(kind, ev) or "UNAVAILABLE",
+            })
+        if info["status"] == "NORMAL":
+            info["status"] = "ABNORMAL"
+
+    # cap warnings per agent, newest first
+    for agent, info in agents.items():
+        info["warnings"].sort(key=lambda w: w["ts"] or 0, reverse=True)
+        info["warnings"] = info["warnings"][:5]
+
+    return {
+        "available": unavailable_reason is None,
+        "unavailable_reason": unavailable_reason,
+        "scan_ts": scan_ts,
+        "scan_ts_text": _fmt_ts(scan_ts) or "UNAVAILABLE",
+        "stale": unavailable_reason is not None,
+        "agent_count": len(agents),
+        "abnormal_count": sum(1 for a in agents.values() if a["status"] != "NORMAL"),
+        "agents": agents,
+    }
+
+@app.get("/api/detail/agent-watchdog")
+def detail_agent_watchdog() -> dict[str, Any]:
+    try:
+        return detail_response("agent-watchdog", _collect_agent_watchdog())
+    except Exception as exc:
+        return detail_response(
+            "agent-watchdog",
+            {
+                "available": False,
+                "unavailable_reason": _sanitize_error(exc),
+                "scan_ts": None,
+                "scan_ts_text": "UNAVAILABLE",
+                "stale": True,
+                "agent_count": 0,
+                "abnormal_count": 0,
+                "agents": {"UNAVAILABLE": {"status": "UNAVAILABLE", "buckets": {}, "warnings": []}},
+            },
+        )

@@ -505,6 +505,87 @@
       box-shadow: 0 0 0 1px rgba(120, 140, 170, 0.25), var(--shadow);
     }
 
+    /* Agent Watchdog (read-only display of agent-stall-detector results) */
+    .watchdog-card {
+      margin-top: 8px;
+      border-color: rgba(255, 178, 28, 0.45);
+      box-shadow: 0 0 0 1px rgba(255, 178, 28, 0.22), var(--shadow);
+      padding: 14px 16px;
+    }
+    .watchdog-card.watchdog-error {
+      border-color: rgba(120, 140, 170, 0.35);
+      box-shadow: 0 0 0 1px rgba(120, 140, 170, 0.25), var(--shadow);
+    }
+    .watchdog-head {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 10px;
+      flex-wrap: wrap;
+    }
+    .watchdog-head .card-title { margin: 0; }
+    .watchdog-scan-meta { font-size: 11px; color: var(--muted); }
+    .watchdog-pill {
+      display: inline-block;
+      padding: 3px 10px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-left: auto;
+    }
+    .watchdog-pill.ok { color: var(--green); background: rgba(99, 239, 102, 0.12); border: 1px solid rgba(99, 239, 102, 0.35); }
+    .watchdog-pill.warn { color: var(--amber); background: rgba(255, 178, 28, 0.12); border: 1px solid rgba(255, 178, 28, 0.4); }
+    .watchdog-pill.fail { color: var(--red); background: rgba(255, 92, 113, 0.14); border: 1px solid rgba(255, 92, 113, 0.45); }
+    .watchdog-pill.unknown { color: var(--muted); background: rgba(120, 140, 170, 0.12); border: 1px solid rgba(120, 140, 170, 0.4); }
+    .watchdog-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(215px, 1fr));
+      gap: 8px;
+    }
+    .wd-agent {
+      border: 1px solid rgba(120, 140, 170, 0.28);
+      border-radius: 10px;
+      padding: 10px 12px;
+      background: rgba(255, 255, 255, 0.015);
+      min-width: 0;
+    }
+    .wd-agent.wd-normal { border-color: rgba(99, 239, 102, 0.3); }
+    .wd-agent.wd-abnormal { border-color: rgba(255, 92, 113, 0.55); background: rgba(255, 92, 113, 0.05); }
+    .wd-agent.wd-unavailable { border-color: rgba(120, 140, 170, 0.3); }
+    .wd-agent-top { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+    .wd-agent-name { font-size: 13px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .wd-status {
+      margin-left: auto;
+      font-size: 10px;
+      font-weight: 800;
+      padding: 2px 8px;
+      border-radius: 999px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      flex-shrink: 0;
+    }
+    .wd-status.normal { color: var(--green); background: rgba(99, 239, 102, 0.14); }
+    .wd-status.abnormal { color: #fff; background: rgba(255, 92, 113, 0.55); }
+    .wd-status.unavailable { color: var(--muted); background: rgba(120, 140, 170, 0.18); }
+    .wd-buckets { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 6px; min-height: 4px; }
+    .wd-bucket {
+      font-size: 10px;
+      font-weight: 700;
+      padding: 2px 7px;
+      border-radius: 6px;
+      color: var(--amber);
+      background: rgba(255, 178, 28, 0.12);
+      border: 1px solid rgba(255, 178, 28, 0.35);
+    }
+    .wd-bucket.worst-fail { color: #fff; background: rgba(255, 92, 113, 0.55); border-color: rgba(255, 92, 113, 0.7); }
+    .wd-warns { font-size: 11px; color: var(--muted); line-height: 1.55; }
+    .wd-warns .wd-w { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .wd-warns .wd-w b { color: var(--text); font-weight: 600; }
+    .wd-empty { font-size: 12px; color: var(--muted); padding: 8px 0; }
+    @media (max-width: 620px) { .watchdog-grid { grid-template-columns: 1fr; } }
+
     .gpu-grid, .agent-grid {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1253,6 +1334,15 @@
       </article>
     </section>
 
+    <section class="card watchdog-card" id="watchdog-card">
+      <div class="watchdog-head">
+        <div class="card-title"><span class="icon" style="color:#ffb21c">⌖</span><span>Agent Watchdog</span></div>
+        <span id="watchdog-scan" class="watchdog-scan-meta">last scan: --</span>
+        <span id="watchdog-pill" class="watchdog-pill unknown">--</span>
+      </div>
+      <div id="watchdog-grid" class="watchdog-grid"><div class="wd-empty">Loading…</div></div>
+    </section>
+
     <section class="card openclaw-main-summary">
       <div class="openclaw-summary-head"><span class="icon">▧</span><span>OpenClaw Summary</span></div>
       <div class="openclaw-main-metrics">
@@ -1597,6 +1687,80 @@
         document.getElementById("secretary-meta").innerHTML = formatPromptRiskMeta(data);
       } catch (err) {
         renderSecretaryError();
+      }
+    }
+
+    function renderWatchdogError() {
+      document.getElementById("watchdog-card").classList.add("watchdog-error");
+      document.getElementById("watchdog-scan").textContent = "last scan: UNAVAILABLE";
+      const pill = document.getElementById("watchdog-pill");
+      pill.textContent = "UNAVAILABLE";
+      pill.className = "watchdog-pill unknown";
+      document.getElementById("watchdog-grid").innerHTML = '<div class="wd-empty">UNAVAILABLE</div>';
+    }
+
+    function wdEscape(s) {
+      return String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    }
+
+    function renderWatchdog(data) {
+      document.getElementById("watchdog-card").classList.remove("watchdog-error");
+      const scanEl = document.getElementById("watchdog-scan");
+      const pill = document.getElementById("watchdog-pill");
+      const grid = document.getElementById("watchdog-grid");
+      if (!data || !data.available || !data.agents) {
+        scanEl.textContent = "last scan: UNAVAILABLE";
+        pill.textContent = "UNAVAILABLE";
+        pill.className = "watchdog-pill unknown";
+        grid.innerHTML = '<div class="wd-empty">UNAVAILABLE</div>';
+        return;
+      }
+      scanEl.textContent = `last scan: ${wdEscape(data.scan_ts_text)} · agents ${data.agent_count} · abnormal ${data.abnormal_count}`;
+      const abnormal = data.abnormal_count || 0;
+      const hasFail = Object.values(data.agents).some(a => Object.values(a.buckets || {}).some(b => b.worst === "FAIL"));
+      if (hasFail) { pill.textContent = "ALERT"; pill.className = "watchdog-pill fail"; }
+      else if (abnormal > 0) { pill.textContent = `${abnormal} ABNORMAL`; pill.className = "watchdog-pill warn"; }
+      else { pill.textContent = "ALL NORMAL"; pill.className = "watchdog-pill ok"; }
+
+      const agents = data.agents;
+      const names = Object.keys(agents).sort((a, b) => {
+        const sa = agents[a].status === "ABNORMAL" ? 0 : 1;
+        const sb = agents[b].status === "ABNORMAL" ? 0 : 1;
+        return sa - sb || a.localeCompare(b);
+      });
+      if (!names.length) {
+        grid.innerHTML = '<div class="wd-empty">No agents with active detections</div>';
+        return;
+      }
+      grid.innerHTML = names.map(name => {
+        const info = agents[name] || {};
+        const status = info.status || "UNAVAILABLE";
+        const cls = status === "NORMAL" ? "wd-normal" : status === "ABNORMAL" ? "wd-abnormal" : "wd-unavailable";
+        const statusCls = status === "NORMAL" ? "normal" : status === "ABNORMAL" ? "abnormal" : "unavailable";
+        const buckets = Object.entries(info.buckets || {}).map(([bk, b]) => {
+          const worstFail = b.worst === "FAIL" ? " worst-fail" : "";
+          return `<span class="wd-bucket${worstFail}">${wdEscape(bk)} ×${b.count}</span>`;
+        }).join("");
+        const warns = (info.warnings || []).slice(0, 3).map(w =>
+          `<span class="wd-w"><b>${wdEscape(w.ts_text)}</b> ${wdEscape(w.kind)} — ${wdEscape(w.reason)}</span>`
+        ).join("");
+        const body = warns || '<span class="wd-w">No active detections</span>';
+        return `<div class="wd-agent ${cls}">
+          <div class="wd-agent-top"><span class="wd-agent-name">${wdEscape(name)}</span><span class="wd-status ${statusCls}">${wdEscape(status)}</span></div>
+          <div class="wd-buckets">${buckets}</div>
+          <div class="wd-warns">${body}</div>
+        </div>`;
+      }).join("");
+    }
+
+    async function refreshWatchdog() {
+      try {
+        const response = await fetch("/api/detail/agent-watchdog", { cache: "no-store" });
+        const data = await response.json();
+        if (data.status !== "ok") { renderWatchdogError(); return; }
+        renderWatchdog(data);
+      } catch (err) {
+        renderWatchdogError();
       }
     }
 
@@ -1974,6 +2138,8 @@
     setInterval(refreshDetail, 15000);
     setInterval(refreshErpmanager, 10000);
     setInterval(refreshSecretary, 10000);
+    refreshWatchdog();
+    setInterval(refreshWatchdog, 15000);
     refreshCodex();
     setInterval(refreshCodex, 60000);
     refreshOpenclawMain(true);
