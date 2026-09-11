@@ -51,11 +51,21 @@ class ScriptedAdapter:
 
     def submit(self, core_run_id, payload):
         self.submit_calls.append((core_run_id, dict(payload)))
+        # Mirrors live adapter: when the agent response omits sessionId, the
+        # adapter resolves it via a sessions.list RPC. The fake returns a
+        # deterministic session_id so the recovery layer can be exercised.
         return RunBinding(
             core_run_id, f"oc-{core_run_id}", payload["agentId"],
             f"agent:{payload['agentId']}:main", "session-1",
             payload["idempotencyKey"], CoreRunStatus.RUNNING,
         )
+
+    def request(self, method, params, timeout_ms=15000):
+        """Minimal fake RPC bridge for sessions.list lookups (mirrors live bridge)."""
+        if method == "sessions.list":
+            rows = [{"key": f"agent:{a}:main", "sessionId": f"session-{a}"} for a in ("erpmanager", "erpcoder", "erpqa", "secretary")]
+            return ({"sessions": rows, "count": len(rows)}, "fake-connection")
+        raise AssertionError(f"unexpected RPC {method}")
 
     def wait(self, core_run_id, *, timeout_seconds):
         if core_run_id in self.outcomes:

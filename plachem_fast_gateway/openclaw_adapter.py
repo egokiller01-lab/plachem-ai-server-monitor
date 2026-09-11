@@ -1060,6 +1060,8 @@ class OpenClawAdapter:
         session_id = response.get("sessionId")
         if session_id is not None and not isinstance(session_id, str):
             raise GatewayContractError("OpenClaw sessionId is invalid")
+        if session_id is None:
+            session_id = self._resolve_session_id(session_key)
         binding = RunBinding(
             core_run_id=core_run_id,
             openclaw_run_id=run_id,
@@ -1095,6 +1097,28 @@ class OpenClawAdapter:
             return None, None, True
         seq, message_id = cls._message_cursor(assistants[-1])
         return seq, message_id, False
+
+    def _resolve_session_id(self, session_key: str) -> str | None:
+        """Best-effort sessionKey -> sessionId resolution via sessions.list.
+
+        Returns None when the session has no persisted row yet; submit()
+        keeps the binding session_id as None in that case (existing behavior).
+        """
+        try:
+            listing = self.rpc.request(
+                "sessions.list", {"allAgents": True, "limit": "all"}, timeout=30.0,
+            )
+        except Exception:
+            return None
+        rows = listing.get("sessions")
+        if not isinstance(rows, list):
+            return None
+        for row in rows:
+            if isinstance(row, Mapping) and row.get("key") == session_key:
+                sid = row.get("sessionId")
+                if isinstance(sid, str) and sid:
+                    return sid
+        return None
 
     @classmethod
     def _history_after_watermark(
