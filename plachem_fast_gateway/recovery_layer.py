@@ -18,9 +18,18 @@ Design contract
     SESSION_RECOVERABLE  transport/session failures
     POLICY_BLOCKED       policy abort / auth / user cancel
     UNKNOWN              anything else
-- MAX_RECOVERY_ATTEMPTS = 1: the parent FAIL record is never mutated.
-  Recovery state is appended to the child run record, which is the
-  durable unit of recovery accounting.
+- Attempt semantics:
+    recovery_dispatch_attempt   incremented for every dispatch call
+    recovery_execution_attempt  incremented only when the worker actually
+                                started (status != BLOCKED with an auth
+                                pre-execution reason)
+  MAX_RECOVERY_ATTEMPTS = 1 applies to recovery_execution_attempt: the
+  parent FAIL record is never mutated.  Pre-execution blocks do not
+  consume the execution budget, but they are bounded by a hard cap on
+  dispatch attempts to prevent infinite retry loops.
+- Auth grant registration reuses the existing DirectIngressGrantAuthorizer
+  path: the recovery child inherits the parent's goal contract verbatim,
+  guaranteeing Recovery Scope <= Original Source Scope.
 - Read-only evidence: the agent-stall-detector scan is consumed as
   external evidence only; it is never mutated by this layer.
 """
@@ -33,13 +42,16 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Protocol
 
+from plachem_fast_gateway.auth_broker import execution_auth_scope
 from plachem_fast_gateway.core_engine import CoreEngine, RunRegistry
 from plachem_fast_gateway.openclaw_adapter import CoreRunStatus
 from plachem_fast_gateway.runtime_policy import normalize_goal_contract
 
 MAX_RECOVERY_ATTEMPTS = 1
+MAX_RECOVERY_DISPATCH_ATTEMPTS = 3
 
 RECOVERY_EVENT_CODE = "RECOVERY_ATTEMPTED"
+RECOVERY_EXECUTION_EVENT_CODE = "RECOVERY_EXECUTION_STARTED"
 
 RESULT_RECOVERABLE = "RESULT_RECOVERABLE"
 SESSION_RECOVERABLE = "SESSION_RECOVERABLE"
@@ -70,6 +82,16 @@ _RESULT_VALIDATION_PREFIXES = (
     "RESULT_SCHEMA_VALIDATION_FAILED:",
 )
 
+# Auth pre-execution block reasons: the worker never started.
+_PRE_EXECUTION_BLOCK_REASONS = {
+    "AUTH_AUTH_REQUIRED",
+    "AUTH_BROKER_UNAVAILABLE",
+    "AUTH_BINDING_MISMATCH",
+    "AUTH_FORBIDDEN_FIELD",
+    "AUTH_EXPIRED",
+    "AUTH_CONFLICT",
+}
+
 
 def classify_fail(reason: str) -> str:
     """Rule-based classification of a FAIL reason into one of 4 classes."""
@@ -95,6 +117,23 @@ def is_recoverable_class(fail_class: str) -> bool:
     return fail_class in {RESULT_RECOVERABLE, SESSION_RECOVERABLE}
 
 
+def _is_pre_execution_block(status: str, reason: str) -> bool:
+    """True when the child was blocked before the worker ever started."""
+
+    return (status == CoreRunStatus.BLOCKED.value
+            and reason in _PRE_EXECUTION_BLOCK_REASONS)
+
+
+def _recovery_attempt_counts(record: Mapping[str, Any]) -> tuple[int, int]:
+    """Return (dispatch_attempts, execution_attempts) from child goal_state."""
+
+    goal_state = (record.get("policy_state") or {}).get("goal") or {}
+    return (
+        int(goal_state.get("recovery_dispatch_attempt") or 0),
+        int(goal_state.get("recovery_execution_attempt") or 0),
+    )
+
+
 class RecoveryDispatcher(Protocol):
     def dispatch(
         self, *, agent_id: str, message: str, timeout_seconds: float,
@@ -111,8 +150,22 @@ class RecoveryVerdict:
     detail: str = ""
 
 
-def evaluate_recovery(record: Mapping[str, Any]) -> RecoveryVerdict:
-    """Decide whether one terminal run record is eligible for recovery."""
+def evaluate_recovery(
+    record: Mapping[str, Any],
+    *,
+    existing_execution_attempts: int | None = None,
+) -> RecoveryVerdict:
+    """Decide whether one terminal run record is eligible for recovery.
+
+    MAX_RECOVERY_ATTEMPTS applies to recovery_execution_attempt:
+    pre-execution blocks do not consume the execution budget.
+
+    The parent FAIL record is immutable, so recovery accounting lives on
+    the child record.  When called from RecoveryLayer (which can scan
+    children), ``existing_execution_attempts`` is passed explicitly.
+    When called standalone with a child record, the record's own
+    goal_state is used as fallback.
+    """
 
     status = str(record.get("status") or "")
     reason = str(record.get("reason") or "")
@@ -131,13 +184,14 @@ def evaluate_recovery(record: Mapping[str, Any]) -> RecoveryVerdict:
             reason="CLASS_NOT_RECOVERABLE",
             detail=reason,
         )
-    attempts = int(record.get("recovery_attempts") or 0)
-    if attempts >= MAX_RECOVERY_ATTEMPTS:
+    if existing_execution_attempts is None:
+        _, existing_execution_attempts = _recovery_attempt_counts(record)
+    if existing_execution_attempts >= MAX_RECOVERY_ATTEMPTS:
         return RecoveryVerdict(
             fail_class=fail_class,
             eligible=False,
             reason="MAX_RECOVERY_ATTEMPTS",
-            detail=f"attempts={attempts}",
+            detail=f"execution_attempts={existing_execution_attempts}",
         )
     return RecoveryVerdict(
         fail_class=fail_class,
@@ -200,7 +254,7 @@ def build_recovery_message(
         + "Do not use Markdown code fences and do not add prose before or after the JSON object. "
         + 'Top-level fields status, summary, evidence, artifacts, and scope are mandatory. '
         + 'status: "completed" only when all remaining conditions are actually verified, '
-        'otherwise "failed" or "blocked". summary: concise actual outcome. '
+        + 'otherwise "failed" or "blocked". summary: concise actual outcome. '
         + 'evidence: non-empty array of {"type","detail"} objects for this run only. '
         + 'artifacts: array of {"path"} for outputs newly produced by this run. '
         + 'scope: {"compliant": true, "violations": []}.'
@@ -209,19 +263,29 @@ def build_recovery_message(
 
 
 def recovery_goal_contract(source: Mapping[str, Any]) -> dict[str, Any] | None:
-    """Project the parent goal contract; recovery never rewrites it."""
+    """Project the parent goal contract for the recovery child.
+
+    Recovery never rewrites the contract: the child inherits the exact
+    same objective, scope, and completion conditions as the parent.
+    The goal_id field is intentionally omitted because
+    CoreEngine._dispatch calls normalize_goal_contract() which
+    deterministically regenerates the identical goal_id from the same
+    content.  This guarantees Recovery Scope <= Original Source Scope
+    and allows the auth grant digest to match the normalized contract
+    that CoreEngine._dispatch computes internally.
+    """
 
     contract = source.get("goal_contract")
     if not isinstance(contract, Mapping) or not contract:
         return None
-    return {
-        key: contract[key]
-        for key in (
-            "primary_objective", "allowed_scope", "forbidden_scope",
-            "expected_result", "completion_conditions",
-        )
-        if key in contract
-    }
+    projected: dict[str, Any] = {}
+    for key in (
+        "primary_objective", "allowed_scope",
+        "forbidden_scope", "expected_result", "completion_conditions",
+    ):
+        if key in contract:
+            projected[key] = contract[key]
+    return projected or None
 
 
 def _utcnow() -> datetime:
@@ -242,12 +306,14 @@ class RecoveryLayer:
         *,
         dispatcher: RecoveryDispatcher | None = None,
         max_attempts: int = MAX_RECOVERY_ATTEMPTS,
+        max_dispatch_attempts: int = MAX_RECOVERY_DISPATCH_ATTEMPTS,
         clock: Callable[[], datetime] = _utcnow,
     ) -> None:
         self.engine = engine
         self.registry = registry
         self._dispatcher = dispatcher or engine
         self.max_attempts = max(1, int(max_attempts))
+        self.max_dispatch_attempts = max(1, int(max_dispatch_attempts))
         self._clock = clock
 
     # -- classification -------------------------------------------------
@@ -255,25 +321,44 @@ class RecoveryLayer:
         record = self.registry.get(core_run_id)
         if record is None:
             raise ValueError(f"UNKNOWN_CORE_RUN:{core_run_id}")
-        return evaluate_recovery(record)
+        # The parent FAIL record is immutable.  Recovery accounting lives
+        # on child records, so scan children for existing execution
+        # attempts before evaluating eligibility.
+        existing_exec = self._max_execution_attempts(core_run_id)
+        return evaluate_recovery(record, existing_execution_attempts=existing_exec)
 
     # -- recovery dispatch ----------------------------------------------
     def attempt_recovery(self, core_run_id: str, *, prior_evidence: Mapping[str, Any] | None = None) -> dict[str, Any]:
         """Attempt one bounded recovery for a terminal FAIL run.
 
         The parent record is never mutated.  All recovery accounting is
-        appended to the child run record, so a repeated attempt on the same
-        parent is fail-closed via the child idempotency key.
+        appended to the child run record.  Auth grant registration
+        reuses the existing DirectIngressGrantAuthorizer path: the
+        recovery child inherits the parent's goal contract verbatim,
+        guaranteeing Recovery Scope <= Original Source Scope.
         """
         source = self.registry.get(core_run_id)
         if source is None:
             raise ValueError(f"UNKNOWN_CORE_RUN:{core_run_id}")
-        verdict = evaluate_recovery(source)
+        existing_exec = self._max_execution_attempts(core_run_id)
+        verdict = evaluate_recovery(source, existing_execution_attempts=existing_exec)
         if not verdict.eligible:
             return self._rejected(verdict, core_run_id,
                                   final_state=self._final_state_of(source))
+        # Bounded dispatch attempts: prevent infinite pre-execution retry.
+        existing_dispatches = self._count_existing_dispatches(core_run_id)
+        if existing_dispatches >= self.max_dispatch_attempts:
+            return self._rejected(
+                RecoveryVerdict(
+                    verdict.fail_class, False,
+                    "MAX_DISPATCH_ATTEMPTS",
+                    f"dispatch_attempts={existing_dispatches}",
+                ),
+                core_run_id,
+                final_state="POLICY_BLOCKED",
+            )
         child_id = f"{core_run_id}-rec-{uuid.uuid4().hex[:8]}"
-        idempotency_key = f"{source.get('idempotency_key') or core_run_id}:rec:1"
+        idempotency_key = f"{source.get('idempotency_key') or core_run_id}:rec:{existing_dispatches + 1}"
         message = build_recovery_message(
             source,
             fail_class=verdict.fail_class,
@@ -281,6 +366,47 @@ class RecoveryLayer:
             prior_evidence=prior_evidence,
         )
         goal_contract = recovery_goal_contract(source)
+
+        # -- Auth grant registration -----------------------------------
+        # Reuse the existing trusted auth path.  The recovery child
+        # inherits the parent's normalized goal contract, so the
+        # task_digest computed here matches what CoreEngine._dispatch
+        # will compute internally.  No new auth mechanism is created.
+        if (self.engine.auth_broker is not None
+                and self.engine.grant_authorizer is not None):
+            if not self.engine.grant_authorizer.owns_run(child_id):
+                return self._rejected(
+                    RecoveryVerdict(
+                        verdict.fail_class, False,
+                        "AUTH_GRANT_UNAVAILABLE",
+                        f"grant_authorizer does not own {child_id}",
+                    ),
+                    core_run_id,
+                    final_state="POLICY_BLOCKED",
+                )
+            try:
+                _normalized = normalize_goal_contract(goal_contract)
+                scope = execution_auth_scope(
+                    agent_id=source["agent_id"],
+                    message=message,
+                    core_run_id=child_id,
+                    idempotency_key=idempotency_key,
+                    goal_contract=_normalized.as_dict(),
+                )
+                self._register_auth_grant(
+                    self.engine.grant_authorizer, child_id, scope,
+                )
+            except Exception as exc:
+                return self._rejected(
+                    RecoveryVerdict(
+                        verdict.fail_class, False,
+                        "AUTH_GRANT_REGISTRATION_FAILED",
+                        f"{type(exc).__name__}: {exc}",
+                    ),
+                    core_run_id,
+                    final_state="POLICY_BLOCKED",
+                )
+
         try:
             dispatched = self._dispatcher.dispatch(
                 agent_id=source["agent_id"],
@@ -298,24 +424,51 @@ class RecoveryLayer:
                 core_run_id,
                 final_state="POLICY_BLOCKED",
             )
-        # Dispatch is asynchronous: the child is RUNNING until observed.
-        # Mark the recovery source on the child now; the final 5-state
-        # verdict is resolved in recover() after a bounded wait.
+
+        # -- Recovery accounting on the child --------------------------
+        dispatch_attempt = existing_dispatches + 1
+        child_status = str(dispatched.get("status") or "")
+        child_reason = str(dispatched.get("reason") or "")
+        execution_started = not _is_pre_execution_block(child_status, child_reason)
+        execution_attempt = 1 if execution_started else 0
+
         record = self.registry.update_goal_state(
             child_id,
-            goal_state={"recovery_source_run_id": core_run_id, "recovery_attempt": 1},
+            goal_state={
+                "recovery_source_run_id": core_run_id,
+                "recovery_dispatch_attempt": dispatch_attempt,
+                "recovery_execution_attempt": execution_attempt,
+            },
             event_code=RECOVERY_EVENT_CODE,
             event_details={
                 "source_run_id": core_run_id,
                 "source_reason": source.get("reason"),
                 "fail_class": verdict.fail_class,
-                "attempt": 1,
+                "dispatch_attempt": dispatch_attempt,
+                "execution_attempt": execution_attempt,
+                "execution_started": execution_started,
                 "max_attempts": self.max_attempts,
+                "max_dispatch_attempts": self.max_dispatch_attempts,
                 "dispatched_status": dispatched.get("status"),
                 "dispatched_reason": dispatched.get("reason"),
             },
         )
-        return {
+        if execution_started:
+            self.registry.update_goal_state(
+                child_id,
+                goal_state={
+                    "recovery_source_run_id": core_run_id,
+                    "recovery_dispatch_attempt": dispatch_attempt,
+                    "recovery_execution_attempt": execution_attempt,
+                },
+                event_code=RECOVERY_EXECUTION_EVENT_CODE,
+                event_details={
+                    "source_run_id": core_run_id,
+                    "dispatch_attempt": dispatch_attempt,
+                    "execution_attempt": execution_attempt,
+                },
+            )
+        result: dict[str, Any] = {
             "status": "DISPATCHED",
             "verdict": {
                 "fail_class": verdict.fail_class,
@@ -325,9 +478,17 @@ class RecoveryLayer:
             },
             "source_run_id": core_run_id,
             "recovery_run_id": child_id,
+            "recovery_dispatch_attempt": dispatch_attempt,
+            "recovery_execution_attempt": execution_attempt,
+            "execution_started": execution_started,
             "final_state": None,
             "classified_at": record.get("updated_at"),
         }
+        # If the dispatch itself returned a pre-execution terminal
+        # (BLOCKED with auth reason), resolve the final state now.
+        if CoreRunStatus(child_status) in _TERMINAL_STATES:
+            result["final_state"] = self._final_state_of(dispatched)
+        return result
 
     # -- verdict ----------------------------------------------------------
     def recover(self, core_run_id: str, *, wait_seconds: float = 30.0) -> dict[str, Any]:
@@ -353,6 +514,34 @@ class RecoveryLayer:
         return result
 
     @staticmethod
+    def _register_auth_grant(grant_authorizer: Any, child_id: str, scope: Any) -> None:
+        """Register an auth grant for a recovery child run.
+
+        Reuses the existing DirectIngressGrantAuthorizer.register() path.
+        Works with both CompositeGrantAuthorizer (production) and
+        DirectIngressGrantAuthorizer (direct) by routing to the
+        appropriate authorizer.
+        """
+        # CompositeGrantAuthorizer routes to the owning authorizer.
+        if hasattr(grant_authorizer, "direct") and hasattr(grant_authorizer, "authorizers"):
+            # Composite: route to the direct authorizer for direct-* runs
+            for authorizer in grant_authorizer.authorizers:
+                if hasattr(authorizer, "owns_run") and authorizer.owns_run(child_id):
+                    if hasattr(authorizer, "register"):
+                        authorizer.register(child_id, scope)
+                        return
+            raise ValueError(
+                f"no authorizer with register() owns {child_id}"
+            )
+        # Direct authorizer
+        if hasattr(grant_authorizer, "register"):
+            grant_authorizer.register(child_id, scope)
+            return
+        raise ValueError(
+            f"grant_authorizer {type(grant_authorizer).__name__} has no register()"
+        )
+
+    @staticmethod
     def _rejected(verdict: RecoveryVerdict, source_run_id: str, *, final_state: str) -> dict[str, Any]:
         return {
             "status": "REJECTED",
@@ -364,9 +553,39 @@ class RecoveryLayer:
             },
             "source_run_id": source_run_id,
             "recovery_run_id": None,
+            "recovery_dispatch_attempt": 0,
+            "recovery_execution_attempt": 0,
+            "execution_started": False,
             "final_state": final_state,
             "classified_at": _utcnow_iso(),
         }
+
+    def _count_existing_dispatches(self, core_run_id: str) -> int:
+        """Count existing recovery child dispatch attempts for a parent."""
+
+        count = 0
+        for record in self.registry.recent(limit=200):
+            if not self._is_recovery_child(record):
+                continue
+            goal_state = (record.get("policy_state") or {}).get("goal") or {}
+            if goal_state.get("recovery_source_run_id") == core_run_id:
+                count += 1
+        return count
+
+    def _max_execution_attempts(self, core_run_id: str) -> int:
+        """Return the max recovery_execution_attempt across children of a parent.
+
+        The parent FAIL record is immutable, so all recovery accounting
+        lives on child records.
+        """
+        max_exec = 0
+        for record in self.registry.recent(limit=200):
+            if not self._is_recovery_child(record):
+                continue
+            goal_state = (record.get("policy_state") or {}).get("goal") or {}
+            if goal_state.get("recovery_source_run_id") == core_run_id:
+                max_exec = max(max_exec, int(goal_state.get("recovery_execution_attempt") or 0))
+        return max_exec
 
     # -- bounded wait on a recovery child ---------------------------------
     def wait_recovery(self, recovery_run_id: str, *, wait_seconds: float = 30.0) -> dict[str, Any]:
@@ -384,11 +603,14 @@ class RecoveryLayer:
             final_state = self._final_state_of(child)
         else:
             final_state = "NEEDS_REVIEW"
+        goal_state = (child.get("policy_state") or {}).get("goal") or {}
         return {
             "status": "WAITED",
             "recovery_run_id": recovery_run_id,
             "child_status": str(child.get("status") or ""),
             "child_reason": str(child.get("reason") or ""),
+            "recovery_dispatch_attempt": int(goal_state.get("recovery_dispatch_attempt") or 0),
+            "recovery_execution_attempt": int(goal_state.get("recovery_execution_attempt") or 0),
             "final_state": final_state,
             "classified_at": _utcnow_iso(),
         }
