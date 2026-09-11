@@ -8,10 +8,13 @@ directory, delivery channel, or arbitrary session id.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import sqlite3
+import stat
+import tempfile
 import threading
 import time
 import uuid
@@ -126,6 +129,107 @@ class GatewaySocket(Protocol):
 SocketFactory = Callable[[str, float], GatewaySocket]
 GatewayEventHandler = Callable[[Mapping[str, Any]], None]
 
+DEFAULT_DEVICE_IDENTITY_PATH = (
+    Path(__file__).resolve().parent.parent / "runtime" / "fast-gateway-device-identity.json"
+)
+
+
+def _b64url(data: bytes) -> str:
+    import base64
+
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode(value: str) -> bytes:
+    import base64
+
+    padded = value + "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode(padded.encode("ascii"))
+
+
+def _load_or_create_device_identity(path: Path) -> tuple[str, str, str]:
+    """Load or create the persistent OpenClaw device identity.
+
+    Returns (device_id, public_key_raw_b64url, private_key_b64url). The
+    device id is derived from the public key (sha256 hex) so every reconnect
+    presents the same identity; the private key is persisted so the identity
+    survives restarts.
+    """
+    from nacl.signing import SigningKey
+
+    if path.exists():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if (
+                isinstance(raw, Mapping)
+                and isinstance(raw.get("device_id"), str)
+                and isinstance(raw.get("public_key"), str)
+                and isinstance(raw.get("private_key"), str)
+            ):
+                return raw["device_id"], raw["public_key"], raw["private_key"]
+        except Exception:
+            pass
+
+    sk = SigningKey.generate()
+    pk_raw = sk.verify_key.encode()
+    device_id = hashlib.sha256(pk_raw).hexdigest()
+    public_b64 = _b64url(pk_raw)
+    private_b64 = _b64url(sk.encode())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".device-identity-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(
+                {"device_id": device_id, "public_key": public_b64, "private_key": private_b64},
+                handle,
+            )
+        os.chmod(tmp_name, stat.S_IRUSR | stat.S_IWUSR)
+        os.replace(tmp_name, path)
+    finally:
+        if os.path.exists(tmp_name):
+            try:
+                os.unlink(tmp_name)
+            except Exception:
+                pass
+    return device_id, public_b64, private_b64
+
+
+def _sign_device_payload(
+    private_key_b64url: str,
+    *,
+    device_id: str,
+    client_id: str,
+    client_mode: str,
+    role: str,
+    scopes: list[str],
+    signed_at_ms: int,
+    token: str,
+    nonce: str,
+    platform: str,
+    device_family: str,
+) -> str:
+    """Sign the OpenClaw v3 device-auth payload (server falls back to v2)."""
+    from nacl.signing import SigningKey
+
+    sk = SigningKey(_b64url_decode(private_key_b64url))
+    payload = "|".join(
+        [
+            "v3",
+            device_id,
+            client_id,
+            client_mode,
+            role,
+            ",".join(scopes),
+            str(signed_at_ms),
+            token,
+            nonce,
+            platform.lower(),
+            device_family.lower(),
+        ]
+    )
+    signed = sk.sign(payload.encode("utf-8"))
+    return _b64url(signed.signature)
+
 
 def _default_socket_factory(url: str, timeout: float) -> GatewaySocket:
     # websockets is a normal declared runtime dependency.  No OpenClaw
@@ -155,6 +259,7 @@ class GatewayRPCClient:
         client_id: str = "gateway-client",
         client_version: str = "1",
         stale_after_seconds: float = 60.0,
+        device_identity_path: str | Path | None = None,
     ) -> None:
         if url != DEFAULT_GATEWAY_URL:
             raise ValueError("OpenClaw endpoint override is not allowed")
@@ -175,6 +280,12 @@ class GatewayRPCClient:
         self._methods: set[str] = set()
         self.role = ""
         self.scopes: tuple[str, ...] = ()
+        identity_path = (
+            Path(device_identity_path) if device_identity_path else DEFAULT_DEVICE_IDENTITY_PATH
+        )
+        self._device_id, self._device_public_key, self._device_private_key = (
+            _load_or_create_device_identity(identity_path)
+        )
 
     @property
     def methods(self) -> frozenset[str]:
@@ -199,8 +310,18 @@ class GatewayRPCClient:
                 socket = self._socket_factory(self._url, self._connect_timeout)
                 self._socket = socket
                 self._last_activity = time.monotonic()
+                challenge_ts: int | None = None
+                challenge_nonce: str | None = None
                 try:
-                    self._receive_challenge_locked(timeout=self._connect_timeout)
+                    challenge = self._receive_challenge_locked(timeout=self._connect_timeout)
+                    challenge_payload = challenge.get("payload")
+                    if isinstance(challenge_payload, Mapping):
+                        ts = challenge_payload.get("ts")
+                        nonce = challenge_payload.get("nonce")
+                        if isinstance(ts, int) and not isinstance(ts, bool):
+                            challenge_ts = ts
+                        if isinstance(nonce, str) and nonce:
+                            challenge_nonce = nonce
                 except (IndexError, KeyError, TimeoutError, TransportError) as challenge_error:
                     # A small number of legacy in-process gateways enqueue
                     # their hello response only after the connect frame.
@@ -212,21 +333,46 @@ class GatewayRPCClient:
                         challenge_error, (IndexError, KeyError, TimeoutError, TransportError)
                     ) or (cause is not None and not isinstance(cause, (IndexError, KeyError, TimeoutError))):
                         raise
+                signed_at_ms = (
+                    challenge_ts if challenge_ts is not None else int(time.time() * 1000)
+                )
+                nonce = challenge_nonce or ""
+                connect_params: dict[str, Any] = {
+                    "minProtocol": PROTOCOL_VERSION,
+                    "maxProtocol": PROTOCOL_VERSION,
+                    "client": {
+                        "id": self._client_id,
+                        "version": self._client_version,
+                        "platform": "linux",
+                        "mode": "backend",
+                    },
+                    "role": "operator",
+                    "scopes": list(REQUIRED_SCOPES),
+                    "auth": {"token": token},
+                }
+                if nonce:
+                    connect_params["device"] = {
+                        "id": self._device_id,
+                        "publicKey": self._device_public_key,
+                        "signature": _sign_device_payload(
+                            self._device_private_key,
+                            device_id=self._device_id,
+                            client_id=self._client_id,
+                            client_mode="backend",
+                            role="operator",
+                            scopes=list(REQUIRED_SCOPES),
+                            signed_at_ms=signed_at_ms,
+                            token=token,
+                            nonce=nonce,
+                            platform="linux",
+                            device_family="",
+                        ),
+                        "signedAt": signed_at_ms,
+                        "nonce": nonce,
+                    }
                 payload = self._request_locked(
                     "connect",
-                    {
-                        "minProtocol": PROTOCOL_VERSION,
-                        "maxProtocol": PROTOCOL_VERSION,
-                        "client": {
-                            "id": self._client_id,
-                            "version": self._client_version,
-                            "platform": "linux",
-                            "mode": "backend",
-                        },
-                        "role": "operator",
-                        "scopes": list(REQUIRED_SCOPES),
-                        "auth": {"token": token},
-                    },
+                    connect_params,
                     timeout=self._connect_timeout,
                 )
             except Exception as exc:
