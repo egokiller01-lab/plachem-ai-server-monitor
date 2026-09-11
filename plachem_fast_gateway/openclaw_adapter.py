@@ -283,6 +283,7 @@ class GatewayRPCClient:
         identity_path = (
             Path(device_identity_path) if device_identity_path else DEFAULT_DEVICE_IDENTITY_PATH
         )
+        self._device_identity_path = identity_path
         self._device_id, self._device_public_key, self._device_private_key = (
             _load_or_create_device_identity(identity_path)
         )
@@ -527,6 +528,7 @@ class GatewayRPCClient:
             client_id=self._client_id,
             client_version=self._client_version,
             stale_after_seconds=self._stale_after_seconds,
+            device_identity_path=getattr(self, "_device_identity_path", None),
         )
         try:
             return client.request(method, params, timeout=timeout, event_handler=event_handler)
@@ -1464,16 +1466,13 @@ class OpenClawAdapter:
 
     def cancel(self, core_run_id: str) -> RunBinding:
         binding = self._require_binding(core_run_id)
+        abort_params = {
+            "key": binding.session_key,
+            "runId": binding.openclaw_run_id,
+            "agentId": binding.agent_id,
+        }
         try:
-            response = self.rpc.request_on_owner_connection(
-                "sessions.abort" if "sessions.abort" in self.rpc.methods else "chat.abort",
-                {
-                    "key": binding.session_key,
-                    "runId": binding.openclaw_run_id,
-                    "agentId": binding.agent_id,
-                },
-                timeout=15.0,
-            )
+            response = self._abort_run(abort_params)
         except GatewayContractError as exc:
             # Abort is idempotent when the underlying run already completed.
             if exc.code not in {"RUN_NOT_FOUND", "ALREADY_FINISHED", "RUN_ALREADY_FINISHED", "NO_ACTIVE_RUN"}:
@@ -1488,6 +1487,29 @@ class OpenClawAdapter:
         if not confirmed:
             raise GatewayContractError("OpenClaw did not confirm abort")
         return self._set_status(binding, CoreRunStatus.CANCELLED)
+
+    def _abort_run(self, abort_params: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Abort a run, falling back to a fresh connection only when the
+        owner connection is definitively gone (socket is None).
+
+        The normal path (owner connection alive, even if stale) is unchanged:
+        the gateway binds a run to the connection that submitted it, so a
+        fresh connection has no authority to abort that run.  Only when the
+        owner socket has been dropped do we open exactly one fresh connection
+        presenting the same stable device.id and attempt ``sessions.abort``
+        once.  No retry, no admin, no policy change.
+        """
+        method = "sessions.abort" if "sessions.abort" in self.rpc.methods else "chat.abort"
+        try:
+            return self.rpc.request_on_owner_connection(method, abort_params, timeout=15.0)
+        except TransportError:
+            with self.rpc._lock:
+                owner_socket_gone = self.rpc._socket is None
+            if not owner_socket_gone:
+                raise
+            # Owner socket is gone.  One fresh connection with the same stable
+            # device identity.  A failure here propagates to the caller.
+            return self.rpc.request_fresh(method, abort_params, timeout=15.0)
 
     def _require_binding(self, core_run_id: str) -> RunBinding:
         binding = self.bindings.get(core_run_id)

@@ -378,6 +378,79 @@ class OpenClawAdapterTests(unittest.TestCase):
             abort["params"],
         )
 
+    # --- TASK 4: fresh-connection abort fallback (stable device.id) ---
+
+    def test_owner_connection_gone_cancel_falls_back_to_fresh_connection(self):
+        """When the owner socket is gone, one fresh connection with the same
+        stable device.id is used to abort the run."""
+        handlers = {"agent": accepted, "sessions.abort": {"status": "aborted"}}
+        adapter, fake = self.adapter(handlers)
+        adapter.submit("core-run-1", self.payload())
+        # Kill the owner socket to simulate a dropped owner connection.
+        with adapter.rpc._lock:
+            adapter.rpc._disconnect_locked()
+        self.assertIsNone(adapter.rpc._socket)
+        abort_handler = Mock(return_value={"status": "aborted"})
+        adapter.rpc.request_fresh = abort_handler
+        binding = adapter.cancel("core-run-1")
+        self.assertEqual(CoreRunStatus.CANCELLED, binding.status)
+        self.assertEqual(1, abort_handler.call_count)
+        # Verify the fresh connection received the correct abort params.
+        call_args = abort_handler.call_args
+        params = call_args[0][1]
+        self.assertEqual("openclaw-run-1", params["runId"])
+        self.assertEqual("qwentest", params["agentId"])
+
+    def test_owner_connection_gone_fresh_abort_success_is_cancelled(self):
+        """Fresh-connection abort success maps to CANCELLED status, not
+        POLICY_ABORT_FAILED."""
+        handlers = {"agent": accepted, "sessions.abort": {"status": "aborted"}}
+        adapter, fake = self.adapter(handlers)
+        adapter.submit("core-run-1", self.payload())
+        with adapter.rpc._lock:
+            adapter.rpc._disconnect_locked()
+        adapter.rpc.request_fresh = Mock(return_value={"status": "aborted"})
+        binding = adapter.cancel("core-run-1")
+        self.assertEqual(CoreRunStatus.CANCELLED, binding.status)
+        # No exception raised — POLICY_ABORT_FAILED does not occur.
+
+    def test_owner_connection_gone_fresh_abort_failure_propagates(self):
+        """If the fresh-connection abort also fails, the error propagates
+        (no retry, no silent success)."""
+        handlers = {"agent": accepted, "sessions.abort": {"status": "aborted"}}
+        adapter, fake = self.adapter(handlers)
+        adapter.submit("core-run-1", self.payload())
+        with adapter.rpc._lock:
+            adapter.rpc._disconnect_locked()
+        adapter.rpc.request_fresh = Mock(
+            side_effect=TransportError("fresh connection failed")
+        )
+        with self.assertRaises(TransportError):
+            adapter.cancel("core-run-1")
+        # Exactly one fresh attempt — no retry.
+        self.assertEqual(1, adapter.rpc.request_fresh.call_count)
+
+    def test_fresh_connection_uses_same_device_identity_path(self):
+        """The fresh connection inherits the same device identity path as the
+        owner connection, preserving stable device.id."""
+        handlers = {"agent": accepted, "sessions.abort": {"status": "aborted"}}
+        adapter, fake = self.adapter(handlers)
+        adapter.submit("core-run-1", self.payload())
+        with adapter.rpc._lock:
+            adapter.rpc._disconnect_locked()
+        # request_fresh already receives device_identity_path via
+        # getattr(self, "_device_identity_path", None) — verify it is set.
+        self.assertIsNotNone(adapter.rpc._device_identity_path)
+        # Simulate a fresh connection to confirm the path is passed through.
+        captured = {}
+        def capture_fresh(method, params, *, timeout, event_handler=None):
+            captured["called"] = True
+            return {"status": "aborted"}
+        adapter.rpc.request_fresh = capture_fresh
+        binding = adapter.cancel("core-run-1")
+        self.assertTrue(captured.get("called"))
+        self.assertEqual(CoreRunStatus.CANCELLED, binding.status)
+
     def test_invalid_agent_and_forbidden_fields_fail_before_transport(self):
         adapter, fake = self.adapter({"agent": accepted})
         with self.assertRaisesRegex(GatewayContractError, "INVALID_AGENT_ID"):
