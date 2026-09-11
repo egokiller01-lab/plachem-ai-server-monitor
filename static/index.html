@@ -586,6 +586,34 @@
     .wd-empty { font-size: 12px; color: var(--muted); padding: 8px 0; }
     @media (max-width: 620px) { .watchdog-grid { grid-template-columns: 1fr; } }
 
+    /* Watchdog summary-only mode on initial screen */
+    .watchdog-grid.wd-summary-hidden { display: none; }
+    .wd-summary-line { font-size: 12px; color: var(--muted); margin-top: 6px; line-height: 1.6; }
+    .wd-summary-line b { color: var(--text); font-weight: 700; }
+    .wd-summary-line .wd-abn { color: var(--red); font-weight: 700; }
+
+    /* OpenClaw Agents table - watchdog-integrated state badges */
+    .oc-state {
+      display: inline-block;
+      padding: 2px 9px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .oc-state.wd-stall, .oc-state.wd-loop, .oc-state.wd-context {
+      color: #fff;
+      background: rgba(255, 92, 113, 0.65);
+      border: 1px solid rgba(255, 92, 113, 0.8);
+      animation: wd-blink 1.6s ease-in-out infinite;
+    }
+    @keyframes wd-blink {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(255, 92, 113, 0.45); }
+      50% { box-shadow: 0 0 10px 2px rgba(255, 92, 113, 0.55); }
+    }
+    .oc-state-plain { color: var(--muted); font-size: 12px; }
+
     .gpu-grid, .agent-grid {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1340,7 +1368,8 @@
         <span id="watchdog-scan" class="watchdog-scan-meta">last scan: --</span>
         <span id="watchdog-pill" class="watchdog-pill unknown">--</span>
       </div>
-      <div id="watchdog-grid" class="watchdog-grid"><div class="wd-empty">Loading…</div></div>
+      <div id="watchdog-summary" class="wd-summary-line">Loading…</div>
+      <div id="watchdog-grid" class="watchdog-grid wd-summary-hidden"></div>
     </section>
 
     <section class="card openclaw-main-summary">
@@ -1696,6 +1725,8 @@
       const pill = document.getElementById("watchdog-pill");
       pill.textContent = "UNAVAILABLE";
       pill.className = "watchdog-pill unknown";
+      const summaryEl = document.getElementById("watchdog-summary");
+      if (summaryEl) summaryEl.textContent = "Watchdog UNAVAILABLE · 상세: OpenClaw Control → Agents";
       document.getElementById("watchdog-grid").innerHTML = '<div class="wd-empty">UNAVAILABLE</div>';
     }
 
@@ -1712,6 +1743,8 @@
         scanEl.textContent = "last scan: UNAVAILABLE";
         pill.textContent = "UNAVAILABLE";
         pill.className = "watchdog-pill unknown";
+        const summaryElU = document.getElementById("watchdog-summary");
+        if (summaryElU) summaryElU.textContent = "Watchdog 데이터 UNAVAILABLE · 상세: OpenClaw Control → Agents";
         grid.innerHTML = '<div class="wd-empty">UNAVAILABLE</div>';
         return;
       }
@@ -1728,6 +1761,18 @@
         const sb = agents[b].status === "ABNORMAL" ? 0 : 1;
         return sa - sb || a.localeCompare(b);
       });
+      const summaryEl = document.getElementById("watchdog-summary");
+      if (summaryEl) {
+        const abnormalNames = names.filter(n => (agents[n] || {}).status === "ABNORMAL");
+        if (abnormalNames.length) {
+          summaryEl.innerHTML = `이상 <span class="wd-abn">${abnormalNames.length}</span> / ${names.length} agent — ` +
+            abnormalNames.slice(0, 6).map(n => wdEscape(n)).join(", ") +
+            (abnormalNames.length > 6 ? ` 외 ${abnormalNames.length - 6}건` : "") +
+            ` · 상세: OpenClaw Control → Agents`;
+        } else {
+          summaryEl.innerHTML = `모든 agent <b>NORMAL</b> (${names.length} agents) · 상세: OpenClaw Control → Agents`;
+        }
+      }
       if (!names.length) {
         grid.innerHTML = '<div class="wd-empty">No agents with active detections</div>';
         return;
@@ -1753,12 +1798,15 @@
       }).join("");
     }
 
+    let watchdogData = null;
     async function refreshWatchdog() {
       try {
         const response = await fetch("/api/detail/agent-watchdog", { cache: "no-store" });
         const data = await response.json();
         if (data.status !== "ok") { renderWatchdogError(); return; }
+        watchdogData = data;
         renderWatchdog(data);
+        if (currentOpenclaw) { try { renderOpenclaw(openclawLastData || {}); } catch (e) { /* ignore */ } }
       } catch (err) {
         renderWatchdogError();
       }
@@ -1841,7 +1889,10 @@
     }
 
     function table(headers, rows) {
-      return `<table class="detail-table"><thead><tr>${headers.map(h => `<th>${escapeHtml(h)}</th>`).join("")}</tr></thead><tbody>${rows.map(row => `<tr>${row.map(cell => `<td>${escapeHtml(cell)}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+      const cellHtml = cell => (typeof cell === "string" && cell.startsWith("\u0001"))
+        ? cell.slice(1)
+        : `<td>${escapeHtml(cell)}</td>`;
+      return `<table class="detail-table"><thead><tr>${headers.map(h => `<th>${escapeHtml(h)}</th>`).join("")}</tr></thead><tbody>${rows.map(row => `<tr>${row.map(cellHtml).join("")}</tr>`).join("")}</tbody></table>`;
     }
 
     function card(title, body, wide = false) {
@@ -2062,6 +2113,7 @@
 
 
     let openclawLastLoad = 0;
+    let openclawLastData = null;
 
     function renderOpenclawSummary(data) {
       const s = data.summary || {};
@@ -2074,7 +2126,26 @@
       const agents = data.agents || [];
       const providers = data.providers || [];
       const skills = data.skills || { items: [], by_source: {} };
-      const agentRows = agents.map(a => [a.id, `${a.emoji || ""} ${a.name || a.id}`, a.model || "unknown", (a.platforms || []).join(", ") || "-", a.session?.state || "unknown", a.session?.session_count ?? 0, a.session?.total_tokens ?? 0]);
+      const wd = (typeof watchdogData !== "undefined" && watchdogData && watchdogData.available) ? (watchdogData.agents || {}) : {};
+      const agentRows = agents.map(a => {
+        const baseState = a.session?.state || "unknown";
+        const wdInfo = wd[a.id] || wd[String(a.id).toLowerCase()] || null;
+        const buckets = wdInfo ? (wdInfo.buckets || {}) : {};
+        const has = k => buckets[k] && buckets[k].count > 0;
+        let label = null, cls = "";
+        if (has("LOOP")) { label = "LOOP"; cls = "wd-loop"; }
+        else if (has("STALL")) { label = "STALL"; cls = "wd-stall"; }
+        else if (has("CONTEXT")) { label = "CONTEXT"; cls = "wd-context"; }
+        let title = `OpenClaw state: ${baseState}`;
+        if (label) {
+          const warns = (wdInfo.warnings || []).slice(0, 3).map(w => `${w.kind} [${w.severity}] ${w.reason}`);
+          title += ` | Watchdog: ${label} | ` + (warns.join(" | ") || "detection evidence unavailable");
+        }
+        const stateCell = "\u0001" + (label
+          ? `<td><span class="oc-state ${cls}" title="${escapeHtml(title)}">${label}</span></td>`
+          : `<td><span class="oc-state-plain" title="${escapeHtml(title)}">${escapeHtml(baseState)}</span></td>`);
+        return [a.id, `${a.emoji || ""} ${a.name || a.id}`, a.model || "unknown", (a.platforms || []).join(", ") || "-", stateCell, a.session?.session_count ?? 0, a.session?.total_tokens ?? 0];
+      });
       const modelRows = providers.flatMap(p => (p.models || []).map(m => [p.id, p.api || "-", p.access_mode || "-", m.id || m.name, m.context_window || "-", m.max_tokens || "-", (p.used_by || []).map(a => a.name || a.id).join(", ") || "-"]));
       const skillRows = (skills.items || []).map(skill => [skill.name || skill.id, skill.source || "-", skill.description || "-"]);
       const sourceRows = Object.entries(skills.by_source || {}).map(([source, count]) => [source, count]);
@@ -2096,6 +2167,7 @@
       try {
         const response = await fetch("/api/openclaw/status", { cache: "no-store" });
         const data = await response.json();
+        openclawLastData = data;
         meta.textContent = `Last updated ${data.last_updated || "Unknown"} · ${data.config_path || "OpenClaw config"}`;
         renderOpenclaw(data);
       } catch (error) {
