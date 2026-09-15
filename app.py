@@ -8,6 +8,7 @@ import platform
 import re
 import shutil
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -31,6 +32,7 @@ STATIC_DIR = BASE_DIR / "static"
 
 app = FastAPI(title="PLACHEM AI Server Monitor")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+app.mount("/vocal-coach", StaticFiles(directory=STATIC_DIR / "vocal-coach", html=True), name="vocal-coach")
 app.include_router(war_room_router)
 app.include_router(war_room_actions_router)
 app.include_router(fast_gateway_router)
@@ -58,8 +60,23 @@ def stop_war_room_runtime() -> None:
 
 
 def _war_room_principal(request: Request) -> str | None:
-    """Resolve a trusted reverse-proxy, signed-session, or server token principal."""
-    return war_room._request_principal(request, None, None)
+    """Resolve a trusted reverse-proxy, signed-session, or server token principal.
+
+    The request object carries the trusted proxy headers and the signed server
+    session cookie; the server-side token map is consulted only after those
+    effective authentication paths have not resolved an identity.  This keeps
+    the token/actor path exactly as the first effective path while the
+    login-to-representative mapping is applied only after an identity has been
+    authenticated and resolved.
+    """
+    resolved = war_room._request_principal(request, None, None)
+    if resolved is not None:
+        return resolved
+    token = request.headers.get("X-War-Room-Token")
+    actor = request.headers.get("X-War-Room-Actor")
+    if not token and not actor:
+        return None
+    return war_room._request_principal(None, actor, token)
 
 
 def _war_room_read_project(path: str) -> str | None:
@@ -83,10 +100,17 @@ async def war_room_read_rbac(request: Request, call_next):
         proxy_secret = os.environ.get("PLACHEM_WAR_ROOM_REVERSE_PROXY_SECRET", "")
         proxy_principal = request.headers.get("X-Authenticated-Principal") or request.headers.get("X-Forwarded-User")
         presented_secret = request.headers.get("X-War-Room-Proxy-Secret")
-        if proxy_secret and proxy_principal and hmac.compare_digest(proxy_secret, presented_secret or "") and war_room._known_principal(proxy_principal) and os.environ.get("PLACHEM_WAR_ROOM_SESSION_SECRET"):
+        if (
+            proxy_secret
+            and proxy_principal
+            and hmac.compare_digest(proxy_secret, presented_secret or "")
+            and (war_room._known_principal(proxy_principal) or war_room._resolve_trusted_principal(proxy_principal))
+            and os.environ.get("PLACHEM_WAR_ROOM_SESSION_SECRET")
+        ):
             session_secret = os.environ["PLACHEM_WAR_ROOM_SESSION_SECRET"]
-            signature = hmac.new(session_secret.encode(), proxy_principal.encode(), hashlib.sha256).hexdigest()
-            response.set_cookie("war_room_session", f"{proxy_principal}.{signature}", httponly=True, samesite="lax", secure=request.url.scheme == "https", path="/")
+            mapped = war_room._resolve_trusted_principal(proxy_principal) or proxy_principal
+            signature = hmac.new(session_secret.encode(), mapped.encode(), hashlib.sha256).hexdigest()
+            response.set_cookie("war_room_session", f"{mapped}.{signature}", httponly=True, samesite="lax", secure=request.url.scheme == "https", path="/")
         return response
     if request.url.path.startswith("/api/war-room"):
         principal = _war_room_principal(request)
@@ -125,6 +149,10 @@ async def war_room_read_rbac(request: Request, call_next):
     return await call_next(request)
 
 _network_prev: dict[str, float | int] | None = None
+_runtime_status_cache: dict[str, Any] = {}
+_runtime_status_cache_at = 0.0
+_runtime_status_cache_lock = threading.Lock()
+_RUNTIME_STATUS_CACHE_TTL_SECONDS = 10.0
 
 
 def pct(value: float | int | None) -> float | None:
@@ -249,14 +277,33 @@ def parse_session_type(key: str) -> str:
 
 
 def read_openclaw_runtime_status() -> dict[str, Any]:
-    result = safe_run(["openclaw", "sessions", "--all-agents", "--limit", "all", "--json"], timeout=8.0)
-    if result is None or result.returncode != 0:
-        return {}
-    try:
-        payload = json.loads(result.stdout)
-    except (TypeError, json.JSONDecodeError):
-        return {}
-    return payload if isinstance(payload, dict) else {}
+    """Return one short-lived session snapshot shared by all monitor cards."""
+    global _runtime_status_cache, _runtime_status_cache_at
+
+    now = time.monotonic()
+    if _runtime_status_cache and now - _runtime_status_cache_at < _RUNTIME_STATUS_CACHE_TTL_SECONDS:
+        return _runtime_status_cache
+
+    # FastAPI runs these synchronous endpoints in worker threads. Keep the
+    # lock through refresh so simultaneous card polls launch only one CLI.
+    with _runtime_status_cache_lock:
+        now = time.monotonic()
+        if _runtime_status_cache and now - _runtime_status_cache_at < _RUNTIME_STATUS_CACHE_TTL_SECONDS:
+            return _runtime_status_cache
+
+        result = safe_run(["openclaw", "sessions", "--all-agents", "--limit", "all", "--json"], timeout=8.0)
+        if result is None or result.returncode != 0:
+            return _runtime_status_cache or {}
+        try:
+            payload = json.loads(result.stdout)
+        except (TypeError, json.JSONDecodeError):
+            return _runtime_status_cache or {}
+        if not isinstance(payload, dict):
+            return _runtime_status_cache or {}
+
+        _runtime_status_cache = payload
+        _runtime_status_cache_at = time.monotonic()
+        return _runtime_status_cache
 
 
 def read_agent_sessions(runtime_status: dict[str, Any], agent_id: str) -> dict[str, Any]:
@@ -288,8 +335,6 @@ def read_agent_sessions(runtime_status: dict[str, Any], agent_id: str) -> dict[s
         diff = now_ms - last_active
         if diff < 180000:
             state = "working"
-        elif diff < 600000:
-            state = "online"
         elif diff < 86400000:
             state = "idle"
     rows.sort(key=lambda row: row["updated_at"], reverse=True)
@@ -567,25 +612,35 @@ def gpu_risk_summary(gpus: list[dict[str, Any]]) -> dict[str, Any]:
     return {"risk": risks[worst_index], "headroom_gb": worst.get("vram_headroom_gb"), "temperature_c": worst.get("temperature_c"), "worst_index": worst_index}
 
 
+def _nvidia_smi_number(value: str | float | int | None) -> float | None:
+    """Parse nvidia-smi numeric fields, preserving unsupported values as null."""
+    if value is None:
+        return None
+    token = str(value).strip()
+    if token.upper().strip("[]") in {"N/A", "NA"}:
+        return None
+    try:
+        return round(float(token), 1)
+    except (TypeError, ValueError):
+        return None
+
+
 def _gpu_metrics_from_nvidia_smi_row(row: list[str], index: int) -> dict[str, Any] | None:
     name, gpu_util, mem_used, mem_total, temp = row[:5]
     uuid = row[5] if len(row) > 5 and row[5] else None
-    try:
-        used = float(mem_used)
-        total = float(mem_total)
-    except Exception:
-        return None
-    used_gb = round(used / 1024, 1)
-    total_gb = round(total / 1024, 1)
-    vram_percent = round((used / total) * 100, 1) if total else None
-    power_draw = pct(row[6]) if len(row) > 6 else None
-    power_limit = pct(row[7]) if len(row) > 7 else None
-    fan_speed = pct(row[8]) if len(row) > 8 else None
+    used = _nvidia_smi_number(mem_used)
+    total = _nvidia_smi_number(mem_total)
+    used_gb = round(used / 1024, 1) if used is not None else None
+    total_gb = round(total / 1024, 1) if total is not None else None
+    vram_percent = round((used / total) * 100, 1) if used is not None and total else None
+    power_draw = _nvidia_smi_number(row[6]) if len(row) > 6 else None
+    power_limit = _nvidia_smi_number(row[7]) if len(row) > 7 else None
+    fan_speed = _nvidia_smi_number(row[8]) if len(row) > 8 else None
     pci_bus_id = row[9] if len(row) > 9 and row[9] else None
-    pcie_gen_current = row[10] if len(row) > 10 and row[10].isdigit() else None
-    pcie_gen_max = row[11] if len(row) > 11 and row[11].isdigit() else None
-    pcie_width_current = row[12] if len(row) > 12 and row[12].isdigit() else None
-    pcie_width_max = row[13] if len(row) > 13 and row[13].isdigit() else None
+    pcie_gen_current = _nvidia_smi_number(row[10]) if len(row) > 10 else None
+    pcie_gen_max = _nvidia_smi_number(row[11]) if len(row) > 11 else None
+    pcie_width_current = _nvidia_smi_number(row[12]) if len(row) > 12 else None
+    pcie_width_max = _nvidia_smi_number(row[13]) if len(row) > 13 else None
     headroom_state, headroom_gb = _gpu_headroom_state({
         "vram_used_gb": used_gb, "vram_total_gb": total_gb, "vram_usage_percent": vram_percent,
     })
@@ -593,13 +648,13 @@ def _gpu_metrics_from_nvidia_smi_row(row: list[str], index: int) -> dict[str, An
         "index": index,
         "uuid": uuid,
         "name": name,
-        "usage_percent": pct(gpu_util),
+        "usage_percent": _nvidia_smi_number(gpu_util),
         "vram_used_gb": used_gb,
         "vram_total_gb": total_gb,
         "vram_usage_percent": vram_percent,
         "vram_headroom_gb": headroom_gb,
         "vram_headroom_state": headroom_state,
-        "temperature_c": pct(temp),
+        "temperature_c": _nvidia_smi_number(temp),
         "power_draw_w": power_draw,
         "power_limit_w": power_limit,
         "fan_speed_percent": fan_speed,
