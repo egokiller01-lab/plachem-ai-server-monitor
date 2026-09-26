@@ -31,6 +31,7 @@ from jev_recovery_shadow import router as jev_recovery_shadow_router
 from jev_recovery_live import LIVE_HISTORY as JEV_LIVE_HISTORY
 from jev_recovery_live import router as jev_recovery_live_router
 from fast_gateway_api import router as fast_gateway_router
+from war_room_command_center import router as war_room_command_center_router
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -46,6 +47,7 @@ app.include_router(jev_result_verifier_router)
 app.include_router(jev_recovery_shadow_router)
 app.include_router(jev_recovery_live_router)
 app.include_router(fast_gateway_router)
+app.include_router(war_room_command_center_router)
 
 
 @app.on_event("startup")

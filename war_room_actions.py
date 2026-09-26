@@ -9,8 +9,9 @@ import sqlite3
 import threading
 import time
 import uuid
+from contextlib import contextmanager
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from urllib.parse import quote
-from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Header, HTTPException, Request
@@ -356,15 +357,30 @@ def _now() -> int:
     return int(time.time())
 
 
-def _connect_rw() -> sqlite3.Connection:
+@contextmanager
+def _transaction_connection(path):
+    con = sqlite3.connect(path)
+    try:
+        with con:
+            yield con
+    finally:
+        con.close()
+
+
+@contextmanager
+def _connect_rw():
     path = war_room._db_path()
     if not path.is_file():
         raise HTTPException(503, "War Room data unavailable")
     con = sqlite3.connect(path)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA foreign_keys = ON")
-    con.execute("PRAGMA busy_timeout = 2000")
-    return con
+    try:
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA foreign_keys = ON")
+        con.execute("PRAGMA busy_timeout = 2000")
+        with con:
+            yield con
+    finally:
+        con.close()
 
 
 def _connect_ro() -> sqlite3.Connection:
@@ -383,7 +399,7 @@ def _connect_ro() -> sqlite3.Connection:
 
 def provision_action_schema(path: str | None = None) -> str:
     target = path or str(war_room._db_path())
-    with sqlite3.connect(target) as con:
+    with _transaction_connection(target) as con:
         con.executescript(SCHEMA)
         participant_columns = {row[1] for row in con.execute("PRAGMA table_info(war_participants)")}
         if "active" not in participant_columns:
@@ -1051,7 +1067,7 @@ def _grounding_packet(body: dict[str, Any], project_id: str, document_version: s
         "session_integrity_required": any("existing work sessions" in value.lower() for value in supplied.get("forbidden", []) if isinstance(value, str)),
     }
     # Approved result-document paths are server-supplied task contract data:
-    # the prepare request is the only source.  Worker responses never
+    # the prepare request is the only source. Worker responses never
     # contribute to this list; the immutable grounding packet is the trust
     # boundary forwarded into the Fast Gateway grounding envelope.
     approved_paths_raw = supplied.get("approved_paths")
@@ -1079,7 +1095,12 @@ def _grounding_packet(body: dict[str, Any], project_id: str, document_version: s
             result_artifact_paths.append(candidate)
     packet["result_artifact_paths"] = result_artifact_paths
 
-    if (not worktree.startswith("/") or any(not isinstance(packet[key], str) or not packet[key].strip() for key in ("branch","revision","api_base","db_label"))
+    absolute_worktree = (
+        Path(worktree).is_absolute()
+        or PurePosixPath(worktree).is_absolute()
+        or PureWindowsPath(worktree).is_absolute()
+    )
+    if (not absolute_worktree or any(not isinstance(packet[key], str) or not packet[key].strip() for key in ("branch","revision","api_base","db_label"))
             or any(not isinstance(values, list) or not values or any(not isinstance(v, str) or not v.strip() for v in values) for values in (packet["forbidden"], packet["completion_conditions"]))):
         raise HTTPException(422, "grounding packet is incomplete")
     return packet
