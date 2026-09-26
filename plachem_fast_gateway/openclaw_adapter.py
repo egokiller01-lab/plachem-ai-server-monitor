@@ -35,6 +35,7 @@ _ALLOWED_SUBMIT_FIELDS = {
     "idempotencyKey",
     "timeout",
     "sessionKey",
+    "_trustedValidationContext",
 }
 _FORBIDDEN_SUBMIT_FIELDS = {
     "model",
@@ -542,16 +543,54 @@ class GatewayRPCClient:
         *,
         timeout: float,
     ) -> Mapping[str, Any]:
-        """Run an ownership-sensitive RPC on the original connection.
-
-        OpenClaw binds an active agent run to the connection that submitted
-        it.  Reconnect is intentionally forbidden here: a new connection has
-        no authority to abort that run even when it has operator.write.
-        """
+        """Run an RPC on the currently connected persistent socket only."""
         with self._lock:
             if self._socket is None:
                 raise TransportError("OpenClaw Gateway owner connection is unavailable")
             return self._request_locked(method, params, timeout=timeout)
+
+    def request_fresh_abort(
+        self,
+        *,
+        session_key: str,
+        run_id: str,
+        agent_id: str,
+        timeout: float,
+    ) -> Mapping[str, Any]:
+        """Abort once on a private connection using the same stable device id.
+
+        Current OpenClaw authorizes aborts by admin, owner connection, or the
+        same stable device id.  This path is used only after the persistent
+        connection is unavailable or fails transport.  The private client
+        negotiates methods independently and performs no reconnect/retry.
+        """
+        client = GatewayRPCClient(
+            self._secret_ref,
+            url=self._url,
+            socket_factory=self._socket_factory,
+            connect_timeout=self._connect_timeout,
+            client_id=self._client_id,
+            client_version=self._client_version,
+            stale_after_seconds=self._stale_after_seconds,
+            device_identity_path=getattr(self, "_device_identity_path", None),
+        )
+        try:
+            client.connect()
+            if "sessions.abort" in client.methods:
+                return client.request_on_owner_connection(
+                    "sessions.abort",
+                    {"key": session_key, "runId": run_id, "agentId": agent_id},
+                    timeout=timeout,
+                )
+            if "chat.abort" in client.methods:
+                return client.request_on_owner_connection(
+                    "chat.abort",
+                    {"sessionKey": session_key, "runId": run_id, "agentId": agent_id},
+                    timeout=timeout,
+                )
+            raise GatewayContractError("OpenClaw abort method is unavailable")
+        finally:
+            client.close()
 
     def _is_stale_locked(self) -> bool:
         return (
@@ -1070,6 +1109,7 @@ class OpenClawAdapter:
         self.result_recovery_agent_ids = frozenset(result_recovery_agent_ids or ())
         self.history_limit = history_limit
         self._output_observer: Callable[[RunBinding, str], None] | None = None
+        self._trusted_validation_contexts: dict[str, dict[str, Any]] = {}
 
     def set_output_observer(self, observer: Callable[[RunBinding, str], None] | None) -> None:
         """Attach the Core-owned observation hook; it has no lifecycle authority."""
@@ -1158,6 +1198,17 @@ class OpenClawAdapter:
         if not isinstance(core_run_id, str) or not core_run_id:
             raise GatewayContractError("core_run_id is required")
         params = self._validate_submit(payload)
+        trusted_context = params.pop("_trustedValidationContext", {})
+        if not isinstance(trusted_context, Mapping):
+            raise GatewayContractError("INVALID_TRUSTED_VALIDATION_CONTEXT")
+        approved_paths = trusted_context.get("approved_paths", [])
+        if not isinstance(approved_paths, list) or not all(
+            isinstance(path, str) and path for path in approved_paths
+        ):
+            raise GatewayContractError("INVALID_TRUSTED_VALIDATION_CONTEXT")
+        self._trusted_validation_contexts[core_run_id] = {
+            "approved_paths": list(approved_paths),
+        }
         agent_id = str(params["agentId"])
         requested_session = params.get("sessionKey")
         session_key = requested_session or f"agent:{agent_id}:fast-gateway-{core_run_id}"
@@ -1247,26 +1298,30 @@ class OpenClawAdapter:
         return seq, message_id, False
 
     def _resolve_session_id(self, session_key: str) -> str | None:
-        """Best-effort sessionKey -> sessionId resolution via sessions.list.
+        """Best-effort exact sessionKey -> sessionId lookup on a private RPC.
 
-        Returns None when the session has no persisted row yet; submit()
-        keeps the binding session_id as None in that case (existing behavior).
+        Session identity enrichment is optional metadata and must never
+        reconnect, close, or otherwise perturb the persistent run connection.
         """
+        if "sessions.describe" not in self.rpc.methods:
+            return None
         try:
-            listing = self.rpc.request(
-                "sessions.list", {"allAgents": True, "limit": "all"}, timeout=30.0,
+            response = self.rpc.request_fresh(
+                "sessions.describe",
+                {
+                    "key": session_key,
+                    "includeDerivedTitles": False,
+                    "includeLastMessage": False,
+                },
+                timeout=15.0,
             )
         except Exception:
             return None
-        rows = listing.get("sessions")
-        if not isinstance(rows, list):
+        session = response.get("session")
+        if not isinstance(session, Mapping):
             return None
-        for row in rows:
-            if isinstance(row, Mapping) and row.get("key") == session_key:
-                sid = row.get("sessionId")
-                if isinstance(sid, str) and sid:
-                    return sid
-        return None
+        sid = session.get("sessionId")
+        return sid if isinstance(sid, str) and sid else None
 
     @classmethod
     def _history_after_watermark(
@@ -1371,7 +1426,11 @@ class OpenClawAdapter:
             key: value for key, value in response.items()
             if key not in {"result", "evidence", "artifacts", "messages", "history"}
         }
-        validation_payload: Mapping[str, Any] = {**control_payload, "history": history}
+        validation_payload: Mapping[str, Any] = {
+            **control_payload,
+            **self._trusted_validation_contexts.get(core_run_id, {}),
+            "history": history,
+        }
         raw_response = self._terminal_assistant_text(history)
         decision = self.result_validator(validation_payload)
         original_decision = decision
@@ -1489,27 +1548,44 @@ class OpenClawAdapter:
         return self._set_status(binding, CoreRunStatus.CANCELLED)
 
     def _abort_run(self, abort_params: Mapping[str, Any]) -> Mapping[str, Any]:
-        """Abort a run, falling back to a fresh connection only when the
-        owner connection is definitively gone (socket is None).
+        """Abort with the persistent connection, then one same-device fallback.
 
-        The normal path (owner connection alive, even if stale) is unchanged:
-        the gateway binds a run to the connection that submitted it, so a
-        fresh connection has no authority to abort that run.  Only when the
-        owner socket has been dropped do we open exactly one fresh connection
-        presenting the same stable device.id and attempt ``sessions.abort``
-        once.  No retry, no admin, no policy change.
+        OpenClaw authorizes an active-run abort by admin, the owner connection,
+        or the same stable device id.  Prefer the persistent connection while
+        it is healthy.  On transport loss, discard it and make exactly one
+        private same-device abort attempt with freshly negotiated methods.
         """
-        method = "sessions.abort" if "sessions.abort" in self.rpc.methods else "chat.abort"
-        try:
-            return self.rpc.request_on_owner_connection(method, abort_params, timeout=15.0)
-        except TransportError:
-            with self.rpc._lock:
-                owner_socket_gone = self.rpc._socket is None
-            if not owner_socket_gone:
-                raise
-            # Owner socket is gone.  One fresh connection with the same stable
-            # device identity.  A failure here propagates to the caller.
-            return self.rpc.request_fresh(method, abort_params, timeout=15.0)
+        session_key = str(abort_params.get("key") or "")
+        run_id = str(abort_params.get("runId") or "")
+        agent_id = str(abort_params.get("agentId") or "")
+        if not session_key or not run_id or not agent_id:
+            raise GatewayContractError("invalid abort binding")
+
+        with self.rpc._lock:
+            owner_available = self.rpc._socket is not None
+            owner_methods = self.rpc.methods
+
+        if owner_available:
+            if "sessions.abort" in owner_methods:
+                method = "sessions.abort"
+                params = {"key": session_key, "runId": run_id, "agentId": agent_id}
+            elif "chat.abort" in owner_methods:
+                method = "chat.abort"
+                params = {"sessionKey": session_key, "runId": run_id, "agentId": agent_id}
+            else:
+                raise GatewayContractError("OpenClaw abort method is unavailable")
+            try:
+                return self.rpc.request_on_owner_connection(method, params, timeout=15.0)
+            except (TransportError, TimeoutError):
+                with self.rpc._lock:
+                    self.rpc._disconnect_locked()
+
+        return self.rpc.request_fresh_abort(
+            session_key=session_key,
+            run_id=run_id,
+            agent_id=agent_id,
+            timeout=15.0,
+        )
 
     def _require_binding(self, core_run_id: str) -> RunBinding:
         binding = self.bindings.get(core_run_id)

@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import re
 import threading
 import uuid
@@ -190,6 +191,8 @@ class RunRegistry:
         goal_contract: GoalContract,
         parent_core_run_id: str | None = None,
         context_reset_count: int = 0,
+        approved_paths: list[str] | None = None,
+        watchdog_managed: bool = False,
     ) -> tuple[dict[str, Any], bool]:
         with self._lock:
             actual_id = core_run_id or self._run_id_factory()
@@ -251,6 +254,8 @@ class RunRegistry:
                 "context_reset_count": context_reset_count,
                 "max_context_resets": policy.get("max_context_resets", 0),
                 "parent_core_run_id": parent_core_run_id,
+                "approved_paths": list(approved_paths) if approved_paths else [],
+                "watchdog_managed": bool(watchdog_managed),
                 "escalation_required": False,
                 "escalation_reason": "",
                 "escalation_package": None,
@@ -474,7 +479,35 @@ class RunRegistry:
             handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
 
 
+def _read_only_has_symlink_component(path: Path) -> bool:
+    """Return True if path or any parent component is (or becomes) a symlink."""
+    current = path
+    while current != current.parent:
+        try:
+            if current.is_symlink():
+                return True
+        except OSError:
+            pass
+        current = current.parent
+    return False
+
+
+def _read_only_normalize(path: Path) -> Path:
+    """Normalize a path for designation comparison without resolving symlinks.
+
+    The original string is rejected up front when it contains ``..``
+    segments, so a designation written with traversal cannot be lexically
+    collapsed into a clean allowed path.  Otherwise ``~`` is expanded and
+    the path is lexically collapsed for exact identity comparison.
+    """
+    if ".." in path.parts:
+        return path
+    path = path.expanduser()
+    return Path(os.path.normpath(str(path)))
+
+
 def production_result_validator() -> CompositeResultValidator:
+
     """Build the fail-closed validator used by the Core production path."""
 
     claim_patterns = {
@@ -650,8 +683,50 @@ def production_result_validator() -> CompositeResultValidator:
                 "read-only", "read only", "읽기 전용", "조회만", "변경하지",
             ))
             if read_only:
-                if result.get("artifacts"):
-                    return "READ_ONLY_ARTIFACT_REUSE"
+                artifacts = result.get("artifacts")
+                # approved_paths is the existing server-supplied designation
+                # contract; result fields cannot authorize themselves.
+                designated_raw = envelope.get("approved_paths")
+                if designated_raw is None:
+                    designated_raw = []
+                if not isinstance(designated_raw, list) or not designated_raw or not all(
+                    isinstance(path, str) and path.strip() for path in designated_raw
+                ):
+                    designated_raw = []
+                designated: set[Path] = set()
+                designated_has_symlink = False
+                for raw_path in designated_raw:
+                    candidate = Path(raw_path)
+                    if _read_only_has_symlink_component(candidate):
+                        designated_has_symlink = True
+                    candidate = _read_only_normalize(candidate)
+                    if _read_only_has_symlink_component(candidate):
+                        designated_has_symlink = True
+                    output_root = Path("/home/plachem-sever/.openclaw/agents")
+                    if (not candidate.is_absolute() or ".." in candidate.parts
+                            or len(candidate.parts) < len(output_root.parts) + 3
+                            or candidate.parts[:len(output_root.parts)] != output_root.parts
+                            or candidate.parts[len(output_root.parts) + 1] not in {"01_ACTIVE", "05_QA_EVIDENCE"}):
+                        return "READ_ONLY_ARTIFACT_REUSE" if artifacts else "READ_ONLY_WRITE_ATTEMPT"
+                    designated.add(candidate)
+
+
+                if artifacts:
+                    if not designated:
+                        return "READ_ONLY_ARTIFACT_REUSE"
+                    for item in artifacts:
+                        if not isinstance(item, Mapping) or not isinstance(item.get("path"), str):
+                            return "READ_ONLY_ARTIFACT_REUSE"
+                        artifact_path = Path(item["path"]).expanduser()
+                        if not artifact_path.is_absolute() or ".." in artifact_path.parts:
+                            return "READ_ONLY_ARTIFACT_REUSE"
+                        if (
+                            designated_has_symlink
+                            or _read_only_normalize(artifact_path) not in designated
+                            or _read_only_has_symlink_component(artifact_path)
+                        ):
+                            return "READ_ONLY_ARTIFACT_REUSE"
+                artifact_creation_seen = False
                 for message in messages:
                     if not isinstance(message, Mapping):
                         continue
@@ -664,14 +739,59 @@ def production_result_validator() -> CompositeResultValidator:
                         if kind not in {"toolcall", "tooluse"}:
                             continue
                         name = str(block.get("name") or block.get("toolName") or "").casefold()
-                        args = json.dumps(block.get("arguments") or block.get("input") or {}, ensure_ascii=False).casefold()
+                        # Preserve path case for exact filesystem identity;
+                        # only the tool name is normalized.
+                        arguments = block.get("arguments") or block.get("input") or {}
+                        args = json.dumps(arguments, ensure_ascii=False)
                         command = f"{name} {args}"
-                        if name in {"write", "edit", "apply_patch"} or re.search(
-                            r"(?:^|\s)(?:tee|touch|cp|mv)\s|(?<![0-9])>(?![>&])", command
-                        ):
-                            return "READ_ONLY_WRITE_ATTEMPT"
-                        if re.search(r"\b(?:pytest|unittest|npm\s+(?:run\s+)?test|node\s+[^\n]*test)\b", command):
+                        write_operation = name in {"write", "edit", "apply_patch"} or re.search(
+                            r"\b(?:tee|touch|cp|mv)\s|(?<![0-9])>(?![>&])", command
+                        )
+                        if write_operation:
+                            if not artifacts or len(designated) != len(artifacts):
+                                return "READ_ONLY_WRITE_ATTEMPT"
+                            if name == "write":
+                                # Report content is data, not a write destination
+                                # or an executable command. Fail closed when the
+                                # structured target is missing or ambiguous.
+                                if not isinstance(arguments, Mapping) or (
+                                    "arguments" in block and "input" in block
+                                    and block["arguments"] != block["input"]
+                                ):
+                                    return "READ_ONLY_WRITE_ATTEMPT"
+                                targets = [
+                                    arguments[key] for key in ("path", "file_path")
+                                    if key in arguments
+                                ]
+                                if (
+                                    not targets
+                                    or any(not isinstance(raw, str) or not raw or "\0" in raw for raw in targets)
+                                    or len(set(targets)) != 1
+                                ):
+                                    return "READ_ONLY_WRITE_ATTEMPT"
+                                mentioned = {Path(raw) for raw in targets}
+                                if any(not path.is_absolute() or ".." in path.parts for path in mentioned):
+                                    return "READ_ONLY_WRITE_ATTEMPT"
+                            else:
+                                mentioned = {
+                                    Path(raw).expanduser()
+                                    for raw in re.findall(r"/[^\s\\\"']+", command)
+                                }
+                            mentioned_normalized = {
+                                _read_only_normalize(path) for path in mentioned
+                            }
+                            if (
+                                designated_has_symlink
+                                or not mentioned
+                                or not mentioned_normalized.issubset(designated)
+                                or any(_read_only_has_symlink_component(path) for path in mentioned_normalized)
+                            ):
+                                return "READ_ONLY_WRITE_ATTEMPT"
+                            artifact_creation_seen = True
+                        if name != "write" and re.search(r"\b(?:pytest|unittest|npm\s+(?:run\s+)?test|node\s+[^\n]*test)\b", command):
                             return "READ_ONLY_SCOPE_EXPANSION"
+                if artifacts and not artifact_creation_seen:
+                    return "READ_ONLY_ARTIFACT_REUSE"
         return None
 
     return CompositeResultValidator(
@@ -738,6 +858,24 @@ class CoreEngine:
         with self._lock:
             self._terminal_transition_guard = guard
 
+    @staticmethod
+    def _normalize_approved_paths(approved_paths: list[str] | None) -> list[str]:
+        """Validate server-side approved result-document path designations."""
+        if approved_paths is None:
+            return []
+        if not isinstance(approved_paths, list):
+            raise ValueError("INVALID_APPROVED_PATHS")
+        normalized: list[str] = []
+        for value in approved_paths:
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("INVALID_APPROVED_PATHS")
+            value = value.strip()
+            if not value.startswith("/") or len(value) > 4096:
+                raise ValueError("INVALID_APPROVED_PATHS")
+            if value not in normalized:
+                normalized.append(value)
+        return normalized
+
     def dispatch(
         self,
         *,
@@ -746,19 +884,22 @@ class CoreEngine:
         timeout_seconds: float,
         core_run_id: str | None = None,
         idempotency_key: str | None = None,
+        watchdog_managed: bool = False,
         goal_contract: Mapping[str, Any] | None = None,
         auth_token: str | None = None,
         action: str = "dispatch",
         workspace_id: str = "command-center",
         project_id: str = "fast-gateway",
         task_runtime_class: str | TaskRuntimeClass = TaskRuntimeClass.STANDARD,
+        approved_paths: list[str] | None = None,
     ) -> dict[str, Any]:
         return self._dispatch(
             agent_id=agent_id, message=message, timeout_seconds=timeout_seconds,
             core_run_id=core_run_id, idempotency_key=idempotency_key,
             goal_contract=goal_contract, session_key=None, parent_core_run_id=None, context_reset_count=0,
             auth_token=auth_token, action=action, workspace_id=workspace_id, project_id=project_id,
-            task_runtime_class=task_runtime_class,
+            task_runtime_class=task_runtime_class, approved_paths=approved_paths,
+            watchdog_managed=watchdog_managed,
         )
 
     def _dispatch(
@@ -773,14 +914,20 @@ class CoreEngine:
         session_key: str | None,
         parent_core_run_id: str | None,
         context_reset_count: int,
+        watchdog_managed: bool = False,
         auth_token: str | None = None,
         action: str = "dispatch",
         workspace_id: str = "command-center",
         project_id: str = "fast-gateway",
         task_runtime_class: str | TaskRuntimeClass = TaskRuntimeClass.STANDARD,
+        approved_paths: list[str] | None = None,
     ) -> dict[str, Any]:
         with self._lock:
             registration = self.agents.require(agent_id)
+            # Trusted server-side designation only: validated at dispatch
+            # entry.  The value is persisted on the run record and never
+            # inferred from worker output.
+            approved = self._normalize_approved_paths(approved_paths)
             if not isinstance(message, str) or not message.strip():
                 raise ValueError("INVALID_MESSAGE")
             if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0:
@@ -804,6 +951,8 @@ class CoreEngine:
                 goal_contract=contract,
                 parent_core_run_id=parent_core_run_id,
                 context_reset_count=context_reset_count,
+                approved_paths=approved,
+                watchdog_managed=watchdog_managed,
             )
             if not created and record["status"] != CoreRunStatus.QUEUED.value:
                 return record
@@ -840,6 +989,7 @@ class CoreEngine:
                     "agentId": agent_id,
                     "idempotencyKey": key,
                     "timeout": effective_timeout,
+                    "_trustedValidationContext": {"approved_paths": list(record.get("approved_paths") or [])},
                 }
                 if session_key is not None:
                     submit_payload["sessionKey"] = session_key
@@ -855,7 +1005,7 @@ class CoreEngine:
                 reason = "TRANSPORT_FAILURE" if isinstance(exc, (TransportError, TimeoutError)) else "DISPATCH_REJECTED"
                 return self.registry.transition(actual_id, CoreRunStatus.FAIL, reason=reason)
             running = self.registry.transition(actual_id, CoreRunStatus.RUNNING, binding=binding)
-            self._schedule_runtime_deadline(actual_id, profile)
+            self._schedule_runtime_deadline(actual_id, profile, watchdog_managed=watchdog_managed)
             return running
 
     def observe_progress_checkpoint(self, core_run_id: str, checkpoint: Mapping[str, Any]) -> dict[str, Any]:
@@ -1038,10 +1188,11 @@ class CoreEngine:
                 record = self._require(core_run_id)
                 elapsed_before = self._runtime_seconds(record)
                 self.registry.update_policy(core_run_id, runtime_seconds=elapsed_before)
-                remaining = profile.max_runtime - elapsed_before
+                managed = bool(record.get("watchdog_managed"))
+                remaining = float("inf") if managed else profile.max_runtime - elapsed_before
                 if remaining <= 0:
                     return self._cancel_for_policy(core_run_id, profile, "RUNTIME_LIMIT")
-                execution_remaining = profile.execution_budget - elapsed_before
+                execution_remaining = float("inf") if managed else profile.execution_budget - elapsed_before
                 if profile.runtime_class is RuntimeClass.LOCAL and execution_remaining <= 0:
                     return self._finalize_local_execution(core_run_id, profile)
                 bounded_wait = min(
@@ -1062,15 +1213,22 @@ class CoreEngine:
                 if guard is not None and guard(core_run_id):
                     return self._require(core_run_id)
                 if (
-                    profile.runtime_class is RuntimeClass.LOCAL
+                    not managed
+                    and profile.runtime_class is RuntimeClass.LOCAL
                     and elapsed >= profile.execution_budget
                     and outcome.status in {CoreRunStatus.RUNNING, CoreRunStatus.TIMEOUT}
                 ):
                     return self._finalize_local_execution(core_run_id, profile)
-                if elapsed >= profile.max_runtime and outcome.status in {CoreRunStatus.RUNNING, CoreRunStatus.TIMEOUT}:
+                if not managed and elapsed >= profile.max_runtime and outcome.status in {CoreRunStatus.RUNNING, CoreRunStatus.TIMEOUT}:
                     return self._cancel_for_policy(core_run_id, profile, "RUNTIME_LIMIT")
                 if outcome.status != CoreRunStatus.TIMEOUT:
                     break
+                if managed and outcome.reason == "OPENCLAW_TIMEOUT":
+                    # Watchdog-managed runs must yield one observational
+                    # RUNNING snapshot per bounded wait window so the harness
+                    # can invoke JEV on its own cadence. The timeout belongs to
+                    # agent.wait, not to the underlying run.
+                    return self._require(core_run_id)
                 if profile.runtime_class is not RuntimeClass.LOCAL:
                     # A caller-bounded cloud poll is observational only.  It
                     # must not terminate the underlying run.
@@ -1447,7 +1605,9 @@ class CoreEngine:
             reason=cancel_reason,
         )
 
-    def _schedule_runtime_deadline(self, core_run_id: str, profile: RuntimeModelProfile) -> None:
+    def _schedule_runtime_deadline(self, core_run_id: str, profile: RuntimeModelProfile, *, watchdog_managed: bool = False) -> None:
+        if watchdog_managed:
+            return
         deadline = (
             profile.execution_budget
             if profile.runtime_class is RuntimeClass.LOCAL
@@ -1473,6 +1633,8 @@ class CoreEngine:
                 self._clear_runtime_deadline(core_run_id)
                 return
             profile = self._profile_for_record(record)
+            if record.get("watchdog_managed"):
+                return
             if profile.runtime_class is RuntimeClass.LOCAL:
                 self.registry.update_policy(core_run_id, runtime_seconds=profile.execution_budget)
                 self._finalize_local_execution(core_run_id, profile)

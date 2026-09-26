@@ -50,10 +50,31 @@ class FastGatewayWarRoomAdapter:
         if row is None:
             return DeliveryReceipt(delivery_id, "failed", error_code="FAST_GATEWAY_APPROVED_SOURCE_MISSING")
         from war_room_actions import _grounded_instruction
-        body = _grounded_instruction(row[0], json.loads(row[2]), row[1])
+        packet = json.loads(row[2])
+        body = _grounded_instruction(row[0], packet, row[1])
+        # The approved result-document paths come only from the War Room task
+        # contract (immutable grounding packet).  They are never derived from
+        # worker responses or request fields.
+        # Fast Gateway READ-ONLY validation requires exact new-result
+        # designations. Broad approved_paths remain the War Room filesystem
+        # scope, while result_artifact_paths is the exact output contract.
+        approved_paths = packet.get("result_artifact_paths")
+        if not isinstance(approved_paths, list) or not approved_paths:
+            # Backward compatibility for old tasks that already supplied exact
+            # approved_paths.
+            approved_paths = packet.get("approved_paths")
+        if not isinstance(approved_paths, list):
+            approved_paths = []
+        approved_paths = [path for path in approved_paths
+                          if isinstance(path, str) and path.strip()]
+        dispatch_kwargs: dict[str, Any] = {}
+        if approved_paths:
+            dispatch_kwargs["approved_paths"] = approved_paths
         record = self.engine.dispatch(
             agent_id=self._agent(agent_id), message=body, timeout_seconds=300.0,
             core_run_id=self.core_id(delivery_id), idempotency_key=delivery_id,
+            watchdog_managed=True,
+            **dispatch_kwargs,
         )
         binding = record.get("openclaw_binding") or {}
         status = str(record.get("status") or "")

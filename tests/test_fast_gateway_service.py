@@ -227,6 +227,17 @@ class PersistentExecutionHarnessTests(unittest.TestCase):
         self.assertEqual({}, harness.active_controllers)
         self.assertEqual("CANCELLED", core.records["run-2"]["status"])
 
+
+    def test_fastgateway_watchdog_recovery_defaults_off(self):
+        import os
+        import fast_gateway_service
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PLACHEM_FAST_GATEWAY_WATCHDOG_RECOVERY_ENABLED", None)
+            self.assertFalse(fast_gateway_service.fastgateway_watchdog_recovery_enabled())
+            os.environ["PLACHEM_FAST_GATEWAY_WATCHDOG_RECOVERY_ENABLED"] = "1"
+            self.assertTrue(fast_gateway_service.fastgateway_watchdog_recovery_enabled())
+
     def test_process_harness_factory_reuses_one_core_owner(self):
         import fast_gateway_service
 

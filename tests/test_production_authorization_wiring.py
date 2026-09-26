@@ -114,9 +114,20 @@ def prepared(production, *, agents=None, approved=True, key="fixture"):
     assert response.status_code == 201, response.text
     item = response.json()
     if approved:
-        response = client.post(f"/api/war-room/tasks/{item['task_id']}/approve-execute",
-                               json={"expires_at": int(time.time()) + 600},
-                               headers=representative_headers)
+        context = client.get(
+            f"/api/war-room/projects/plachem-agent-war-room/mutation-context",
+            params={"action": "task_approve_execute", "target_id": item["task_id"]},
+            headers=representative_headers,
+        )
+        assert context.status_code == 200, context.text
+        response = client.post(
+            f"/api/war-room/tasks/{item['task_id']}/approve-execute",
+            json={
+                "expires_at": int(time.time()) + 600,
+                "context_token": context.json()["context_token"],
+            },
+            headers=representative_headers,
+        )
         assert response.status_code == 200, response.text
         item.update(response.json())
     with sqlite3.connect(root / "war-room.sqlite3") as db:
@@ -172,7 +183,9 @@ def test_approved_request_consumes_once_and_hides_credentials(production):
     assert audit[-1]["workspace_id"] == "war-room:" + item["task_id"]
     assert audit[-1]["project_id"] == "plachem-agent-war-room"
     assert len(owner.submitted) == 1
-    assert set(next(iter(owner.submitted.values()))) == {"agentId", "message", "timeout", "idempotencyKey"}
+    assert set(next(iter(owner.submitted.values()))) == {
+        "agentId", "message", "timeout", "idempotencyKey", "_trustedValidationContext"
+    }
     with sqlite3.connect(root / "war-room.sqlite3") as db:
         assert db.execute("SELECT call_count FROM war_task_calls WHERE task_id=?", (item["task_id"],)).fetchone() == (1,)
     assert "fixture-only-dedicated-key" not in (root / "runs.jsonl").read_text()

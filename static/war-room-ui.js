@@ -7,6 +7,8 @@ let currentParticipants = [];
 let currentAgentCatalog = [];
 let currentTasks = [];
 let currentDeliveries = [];
+let currentProcessBoard = null;
+let currentReadiness = null;
 let demoMode = false;
 let quickTaskId = null;
 let selectedTaskId = null;
@@ -39,6 +41,18 @@ const post = (url, body, method = "POST") => requestJson(url, {
   headers: {"Content-Type":"application/json", "Idempotency-Key":crypto.randomUUID()},
   body: JSON.stringify(body),
 });
+
+async function freshMutationContext(action, targetId = null) {
+  if (!selectedProjectId) throw new Error("프로젝트를 다시 선택하세요");
+  const params = new URLSearchParams({action});
+  if (targetId) params.set("target_id", targetId);
+  return get(`/api/war-room/projects/${encodeURIComponent(selectedProjectId)}/mutation-context?${params}`);
+}
+
+async function guardedPost(url, body, action, targetId = null, method = "POST") {
+  const context = await freshMutationContext(action, targetId);
+  return post(url, {...(body || {}), context_token:context.context_token}, method);
+}
 
 function mutationContract(task) {
   return {contract_version:1, project_id:task.project_id || selectedProjectId,
@@ -83,7 +97,68 @@ function navigateScreen(name, {push = true} = {}) {
   document.querySelectorAll("[data-screen]").forEach(button => button.setAttribute("aria-current", button.dataset.screen === name ? "page" : "false"));
   if (name === "task") renderTaskDetail();
   if (name === "task") renderReview();
+  if (name === "process-board") renderProcessBoard();
   if (push) updateLocation({push:true});
+}
+
+function processBoardText(value, fallback = "-") {
+  if (value === null || value === undefined || value === "") return fallback;
+  if (Array.isArray(value)) return value.length ? value.map(item => processBoardText(item)).join(", ") : fallback;
+  if (typeof value === "object") return processBoardText(value.session_id || value.id || value.name, fallback);
+  return String(value);
+}
+
+function renderReadinessBanner(readiness = currentReadiness) {
+  const target = document.getElementById("process-board-readiness");
+  if (!target) return;
+  if (!readiness || readiness.mode === "unavailable") {
+    target.className = "readiness-banner unavailable";
+    target.textContent = "준비 상태를 확인할 수 없습니다. 대표 완료 상태로 간주하지 않습니다.";
+    return;
+  }
+  const blocking = (readiness.blocking_task_ids || []).map(esc).join(", ") || "없음";
+  const reasons = readiness.blocking_reasons || {};
+  const reasonLabels = {
+    CURRENT_EVIDENCE: "현재 revision Evidence 없음",
+    SIGNED_QA_PASS: "현재 revision QA PASS 없음",
+    SESSION_INTEGRITY: "Session Integrity 미충족",
+    REPRESENTATIVE_APPROVAL: "대표 승인 이력 없음",
+    GROUNDING_PACKET_INVALID: "Grounding packet 무결성 오류",
+    QA_SIGNATURE_UNAVAILABLE: "QA 서명 검증 불가",
+    TASK_NOT_IN_QA: "QA 상태 아님",
+  };
+  const reasonSummary = Object.entries(reasons).map(([taskId, codes]) => {
+    const labels = (Array.isArray(codes) ? codes : []).map(code => reasonLabels[code] || code);
+    return `${esc(taskId)} [${labels.map(esc).join(", ")}]`;
+  }).join(" · ");
+  const superseded = (readiness.nonblocking_superseded_ids || []).length;
+  if (readiness.ready_for_representative_completion === true) {
+    target.className = "readiness-banner ready";
+    target.innerHTML = `<strong>대표 완료 준비됨</strong> · 활성 task ${Number(readiness.considered_task_count || 0)}개가 완료되었거나 실제 대표 완료 승인 조건을 충족합니다. SUPERSEDED 이력 ${superseded}개는 차단하지 않습니다. (상태 조회만 수행)`;
+  } else {
+    target.className = "readiness-banner blocked";
+    target.innerHTML = `<strong>대표 완료 준비 안 됨</strong> · 차단 task: ${blocking}.${reasonSummary ? ` 사유: ${reasonSummary}.` : ""} SUPERSEDED 이력 ${superseded}개는 차단하지 않습니다.`;
+  }
+}
+
+function renderProcessBoard(board = currentProcessBoard) {
+  const target = document.getElementById("process-board");
+  if (!target || !board) return;
+  renderReadinessBanner();
+  const states = board.states || ["WAITING","READY","RUNNING","PASS","FAIL","REWORK","BLOCKED","DONE"];
+  const columns = board.columns || {};
+  const items = board.items || [];
+  const summary = states.map(state => `<div class="process-board-state ${state.toLowerCase()}" data-board-state="${state}"><strong>${(columns[state] || []).length}</strong><small>${state}</small></div>`).join("");
+  const rows = items.map((item, index) => {
+    const state = processBoardText(item.mapped_state);
+    const emphasis = ["RUNNING","FAIL","REWORK","BLOCKED"].includes(state) ? ` emphasis-${state.toLowerCase()}` : "";
+    const step = processBoardText(item.step_name, processBoardText(item.input, processBoardText(item.step_id)));
+    const session = item.session && typeof item.session === "object" ? processBoardText(item.session.session_id || item.session.id) : processBoardText(item.session);
+    return `<tr class="${emphasis}" data-board-task-id="${esc(item.task_id)}"><td class="order">${index + 1}</td><td><strong>${esc(processBoardText(item.task_id))}</strong><span class="subline">${esc(step)}</span></td><td>${esc(processBoardText(item.assigned_agent, "미지정"))}</td><td>${statusChip(state)}</td><td>${esc(processBoardText(item.predecessor_step))}</td><td>${esc(session)}</td><td>${esc(processBoardText(item.rework_count, "0"))}</td></tr>`;
+  }).join("");
+  target.innerHTML = `<div class="process-board-summary" aria-label="Process Board 상태별 작업 수">${summary}</div><div class="muted">총 ${items.length}개 task · API mode ${esc(processBoardText(board.mode))}</div><div class="process-board-table-wrap"><table class="process-board-table"><thead><tr><th scope="col">순서</th><th scope="col">Task / Step</th><th scope="col">Agent</th><th scope="col">Status</th><th scope="col">Predecessor</th><th scope="col">Session</th><th scope="col">Rework</th></tr></thead><tbody>${rows || '<tr><td colspan="7"><div class="empty">표시할 작업 없음</div></td></tr>'}</tbody></table></div>`;
+  const updated = document.getElementById("process-board-updated");
+  if (updated) updated.textContent = `읽기 전용 · ${new Date().toLocaleTimeString()}`;
 }
 
 function openTask(id, screen = "task", {push = true} = {}) {
@@ -174,6 +249,8 @@ function renderTaskDetail() {
       .map(row => `<option value="${esc(row.principal_id)}">${esc(row.principal_id)}</option>`).join("");
   }
   renderExecutionProjection(task);
+  loadTaskDetailJev(task.id);
+  loadTaskResultVerifier(task.id);
 }
 
 document.getElementById("legacy-reviewer-form")?.addEventListener("submit", async event => {
@@ -226,7 +303,7 @@ async function renderReview() {
 
 async function completeSelectedTask() {
   const task = selectedCurrentTask(); if (!task) return;
-  try { await withMutation(`complete:${task.id}`, "representative-result", async () => { const fresh = await requireFreshTask(task.id, ["qa"]); if (fresh.latest_qa_verdict?.verdict !== "PASS" || Number(fresh.evidence_count || 0) < 1) throw new Error("QA PASS와 필수 증거를 다시 확인하세요"); const result = await post(`/api/war-room/tasks/${fresh.id}/representative-completion`, {decision:"approved"}); document.getElementById("representative-result").textContent = `대표 승인 ${result.status || "완료"}`; await load(); }); }
+  try { await withMutation(`complete:${task.id}`, "representative-result", async () => { const fresh = await requireFreshTask(task.id, ["qa"]); if (fresh.latest_qa_verdict?.verdict !== "PASS" || Number(fresh.evidence_count || 0) < 1) throw new Error("QA PASS와 필수 증거를 다시 확인하세요"); const result = await guardedPost(`/api/war-room/tasks/${fresh.id}/representative-completion`, {decision:"approved"}, "representative_completion", fresh.id); document.getElementById("representative-result").textContent = `대표 승인 ${result.status || "완료"}`; await load(); }); }
   catch (_) { /* reported */ }
 }
 
@@ -372,7 +449,7 @@ function renderTasks() {
     }
     if (["rework_required","stopped","stop_unconfirmed"].includes(task.status)) buttons.push(`<button data-permission="approve" data-mutation onclick="prepareTaskForReapproval('${task.id}')">재승인 준비</button>`);
     if (["approved","running","qa"].includes(task.status)) buttons.push(`<button data-permission="execute" data-mutation onclick="stopTask('${task.id}')">실제 작업 중지</button>`);
-    return `<div class="project"><button class="project" onclick="openTask('${esc(task.id)}')"><strong>${esc(task.scope)}</strong><div>${statusChip(task.status)} · ${esc(task.assignee_agent_id || "담당 미지정")}</div><small>호출 ${task.call_limit} · 턴 ${task.turn_limit} · 문서 ${esc(task.document_version)}</small></button><div class="filterbar">${buttons.join("")}</div></div>`;
+    return `<div class="project"><button class="project" onclick="openTask('${esc(task.id)}')"><strong>${esc(task.scope)}</strong><div>${statusChip(task.status)} · ${esc(task.assignee_agent_id || "담당 미지정")}</div><small>호출 ${task.call_limit} · 턴 ${task.turn_limit} · 문서 ${esc(task.document_version)}</small></button><div class="filterbar">${buttons.join("")}<button onclick="requestJevAdvisory('${esc(task.id)}')">JEV advisory</button></div><div id="jev-advisory-${esc(task.id)}" class="jev-advisory" hidden></div></div>`;
   }).join("") || '<div class="empty">조건에 맞는 작업 없음</div>';
   const options = currentTasks.map(task => `<option value="${esc(task.id)}">${esc(task.status)} · ${esc(task.scope.slice(0, 42))}</option>`);
   setSelectOptions("message-task", '<option value="">작업 선택</option>' + options.filter(option => !option.includes("completed") && !option.includes("stopped")).join(""), selectedTaskId);
@@ -587,9 +664,10 @@ async function load() {
   catch (error) { fail("audit-summary", error); return; }
   try {
     const base = `/api/war-room/projects/${encodeURIComponent(projectId)}`;
-    const [detail, participants, operations, baseline, tasks, audit, deliveries, candidates] = await Promise.all([
+    const [detail, participants, operations, baseline, tasks, audit, deliveries, candidates, processBoard, readiness] = await Promise.all([
       get(base), get(`${base}/participants`), get(`${base}/operations`),
-      get(`${base}/manyfast-baseline`), get(`${base}/tasks`), get(`${base}/audit?limit=100`), get(`${base}/deliveries`), get(`${base}/agent-candidates`),
+      get(`${base}/manyfast-baseline`), get(`${base}/tasks`), get(`${base}/audit?limit=100`), get(`${base}/deliveries`), get(`${base}/agent-candidates`), get(`${base}/process-board`),
+      get(`${base}/readiness`).catch(() => ({mode:"unavailable"})),
     ]);
     if (generation !== loadGeneration || projectId !== selectedProjectId) return;
     currentProject = detail.project;
@@ -597,6 +675,8 @@ async function load() {
     currentAgentCatalog = candidates.items || [];
     currentTasks = tasks.items;
     currentDeliveries = deliveries.items || [];
+    currentProcessBoard = processBoard;
+    currentReadiness = readiness;
     selectedDocumentVersion = baseline.version;
     document.getElementById("project-edit-name").value = currentProject.name;
     document.getElementById("project-edit-status").value = currentProject.status;
@@ -611,7 +691,7 @@ async function load() {
     renderQuickDeliveries(currentDeliveries);
     document.getElementById("delivery-cards").innerHTML = currentDeliveries.map(row => `<div class="project"><strong>${esc(row.agent_id)} · ${statusChip(row.error_class === "system_error" ? "system_error" : row.status)}</strong><small>run ${esc(row.run_id || "-")} · source ${esc(row.message_id || "-")} · response ${esc(row.response_message_id || "-")}</small><small>retry ${row.retry_count || row.attempt_count || 0}/${row.max_attempts} · ${esc(row.error_code || "정상")}</small>${row.error_class === "system_error" && ["failed","timed_out"].includes(row.status) ? `<button data-permission="execute" onclick="retryDelivery('${esc(row.id)}')">수동 재전송</button>` : ""}</div>`).join("") || '<div class="empty">delivery 없음</div>';
     document.getElementById("stop-ack-delivery").innerHTML = '<option value="">현재 중지 cycle delivery 선택</option>' + currentDeliveries.filter(row => row.status === "stopped" && row.stop_cycle_at === deliveries.stop_requested_at).map(row => `<option value="${esc(row.id)}">${esc(row.agent_id)} · ${esc(row.id.slice(0,8))}</option>`).join("");
-    renderTaskDetail(); renderReview(); applyAccess(); updateLocation();
+    renderTaskDetail(); renderReview(); renderProcessBoard(); applyAccess(); updateLocation();
     await loadTimeline();
   } catch (error) { fail("tasks", error); }
 }
@@ -625,7 +705,7 @@ function showProjectForm() {
 function selectProject(id) {
   selectedProjectId = id;
   selectedTaskId = null; quickTaskId = null; pinnedTaskId = null;
-  currentProject = null; currentParticipants = []; currentTasks = [];
+  currentProject = null; currentParticipants = []; currentTasks = []; currentReadiness = null;
   updateLocation({push:true});
   load();
 }
@@ -747,7 +827,7 @@ async function stopProject() {
   const out = document.getElementById("stop-result");
   try {
     const url = `/api/war-room/projects/${encodeURIComponent(selectedProjectId)}/stop`;
-    const result = await post(url, {});
+    const result = await guardedPost(url, {}, "project_stop", selectedProjectId);
     out.textContent = `중지 요청 ${result.status}`;
     await load();
   }
@@ -758,7 +838,7 @@ async function stopTask(id) {
   const out = document.getElementById("stop-result");
   try { await withMutation(`stop:${id}`, "stop-result", async () => {
     const task = await requireFreshTask(id, ["approved","running","qa"]);
-    const result = await post(`/api/war-room/tasks/${encodeURIComponent(task.id)}/stop`, {});
+    const result = await guardedPost(`/api/war-room/tasks/${encodeURIComponent(task.id)}/stop`, {}, "task_stop", task.id);
     out.textContent = result.confirmed
       ? `작업 중지 확인 · ${task.id} · delivery ${(result.delivery_ids || []).length}건`
       : `작업 중지 요청 · ${task.id} · ${result.status}`;
@@ -799,7 +879,7 @@ async function acknowledgeStop() {
 
 async function resumeProject() {
   const out = document.getElementById("stop-result");
-  try { const result = await post(`/api/war-room/projects/${encodeURIComponent(selectedProjectId)}/resume`, {}); out.textContent = `재개 ${result.status}`; await load(); }
+  try { const result = await guardedPost(`/api/war-room/projects/${encodeURIComponent(selectedProjectId)}/resume`, {}, "project_resume", selectedProjectId); out.textContent = `재개 ${result.status}`; await load(); }
   catch (error) { out.textContent = `재개 실패 · ${error.message}`; }
 }
 
@@ -809,7 +889,7 @@ async function changeTask(id, status) {
 }
 
 async function representativeComplete(id) {
-  try { await post(`/api/war-room/tasks/${id}/representative-completion`, {decision:"approved"}); await load(); }
+  try { await guardedPost(`/api/war-room/tasks/${id}/representative-completion`, {decision:"approved"}, "representative_completion", id); await load(); }
   catch (error) { alert(error.message); }
 }
 
@@ -883,7 +963,7 @@ async function quickApproveAndRun() {
     const task = await requireFreshTask(id, ["awaiting_approval","running"]);
     out.textContent = "승인하고 에이전트에게 전달하고 있습니다…";
     try {
-      if (task.status === "awaiting_approval") await post(`/api/war-room/tasks/${task.id}/approve-execute`, {...mutationContract(task), expires_at:Math.floor(Date.now()/1000)+1800});
+      if (task.status === "awaiting_approval") await guardedPost(`/api/war-room/tasks/${task.id}/approve-execute`, {...mutationContract(task), expires_at:Math.floor(Date.now()/1000)+1800}, "task_approve_execute", task.id);
       else if (task.status === "running") return;
     }
     catch (error) {
@@ -914,7 +994,7 @@ async function quickCompleteTask() {
   try {
     const task = await requireFreshTask(pinnedTaskId !== null ? pinnedTaskId : quickTaskId, ["qa"]);
     if (task.latest_qa_verdict?.verdict !== "PASS" || Number(task.evidence_count || 0) < 1) throw new Error("QA PASS와 필수 증거가 필요합니다");
-    await post(`/api/war-room/tasks/${task.id}/representative-completion`, {decision:"approved"});
+    await guardedPost(`/api/war-room/tasks/${task.id}/representative-completion`, {decision:"approved"}, "representative_completion", task.id);
     await load(); out.textContent = "최종 완료 처리했습니다.";
   } catch (error) { out.textContent = `완료 실패: ${error.message}`; }
 }
@@ -978,6 +1058,52 @@ document.getElementById("message-form").addEventListener("submit", async event =
 });
 
 async function bindDemoSession(){const agent=document.getElementById("demo-session-agent").value; await post(`/api/war-room/projects/${encodeURIComponent(selectedProjectId)}/participants/${agent}/test-session`,{session_key:document.getElementById("demo-session-key").value,session_id:document.getElementById("demo-session-id").value},"PUT"); await load();}
+function renderJevAdvisory(taskId, row) {
+  const box = document.getElementById(`jev-advisory-${taskId}`); if (!box) return;
+  const controls = row.status === "AVAILABLE" ? `<div class="filterbar"><button onclick="decideJev('${esc(taskId)}','${esc(row.advisory_id)}','ACCEPT')">ACCEPT</button><button onclick="decideJev('${esc(taskId)}','${esc(row.advisory_id)}','INSUFFICIENT')">INSUFFICIENT</button><button onclick="decideJev('${esc(taskId)}','${esc(row.advisory_id)}','OVERRIDE')">OVERRIDE</button></div>` : '';
+  box.hidden = false; box.innerHTML = `<div class="notice">Advisory only · assignment/dispatch/lifecycle 변경 없음</div><div>Domain: <strong>${esc(row.domain_choice || "unavailable")}</strong> · Agent: <strong>${esc(row.agent_choice || "unavailable")}</strong></div><div class="muted">probabilities ${esc(JSON.stringify(row.domain_probabilities || {}))} / ${esc(JSON.stringify(row.agent_probabilities || {}))}</div><div class="muted">confidence ${esc(row.domain_confidence ?? "-")} / ${esc(row.agent_confidence ?? "-")} · latency ${esc(row.latency_ms)}ms · ${row.stale ? "STALE" : "fresh"}</div>${row.error ? `<div class="error">${esc(row.error.code)}: ${esc(row.error.detail)}</div>` : ''}${controls}`;
+}
+function renderTaskDetailJev(row) {
+  const box = document.getElementById("jev-task-detail-content"); if (!box) return;
+  if (!row) { box.innerHTML = '<span class="muted">최신 advisory 없음 · 먼저 advisory를 요청하세요.</span>'; return; }
+  const controls = row.status === "AVAILABLE" ? `<div class="filterbar"><button onclick="decideJev('${esc(row.task_id)}','${esc(row.advisory_id)}','ACCEPT')">ACCEPT</button><button onclick="decideJev('${esc(row.task_id)}','${esc(row.advisory_id)}','INSUFFICIENT')">INSUFFICIENT</button><button onclick="decideJev('${esc(row.task_id)}','${esc(row.advisory_id)}','OVERRIDE')">OVERRIDE</button></div>` : '';
+  box.innerHTML = `<div class="notice">${row.status} · advisory-only · lifecycle/assignment/delivery/dispatch unchanged</div><div>Domain: <strong>${esc(row.domain_choice || "-")}</strong> · Agent: <strong>${esc(row.agent_choice || "-")}</strong></div><div class="muted">probabilities ${esc(JSON.stringify(row.domain_probabilities || {}))} / ${esc(JSON.stringify(row.agent_probabilities || {}))}</div><div class="muted">confidence ${esc(row.domain_confidence ?? "-")} / ${esc(row.agent_confidence ?? "-")} · latency ${esc(row.latency_ms ?? "-")}ms · ${row.stale ? "STALE" : "fresh"}</div>${row.latest_decision ? `<div>Latest decision: <strong>${esc(row.latest_decision.decision)}</strong> · actor ${esc(row.latest_decision.actor_id)}</div>` : ''}${row.error ? `<div class="error">${esc(row.error.code)}: ${esc(row.error.detail)}</div>` : ''}${controls}`;
+}
+async function loadTaskDetailJev(taskId) {
+  const box = document.getElementById("jev-task-detail-content"); if (!box || !taskId) return;
+  box.innerHTML = '<span class="muted">최신 advisory 조회 중…</span>';
+  try { renderTaskDetailJev(await get(`/api/war-room/tasks/${encodeURIComponent(taskId)}/jev-advisory`)); }
+  catch (_) { renderTaskDetailJev(null); }
+}
+function renderTaskResultVerifier(row) {
+  const box = document.getElementById("jev-result-verifier-content"); if (!box) return;
+  if (!row) { box.innerHTML = '<span class="muted">Result Verifier advisory 없음.</span><button onclick="requestTaskResultVerifier()">advisory 요청</button>'; return; }
+  box.innerHTML = `<div class="notice">${row.stale ? "STALE" : "fresh"} · advisory-only · lifecycle/assignment/delivery/dispatch/QA unchanged</div><div class="muted">run ${esc(row.run_id || "-")} · revision ${esc(row.task_revision)} · ${esc(row.state_digest)}</div><ul>${(row.signals || []).map(signal => `<li><strong>${esc(signal.signal)}</strong>: ${esc(signal.choice || signal.status)} · p=${esc(JSON.stringify(signal.probabilities || {}))} · ${esc(signal.latency_ms)}ms${signal.error_code ? ` · ${esc(signal.error_code)}` : ""}</li>`).join("")}</ul><button onclick="requestTaskResultVerifier()">새 advisory 요청</button>`;
+}
+async function loadTaskResultVerifier(taskId) {
+  const box = document.getElementById("jev-result-verifier-content"); if (!box || !taskId) return;
+  try { renderTaskResultVerifier(await get(`/api/war-room/tasks/${encodeURIComponent(taskId)}/jev-result-verifier`)); } catch (_) { renderTaskResultVerifier(null); }
+}
+async function requestTaskResultVerifier() {
+  const task = selectedCurrentTask(); if (!task) return;
+  const box = document.getElementById("jev-result-verifier-content"); box.innerHTML = '<span class="muted">Result Verifier advisory 조회 중…</span>';
+  try { renderTaskResultVerifier(await post(`/api/war-room/tasks/${encodeURIComponent(task.id)}/jev-result-verifier`, {})); }
+  catch (error) { box.innerHTML = `<div class="error">ADVISORY_UNAVAILABLE · ${esc(error.message)} · 수동 lifecycle/QA 흐름은 계속 사용 가능합니다.</div>`; }
+}
+async function requestJevAdvisory(taskId) {
+  const box = document.getElementById(`jev-advisory-${taskId}`); if (!box) return;
+  box.hidden = false; box.innerHTML = '<div class="muted">JEV advisory 조회 중…</div>';
+  try {
+    const row = await post(`/api/war-room/tasks/${encodeURIComponent(taskId)}/jev-advisory`, {});
+    renderJevAdvisory(taskId, row);
+  } catch (error) { box.innerHTML = `<div class="error">Advisory unavailable: ${esc(error.message)} · manual assignment remains usable</div>`; }
+}
+async function decideJev(taskId, advisoryId, decision) {
+  const payload = {decision};
+  if (decision === "OVERRIDE") { payload.override_agent_id = window.prompt("등록·활성 후보 Agent ID"); payload.override_reason = window.prompt("Override reason"); }
+  try { await post(`/api/war-room/tasks/${encodeURIComponent(taskId)}/jev-advisory/${encodeURIComponent(advisoryId)}/decision`, payload); const latest = await get(`/api/war-room/tasks/${encodeURIComponent(taskId)}/jev-advisory`); renderJevAdvisory(taskId, latest); renderTaskDetailJev(latest); }
+  catch (error) { window.alert(`JEV decision failed: ${error.message}`); }
+}
 async function processDemoQueue(){await post('/api/war-room/demo/process',{}); await load();}
 async function retryDemoDelivery(id){await post(`/api/war-room/deliveries/${id}/retry`,{}); await load();}
 window.addEventListener("popstate", () => {

@@ -391,15 +391,16 @@ class OpenClawAdapterTests(unittest.TestCase):
             adapter.rpc._disconnect_locked()
         self.assertIsNone(adapter.rpc._socket)
         abort_handler = Mock(return_value={"status": "aborted"})
-        adapter.rpc.request_fresh = abort_handler
+        adapter.rpc.request_fresh_abort = abort_handler
         binding = adapter.cancel("core-run-1")
         self.assertEqual(CoreRunStatus.CANCELLED, binding.status)
         self.assertEqual(1, abort_handler.call_count)
-        # Verify the fresh connection received the correct abort params.
-        call_args = abort_handler.call_args
-        params = call_args[0][1]
-        self.assertEqual("openclaw-run-1", params["runId"])
-        self.assertEqual("qwentest", params["agentId"])
+        abort_handler.assert_called_once_with(
+            session_key="agent:qwentest:fast-gateway-core-run-1",
+            run_id="openclaw-run-1",
+            agent_id="qwentest",
+            timeout=15.0,
+        )
 
     def test_owner_connection_gone_fresh_abort_success_is_cancelled(self):
         """Fresh-connection abort success maps to CANCELLED status, not
@@ -409,7 +410,7 @@ class OpenClawAdapterTests(unittest.TestCase):
         adapter.submit("core-run-1", self.payload())
         with adapter.rpc._lock:
             adapter.rpc._disconnect_locked()
-        adapter.rpc.request_fresh = Mock(return_value={"status": "aborted"})
+        adapter.rpc.request_fresh_abort = Mock(return_value={"status": "aborted"})
         binding = adapter.cancel("core-run-1")
         self.assertEqual(CoreRunStatus.CANCELLED, binding.status)
         # No exception raised — POLICY_ABORT_FAILED does not occur.
@@ -422,13 +423,13 @@ class OpenClawAdapterTests(unittest.TestCase):
         adapter.submit("core-run-1", self.payload())
         with adapter.rpc._lock:
             adapter.rpc._disconnect_locked()
-        adapter.rpc.request_fresh = Mock(
+        adapter.rpc.request_fresh_abort = Mock(
             side_effect=TransportError("fresh connection failed")
         )
         with self.assertRaises(TransportError):
             adapter.cancel("core-run-1")
         # Exactly one fresh attempt — no retry.
-        self.assertEqual(1, adapter.rpc.request_fresh.call_count)
+        self.assertEqual(1, adapter.rpc.request_fresh_abort.call_count)
 
     def test_fresh_connection_uses_same_device_identity_path(self):
         """The fresh connection inherits the same device identity path as the
@@ -438,18 +439,110 @@ class OpenClawAdapterTests(unittest.TestCase):
         adapter.submit("core-run-1", self.payload())
         with adapter.rpc._lock:
             adapter.rpc._disconnect_locked()
-        # request_fresh already receives device_identity_path via
-        # getattr(self, "_device_identity_path", None) — verify it is set.
+        # The fresh-abort helper constructs its private client with this
+        # same stable device identity path.
         self.assertIsNotNone(adapter.rpc._device_identity_path)
-        # Simulate a fresh connection to confirm the path is passed through.
-        captured = {}
-        def capture_fresh(method, params, *, timeout, event_handler=None):
-            captured["called"] = True
-            return {"status": "aborted"}
-        adapter.rpc.request_fresh = capture_fresh
+        adapter.rpc.request_fresh_abort = Mock(return_value={"status": "aborted"})
         binding = adapter.cancel("core-run-1")
-        self.assertTrue(captured.get("called"))
+        self.assertEqual(1, adapter.rpc.request_fresh_abort.call_count)
         self.assertEqual(CoreRunStatus.CANCELLED, binding.status)
+
+    def test_session_id_lookup_uses_private_describe_and_preserves_owner(self):
+        hello = {
+            "type": "hello-ok",
+            "auth": {"role": "operator", "scopes": ["operator.read", "operator.write"]},
+            "features": {"methods": [
+                "agent", "agent.wait", "chat.history", "sessions.abort", "sessions.describe",
+            ]},
+        }
+        owner = FakeSocket(
+            {"chat.history": {"messages": []}, "agent": accepted,
+             "sessions.abort": {"status": "aborted"}},
+            hello=hello,
+        )
+        lookup = FakeSocket(
+            {"sessions.describe": {
+                "session": {
+                    "key": "agent:qwentest:fast-gateway-core-run-1",
+                    "sessionId": "resolved-session-1",
+                }
+            }},
+            hello=hello,
+        )
+        factory = SequenceSocketFactory([owner, lookup])
+        adapter = OpenClawAdapter(
+            FakeSecretRef(), MemoryRunBindingStore(), socket_factory=factory,
+        )
+        binding = adapter.submit("core-run-1", self.payload())
+        self.assertEqual("resolved-session-1", binding.session_id)
+        self.assertIs(adapter.rpc._socket, owner)
+        self.assertFalse(owner.closed)
+        self.assertEqual(2, factory.calls)
+        cancelled = adapter.cancel("core-run-1")
+        self.assertEqual(CoreRunStatus.CANCELLED, cancelled.status)
+        self.assertEqual(
+            1, sum(call["method"] == "sessions.abort" for call in owner.calls),
+        )
+
+    def test_session_id_lookup_failure_is_best_effort_and_keeps_owner(self):
+        hello = {
+            "type": "hello-ok",
+            "auth": {"role": "operator", "scopes": ["operator.read", "operator.write"]},
+            "features": {"methods": [
+                "agent", "agent.wait", "chat.history", "sessions.abort", "sessions.describe",
+            ]},
+        }
+        owner = FakeSocket(
+            {"chat.history": {"messages": []}, "agent": accepted,
+             "sessions.abort": {"status": "aborted"}},
+            hello=hello,
+        )
+        broken_lookup = FakeSocket(
+            {"sessions.describe": lambda _:
+                (_ for _ in ()).throw(OSError("private lookup failed"))},
+            hello=hello,
+        )
+        factory = SequenceSocketFactory([owner, broken_lookup])
+        adapter = OpenClawAdapter(
+            FakeSecretRef(), MemoryRunBindingStore(), socket_factory=factory,
+        )
+        binding = adapter.submit("core-run-1", self.payload())
+        self.assertIsNone(binding.session_id)
+        self.assertIs(adapter.rpc._socket, owner)
+        self.assertFalse(owner.closed)
+        cancelled = adapter.cancel("core-run-1")
+        self.assertEqual(CoreRunStatus.CANCELLED, cancelled.status)
+
+    def test_fresh_abort_negotiates_chat_abort_and_uses_session_key_field(self):
+        owner = FakeSocket({"chat.history": {"messages": []}, "agent": accepted})
+        fresh_hello = {
+            "type": "hello-ok",
+            "auth": {"role": "operator", "scopes": ["operator.read", "operator.write"]},
+            "features": {"methods": ["agent", "agent.wait", "chat.history", "chat.abort"]},
+        }
+        fresh = FakeSocket(
+            {"chat.abort": {"ok": True, "aborted": True, "runIds": ["openclaw-run-1"]}},
+            hello=fresh_hello,
+        )
+        factory = SequenceSocketFactory([owner, fresh])
+        adapter = OpenClawAdapter(
+            FakeSecretRef(), MemoryRunBindingStore(), socket_factory=factory,
+        )
+        adapter.submit("core-run-1", self.payload())
+        with adapter.rpc._lock:
+            adapter.rpc._disconnect_locked()
+        cancelled = adapter.cancel("core-run-1")
+        self.assertEqual(CoreRunStatus.CANCELLED, cancelled.status)
+        abort_call = next(call for call in fresh.calls if call["method"] == "chat.abort")
+        self.assertEqual(
+            {
+                "sessionKey": "agent:qwentest:fast-gateway-core-run-1",
+                "runId": "openclaw-run-1",
+                "agentId": "qwentest",
+            },
+            abort_call["params"],
+        )
+        self.assertNotIn("key", abort_call["params"])
 
     def test_invalid_agent_and_forbidden_fields_fail_before_transport(self):
         adapter, fake = self.adapter({"agent": accepted})

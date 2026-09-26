@@ -1,0 +1,3 @@
+09adbd8e8e054dd4a834efd6b5410ea7f95907a4c1bd199db10d99ad86138381  /home/plachem-sever/codex-workspaces/cha-secretary/plachem-ai-server-monitor/war_room_actions.py
+afda3ba81731ce7beb28cf90a677f8e12df812cd41b95b4ac28b1fa00159965d  /home/plachem-sever/codex-workspaces/cha-secretary/plachem-ai-server-monitor/static/war-room-ui.js
+123251d1cf1d33bddb79eb91804762af99cfd86af1d17227172ed31c885308ac  /home/plachem-sever/codex-workspaces/cha-secretary/plachem-ai-server-monitor/tests/test_war_room_fresh_context.py

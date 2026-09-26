@@ -15,8 +15,10 @@ class FakeCore:
         self.records = {}
         self.cancelled = []
         self.status_calls = []
+        self.dispatch_calls = []
 
     def dispatch(self, **kwargs):
+        self.dispatch_calls.append(kwargs.copy())
         cid = kwargs["core_run_id"]
         self.records[cid] = {"core_run_id": cid, "agent_id": kwargs["agent_id"], "status": "RUNNING",
                              "openclaw_binding": {"openclaw_run_id": "oc-1", "session_key": "agent:erpcoder:main", "session_id": None},
@@ -159,6 +161,34 @@ class WarRoomFastGatewayCorrectionTests(unittest.TestCase):
         self.assertIn("artifacts_json", ui_source)
         self.assertIn('value.pop("session_key", None)', api_source)
         self.assertIn('value.pop("session_id", None)', api_source)
+
+    def test_deliver_prefers_exact_result_artifact_paths_over_broad_scope(self):
+        path = Path(tempfile.mktemp())
+        exact = "/home/plachem-sever/.openclaw/agents/cliper/01_ACTIVE/test/result.md"
+        broad = "/home/plachem-sever/.openclaw/agents/cliper/01_ACTIVE/test"
+        with sqlite3.connect(path) as con:
+            con.executescript("""
+                CREATE TABLE war_deliveries (id TEXT PRIMARY KEY, message_id TEXT, agent_id TEXT);
+                CREATE TABLE war_messages (id TEXT PRIMARY KEY, project_id TEXT, body TEXT);
+                CREATE TABLE war_tasks (id TEXT PRIMARY KEY, source_message_id TEXT, execution_mode TEXT);
+                CREATE TABLE war_grounding_packets (task_id TEXT PRIMARY KEY, packet_json TEXT);
+            """)
+            con.execute("INSERT INTO war_deliveries VALUES ('d2','m2','cliper')")
+            con.execute("INSERT INTO war_messages VALUES ('m2','p2','read-only result')")
+            con.execute("INSERT INTO war_tasks VALUES ('t2','m2','FAST_GATEWAY')")
+            packet = {
+                "worktree": broad, "branch": "test", "revision": "v1",
+                "api_base": "/api", "db_label": "test",
+                "forbidden": ["production DB"], "completion_conditions": ["done"],
+                "approved_paths": [broad], "result_artifact_paths": [exact],
+            }
+            con.execute("INSERT INTO war_grounding_packets VALUES ('t2',?)", (json.dumps(packet),))
+        core = FakeCore()
+        receipt = FastGatewayWarRoomAdapter(core, path).deliver(
+            delivery_id="d2", agent_id="cliper", instruction_id="m2", body="ignored"
+        )
+        self.assertEqual("received", receipt.status)
+        self.assertEqual([exact], core.dispatch_calls[-1]["approved_paths"])
 
 
 if __name__ == "__main__":

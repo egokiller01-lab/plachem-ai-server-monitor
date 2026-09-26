@@ -5,10 +5,11 @@ from __future__ import annotations
 import hmac
 import hashlib
 import os
+import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from plachem_fast_gateway import CoreEngine, TaskRuntimeClass
@@ -38,6 +39,7 @@ class DispatchRequest(BaseModel):
     workspace_id: str = Field(default="command-center", min_length=1, max_length=256)
     project_id: str = Field(default="fast-gateway", min_length=1, max_length=256)
     task_runtime_class: TaskRuntimeClass = TaskRuntimeClass.STANDARD
+    watchdog_managed: bool = True
 
 
 class GoalContractRequest(BaseModel):
@@ -64,6 +66,7 @@ class DirectDispatchRequest(BaseModel):
     source_run_id: str = Field(min_length=8, max_length=256)
     source_session_key: str = Field(min_length=8, max_length=512)
     task_runtime_class: TaskRuntimeClass = TaskRuntimeClass.STANDARD
+    watchdog_managed: bool = True
 
 
 def _present(record: dict[str, Any]) -> dict[str, Any]:
@@ -186,6 +189,7 @@ def dispatch_run(
         goal = payload.get("goal_contract")
         if goal is not None and hasattr(goal, "model_dump"):
             payload["goal_contract"] = goal.model_dump()
+        payload["watchdog_managed"] = request.watchdog_managed
         return _present(_engine().dispatch(**payload))
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc).split(":", 1)[0]) from exc
@@ -225,6 +229,7 @@ def direct_dispatch_and_wait(
             idempotency_key=idempotency_key,
             goal_contract=goal,
             task_runtime_class=request.task_runtime_class,
+            watchdog_managed=request.watchdog_managed,
         )
         if record.get("status") not in {"PASS", "FAIL", "BLOCKED", "TIMEOUT", "CANCELLED"}:
             record = engine.wait(core_run_id, timeout_seconds=305)
@@ -269,3 +274,87 @@ def fresh_context_run(
         return _present(_engine().fresh_context(core_run_id))
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc).split(":", 1)[0]) from exc
+
+
+def _require_localhost(request: Request) -> None:
+    host = request.client.host if request.client else None
+    if host not in {"127.0.0.1", "::1"}:
+        raise HTTPException(status_code=403, detail="localhost_only")
+
+
+@router.post("/internal/watchdog-fixture/start")
+def start_watchdog_fixture(request: Request) -> dict[str, Any]:
+    """Start one safe qwentest FastGateway run for live watchdog validation."""
+    _require_localhost(request)
+    nonce = uuid.uuid4().hex
+    core_run_id = f"direct-watchdog-fixture-{nonce}"
+    idempotency_key = f"direct:watchdog-fixture:{nonce}"
+    agent_id = "qwentest"
+    goal = _direct_goal(agent_id)
+    message = _direct_message(
+        "Safe non-production FastGateway Watchdog live validation. "
+        "Do not modify files and do not perform external or production actions. "
+        "First execute exactly 5 separate exec tool calls of this exact command, unchanged: "
+        "python3 -c 'import sys; sys.exit(1)'. "
+        "These failures are intentional watchdog calibration signals. "
+        "Then immediately execute exactly one final exec tool call of this exact command and wait for it: "
+        "python3 -c 'import time,sys; time.sleep(120); sys.exit(1)'. "
+        "Do not diagnose, optimize, combine, replace, skip the long call, or conclude before it finishes."
+    )
+    contract = normalize_goal_contract(goal)
+    scope = execution_auth_scope(
+        agent_id=agent_id,
+        message=message,
+        core_run_id=core_run_id,
+        idempotency_key=idempotency_key,
+        goal_contract=contract.as_dict(),
+    )
+    engine = _engine()
+    engine.grant_authorizer.direct().register(core_run_id, scope)
+    record = engine.dispatch(
+        agent_id=agent_id,
+        message=message,
+        timeout_seconds=300,
+        core_run_id=core_run_id,
+        idempotency_key=idempotency_key,
+        goal_contract=goal,
+        task_runtime_class=TaskRuntimeClass.STANDARD,
+        watchdog_managed=True,
+    )
+    return {
+        "core_run_id": core_run_id,
+        "status": record.get("status"),
+        "watchdog_managed": record.get("watchdog_managed"),
+    }
+
+
+@router.post("/internal/watchdog-fixture/{core_run_id}/cancel")
+def cancel_watchdog_fixture(core_run_id: str, request: Request) -> dict[str, Any]:
+    """Clean up only the localhost qwentest watchdog fixture run."""
+    _require_localhost(request)
+    if not core_run_id.startswith("direct-watchdog-fixture-"):
+        raise HTTPException(status_code=422, detail="fixture_run_only")
+    record = RunRegistry(_run_path()).get(core_run_id)
+    if record is None or str(record.get("agent_id") or "").casefold() != "qwentest":
+        raise HTTPException(status_code=404, detail="fixture_run_missing")
+    if str(record.get("status") or "") in {"PASS", "FAIL", "BLOCKED", "TIMEOUT", "CANCELLED"}:
+        return {"core_run_id": core_run_id, "status": record.get("status")}
+    cancelled = _engine().cancel(core_run_id)
+    return {"core_run_id": core_run_id, "status": cancelled.get("status")}
+
+
+@router.get("/internal/watchdog-status")
+def watchdog_status(request: Request) -> dict[str, Any]:
+    """Local diagnostic for FastGateway watchdog wiring only."""
+    _require_localhost(request)
+    harness = get_persistent_harness()
+    watchdog = getattr(harness, "_session_watchdog", None)
+    layer = getattr(harness, "_recovery_layer", None)
+    return {
+        "watchdog_attached": watchdog is not None,
+        "watchdog_class": type(watchdog).__name__ if watchdog is not None else None,
+        "recovery_layer_attached": layer is not None,
+        "recovery_layer_class": type(layer).__name__ if layer is not None else None,
+        "active_controllers": sorted(getattr(harness, "active_controllers", {}).keys()),
+        "watchdog_history_path": str(getattr(watchdog, "history_path", "")) if watchdog is not None else None,
+    }

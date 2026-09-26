@@ -87,7 +87,8 @@ class WorkerTransportWiringTests(unittest.TestCase):
         submits = [payload for name, payload in transport.calls if name == "submit"]
         self.assertEqual(1, len(submits))
         self.assertEqual(
-            {"message", "agentId", "idempotencyKey", "timeout"}, set(submits[0]),
+            {"message", "agentId", "idempotencyKey", "timeout", "_trustedValidationContext"},
+            set(submits[0]),
         )
         self.assertEqual("qwentest", submits[0]["agentId"])
         self.assertEqual("idem-1", submits[0]["idempotencyKey"])

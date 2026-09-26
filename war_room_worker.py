@@ -7,7 +7,9 @@ original delivery identifier.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
 import sqlite3
 import time
@@ -69,8 +71,8 @@ def _structured_result(con: sqlite3.Connection, message_id: str, agent_id: str, 
     except (ValueError, TypeError, IndexError):
         return None, "structured_response_invalid_json"
     required = {"confirmed_worktree","confirmed_revision","verdict","evidence","summary","representative_completion_claimed"}
-    if not isinstance(result, dict) or not required.issubset(result):
-        return None, "structured_response_fields_missing"
+    if not isinstance(result, dict) or set(result) != required:
+        return None, "structured_response_fields_mismatch"
     packet = json.loads(con.execute("SELECT packet_json FROM war_grounding_packets WHERE task_id=?", (task["id"],)).fetchone()[0])
     expected_revision = packet["revision"]
     confirmed_revision = result["confirmed_revision"]
@@ -101,10 +103,51 @@ def _structured_result(con: sqlite3.Connection, message_id: str, agent_id: str, 
     return result, None
 
 
-def _store_response_message(con: sqlite3.Connection, row: sqlite3.Row, response_body: str, now: int) -> str:
-    """Persist the exact recovered response before validation so lineage survives FAIL."""
+def _fast_gateway_result(body: str) -> tuple[dict[str, Any] | None, str | None]:
+    """Parse only a Core-validated Fast Gateway terminal result for QA bridging."""
+    try:
+        value = json.loads(body.strip())
+    except (ValueError, TypeError):
+        return None, "fast_gateway_result_invalid_json"
+    if not isinstance(value, dict):
+        return None, "fast_gateway_result_invalid"
+    status = str(value.get("status") or "").lower()
+    if status != "completed":
+        return None, "fast_gateway_result_not_completed"
+    summary = value.get("summary")
+    artifacts = value.get("artifacts")
+    if not isinstance(summary, str) or not isinstance(artifacts, list):
+        return None, "fast_gateway_result_fields_missing"
+    artifact_paths: list[str] = []
+    for item in artifacts:
+        if not isinstance(item, dict):
+            return None, "fast_gateway_result_artifact_invalid"
+        path = item.get("path")
+        if not isinstance(path, str) or not path.startswith("/"):
+            return None, "fast_gateway_result_artifact_invalid"
+        artifact_paths.append(path)
+    if not artifact_paths:
+        return None, "fast_gateway_result_artifact_missing"
+    return {
+        "verdict": "PASS",
+        "summary": summary,
+        "evidence": artifact_paths,
+        "artifact_paths": artifact_paths,
+    }, None
+
+
+def _store_response_message(
+    con: sqlite3.Connection, row: sqlite3.Row, response_body: str, now: int,
+    *, structured_result: dict[str, Any] | None = None,
+) -> str:
+    """Persist response lineage while preserving an already validated result contract."""
     response_message_id = str(uuid.uuid4())
-    clean = war_room._redact_string(response_body)
+    if structured_result is not None:
+        safe_result = dict(structured_result)
+        safe_result["summary"] = war_room._redact_string(str(safe_result.get("summary") or ""))
+        clean = json.dumps(safe_result, ensure_ascii=False, separators=(",", ":"))
+    else:
+        clean = war_room._redact_string(response_body)
     con.execute(
         """INSERT INTO war_messages
            (id,project_id,message_type,author_type,author_id,body,source_message_id,created_at,correlation_id,redaction_state,original_body)
@@ -134,9 +177,408 @@ def _apply_collaboration_outcome(con: sqlite3.Connection, task_id: str, project_
         con.execute("UPDATE war_tasks SET status='qa',qa_cycle=qa_cycle+1,updated_at=? WHERE id=? AND status='running'", (now, task_id))
 
 
-def _terminal_validation_failure(con: sqlite3.Connection, *, message_id: str, project_id: str, delivery_id: str, task_revision: int, error_code: str, now: int) -> None:
-    task = con.execute("SELECT id,status FROM war_tasks WHERE source_message_id=?", (message_id,)).fetchone()
+
+def _auto_qa_enabled() -> bool:
+    return str(os.environ.get("PLACHEM_WAR_ROOM_AUTO_QA", "0")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _qa_delivery_for_task(con: sqlite3.Connection, task_id: str, agent_id: str) -> bool:
+    task = con.execute(
+        "SELECT reviewer_agent_id,status FROM war_tasks WHERE id=?", (task_id,)
+    ).fetchone()
+    return bool(
+        task
+        and task["status"] == "qa"
+        and task["reviewer_agent_id"]
+        and str(task["reviewer_agent_id"]) == str(agent_id)
+    )
+
+
+def _qa_review_instruction(con: sqlite3.Connection, task_id: str, message_id: str) -> str:
+    task = con.execute("SELECT * FROM war_tasks WHERE id=?", (task_id,)).fetchone()
+    original = con.execute("SELECT body FROM war_messages WHERE id=?", (message_id,)).fetchone()
+    packet_row = con.execute(
+        "SELECT packet_json FROM war_grounding_packets WHERE task_id=?", (task_id,)
+    ).fetchone()
+    try:
+        packet = json.loads(packet_row["packet_json"]) if packet_row else {}
+    except (TypeError, ValueError):
+        packet = {}
+    verification_scope = str(packet.get("verification_scope") or "TASK_RUN").upper()
+    if verification_scope == "PROJECT_WINDOW":
+        scope_instruction = (
+            "Verification scope is PROJECT_WINDOW: evaluate completion and forbidden-change conditions "
+            "against the relevant project history as well as the current task."
+        )
+    else:
+        verification_scope = "TASK_RUN"
+        scope_instruction = (
+            "Verification scope is TASK_RUN: evaluate completion and forbidden-change conditions only "
+            "against mutations attributable to this task revision/delivery. Historical project maintenance "
+            "or code changes from earlier tasks are context, not violations of this task. Explicitly approved "
+            "result-artifact writes are task outputs, not production mutations, unless the original task says otherwise."
+        )
+    workers = con.execute(
+        """SELECT d.agent_id,d.run_id,rm.body
+           FROM war_deliveries d
+           LEFT JOIN war_messages rm ON rm.id=d.response_message_id
+           JOIN war_task_agents a ON a.task_id=? AND a.agent_id=d.agent_id
+           WHERE d.message_id=? AND d.task_revision=? AND d.status='responded'
+           ORDER BY d.agent_id""",
+        (task_id, message_id, int(task["revision"])),
+    ).fetchall()
+    summaries = []
+    evidence = []
+    for row in workers:
+        result, error = _structured_result(con, message_id, row["agent_id"], row["body"] or "")
+        if (error or not result) and str(task["execution_mode"] or "") == "FAST_GATEWAY":
+            result, error = _fast_gateway_result(row["body"] or "")
+        if error or not result:
+            summaries.append({"agent": row["agent_id"], "error": error or "missing_result"})
+            continue
+        summaries.append({
+            "agent": row["agent_id"],
+            "verdict": result.get("verdict"),
+            "summary": str(result.get("summary") or "")[:1200],
+            "run_id": row["run_id"],
+        })
+        evidence.extend(v for v in result.get("evidence", []) if isinstance(v, str) and v.startswith("/"))
+    unique_evidence = list(dict.fromkeys(evidence))[:20]
+    return (
+        "[AUTO_QA_REVIEW]\n"
+        "You are the independent QA reviewer for this War Room task. "
+        "Do not perform the worker's task again and do not modify production state. "
+        "Independently verify the worker claims against the original instruction, current read-only state, "
+        "and the listed evidence paths. Return PASS only when the completion conditions are actually proven; "
+        "otherwise return FAIL or REWORK. The outer STRUCTURED_RESULT contract is mandatory. "
+        "Set representative_completion_claimed=false.\n"
+        f"[QA_VERIFICATION_SCOPE]\n{verification_scope}\n{scope_instruction}\n"
+        f"[ORIGINAL_TASK]\n{str(original['body'] if original else '')[:3000]}\n"
+        f"[WORKER_RESULTS]\n{json.dumps(summaries, ensure_ascii=False)}\n"
+        f"[WORKER_EVIDENCE_PATHS]\n{json.dumps(unique_evidence, ensure_ascii=False)}\n"
+    )
+
+
+def _capture_required_evidence(
+    con: sqlite3.Connection,
+    *,
+    task_id: str,
+    message_id: str,
+    task_revision: int,
+    now: int,
+) -> None:
+    """Materialize worker file evidence into the existing immutable QA evidence contract."""
+    task = con.execute("SELECT * FROM war_tasks WHERE id=?", (task_id,)).fetchone()
+    packet_row = con.execute("SELECT packet_json FROM war_grounding_packets WHERE task_id=?", (task_id,)).fetchone()
+    if not task or not packet_row or task["status"] != "qa":
+        return
+    from war_room_actions import _normalize_required_evidence
+    packet = json.loads(packet_row[0])
+    required = _normalize_required_evidence(packet.get("required_evidence", ["test", "artifact"]))
+    workers = con.execute(
+        """SELECT d.agent_id,d.run_id,rm.body
+           FROM war_deliveries d
+           LEFT JOIN war_messages rm ON rm.id=d.response_message_id
+           JOIN war_task_agents a ON a.task_id=? AND a.agent_id=d.agent_id
+           WHERE d.message_id=? AND d.task_revision=? AND d.status='responded'
+           ORDER BY d.agent_id""",
+        (task_id, message_id, task_revision),
+    ).fetchall()
+    candidates: list[tuple[str, str | None]] = []
+    for row in workers:
+        result, error = _structured_result(con, message_id, row["agent_id"], row["body"] or "")
+        if (error or not result) and str(task["execution_mode"] or "") == "FAST_GATEWAY":
+            result, error = _fast_gateway_result(row["body"] or "")
+        if error or not result:
+            continue
+        for uri in result.get("evidence", []):
+            if isinstance(uri, str) and uri.startswith("/") and Path(uri).is_file():
+                candidates.append((uri, row["run_id"]))
+    if not candidates:
+        _audit(con, task["project_id"], "qa_auto_evidence_missing", task_id, {"reason": "no_readable_worker_evidence"})
+        return
+    scope_hash = hashlib.sha256(task["scope"].encode()).hexdigest()
+    approved = packet.get("approved_paths") or [packet.get("worktree")]
+    legacy = all(item.get("legacy") for item in required)
+    for item in required:
+        evidence_type = item["id"] if legacy else item["evidence_type"]
+        contract_evidence_id = None if legacy else item["id"]
+        evidence_id = str(uuid.uuid4())
+        if not legacy:
+            existing = con.execute(
+                """SELECT id FROM war_evidence
+                   WHERE task_id=? AND task_revision=? AND qa_cycle=?
+                     AND COALESCE(contract_evidence_id,id)=? LIMIT 1""",
+                (task_id, int(task["revision"]), int(task["qa_cycle"]), contract_evidence_id),
+            ).fetchone()
+            if existing:
+                continue
+        chosen = None
+        for uri, run_id in candidates:
+            if not war_room.path_within_approved_roots(uri, approved):
+                continue
+            if not legacy and item["expected_contains"]:
+                try:
+                    if item["expected_contains"] not in Path(uri).read_text(encoding="utf-8"):
+                        continue
+                except (OSError, UnicodeDecodeError):
+                    continue
+            chosen = (uri, run_id)
+            break
+        if not chosen:
+            _audit(con, task["project_id"], "qa_auto_evidence_requirement_missing", task_id, {"evidence_id": item["id"]})
+            continue
+        uri, run_id = chosen
+        data = Path(uri).read_bytes()
+        con.execute(
+            """INSERT INTO war_evidence
+               (id,task_id,evidence_type,uri,summary,sha256,task_revision,scope_hash,document_version,qa_cycle,
+                run_id,source_command,expected_contains,immutable,contract_evidence_id,created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                evidence_id, task_id, evidence_type, uri,
+                "Auto-captured from verified worker structured result",
+                hashlib.sha256(data).hexdigest() if not legacy else None,
+                task["revision"], scope_hash, task["document_version"], task["qa_cycle"],
+                run_id if not legacy else None,
+                item["source_command"] if not legacy else None,
+                item["expected_contains"] if not legacy else None,
+                0 if legacy else 1, contract_evidence_id, now,
+            ),
+        )
+        _audit(con, task["project_id"], "qa_auto_evidence_added", task_id, {
+            "evidence_id": contract_evidence_id or evidence_id,
+            "record_id": evidence_id,
+            "uri": uri,
+        })
+
+
+def _ensure_auto_qa_session(
+    con: sqlite3.Connection,
+    *,
+    task: sqlite3.Row,
+    adapter: Any,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Create a fresh reviewer session for exactly one QA delivery.
+
+    QA sessions are delivery-scoped, not project/agent-scoped. This prevents
+    concurrent or sequential task reviews from sharing conversational context.
+    """
+    reviewer = str(task["reviewer_agent_id"] or "")
+    if not reviewer:
+        return None, "reviewer_missing"
+    creator = getattr(adapter, "create_disposable_session", None)
+    if not callable(creator):
+        return None, "reviewer_session_provision_unavailable"
+    try:
+        created = creator(agent_id=reviewer, project_id=task["project_id"])
+    except Exception as exc:
+        return None, f"reviewer_session_provision_failed:{type(exc).__name__}"
+    if (
+        created.get("purpose") != "test"
+        or created.get("disposable") is not True
+        or not str(created.get("session_key") or "").startswith(f"agent:{reviewer.lower()}:war-room-test:")
+        or not created.get("session_id")
+    ):
+        return None, "unsafe_reviewer_session_binding"
+    return {
+        "session_key": str(created["session_key"]),
+        "session_id": str(created["session_id"]),
+        "purpose": "test",
+        "disposable": True,
+    }, None
+
+def _queue_auto_qa_delivery(
+    con: sqlite3.Connection,
+    *,
+    task_id: str,
+    message_id: str,
+    execution_mode: str,
+    adapter: Any,
+    now: int,
+) -> bool:
+    if not _auto_qa_enabled():
+        return False
+    task = con.execute("SELECT * FROM war_tasks WHERE id=?", (task_id,)).fetchone()
+    if not task or task["status"] != "qa" or not task["reviewer_agent_id"]:
+        return False
+    reviewer = str(task["reviewer_agent_id"])
+    if con.execute(
+        "SELECT 1 FROM war_task_agents WHERE task_id=? AND agent_id=?", (task_id, reviewer)
+    ).fetchone():
+        con.execute("UPDATE war_tasks SET status='rework_required',revision=revision+1,updated_at=? WHERE id=?", (now, task_id))
+        _audit(con, task["project_id"], "qa_auto_blocked", task_id, {"reason": "reviewer_not_independent"})
+        return False
+    existing = con.execute(
+        "SELECT id FROM war_deliveries WHERE message_id=? AND agent_id=? AND task_revision=?",
+        (message_id, reviewer, int(task["revision"])),
+    ).fetchone()
+    if existing:
+        return True
+    # QA is always read-only and runs through the direct disposable-session lane,
+    # even when the Worker used Fast Gateway / Controlled Lane.
+    qa_binding, reason = _ensure_auto_qa_session(con, task=task, adapter=adapter)
+    if not qa_binding:
+        con.execute("UPDATE war_tasks SET status='rework_required',revision=revision+1,updated_at=? WHERE id=?", (now, task_id))
+        _audit(con, task["project_id"], "qa_auto_blocked", task_id, {"reason": reason})
+        return False
+    delivery_id = str(uuid.uuid4())
+    correlation = str(uuid.uuid4())
+    con.execute(
+        """INSERT INTO war_deliveries
+           (id,message_id,agent_id,task_revision,status,attempt_count,deadline_at,created_at,correlation_id,
+            session_key,session_id)
+           VALUES (?,?,?,?, 'queued',0,?,?,?,?,?)""",
+        (
+            delivery_id, message_id, reviewer, int(task["revision"]), task["deadline_at"], now, correlation,
+            qa_binding["session_key"], qa_binding["session_id"],
+        ),
+    )
+    _audit(con, task["project_id"], "qa_delivery_queued", delivery_id, {
+        "task_id": task_id,
+        "reviewer": reviewer,
+        "session_id": qa_binding["session_id"],
+        "session_scope": "delivery",
+    }, correlation)
+    return True
+
+
+def _record_auto_qa_verdict(
+    con: sqlite3.Connection,
+    *,
+    task_id: str,
+    reviewer: str,
+    result: dict[str, Any],
+    now: int,
+) -> str:
+    task = con.execute("SELECT * FROM war_tasks WHERE id=?", (task_id,)).fetchone()
+    if not task or task["status"] != "qa" or str(task["reviewer_agent_id"] or "") != reviewer:
+        return "qa_state_mismatch"
+    if con.execute("SELECT 1 FROM war_task_agents WHERE task_id=? AND agent_id=?", (task_id, reviewer)).fetchone():
+        return "qa_not_independent"
+    qa_row = con.execute(
+        "SELECT role,active FROM war_participants WHERE project_id=? AND principal_id=?",
+        (task["project_id"], reviewer),
+    ).fetchone()
+    if not qa_row or qa_row["role"] != "qa" or not qa_row["active"]:
+        return "qa_principal_invalid"
+    from war_room_actions import _normalize_required_evidence, _qa_evidence_validation, _qa_signature
+    packet_row = con.execute("SELECT packet_json FROM war_grounding_packets WHERE task_id=?", (task_id,)).fetchone()
+    packet = json.loads(packet_row[0]) if packet_row else {}
+    required = _normalize_required_evidence(packet.get("required_evidence", ["test", "artifact"]))
+    required_ids = [item["id"] for item in required]
+    verdict = str(result.get("verdict") or "").upper()
+    if verdict not in {"PASS", "FAIL", "REWORK"}:
+        return "qa_invalid_verdict"
+    if verdict == "PASS":
+        error = _qa_evidence_validation(con, task, packet, required_ids)
+        if error:
+            con.execute(
+                "UPDATE war_tasks SET status='rework_required',revision=revision+1,updated_at=? WHERE id=?",
+                (now, task_id),
+            )
+            _audit(con, task["project_id"], "qa_auto_pass_blocked", task_id, {"reason": error, "reviewer": reviewer})
+            return error
+    profile = "required:" + ",".join(required_ids)
+    scope_hash = hashlib.sha256(task["scope"].encode()).hexdigest()
+    signed_payload = json.dumps(
+        {
+            "task_id": task_id,
+            "verdict": verdict,
+            "evidence_profile": profile,
+            "qa_principal": reviewer,
+            "task_revision": task["revision"],
+            "scope_hash": scope_hash,
+            "document_version": task["document_version"],
+            "qa_cycle": task["qa_cycle"],
+        },
+        sort_keys=True,
+    )
+    signature = _qa_signature(signed_payload)
+    verdict_id = str(uuid.uuid4())
+    con.execute(
+        """INSERT INTO war_qa_verdicts
+           (id,task_id,qa_principal,verdict,evidence_profile,signature,signed_payload,
+            task_revision,scope_hash,document_version,qa_cycle,created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            verdict_id, task_id, reviewer, verdict, profile, signature, signed_payload,
+            task["revision"], scope_hash, task["document_version"], task["qa_cycle"], now,
+        ),
+    )
+    _audit(con, task["project_id"], "qa_verdict_recorded", task_id, {"verdict_id": verdict_id, "verdict": verdict, "source": "auto_reviewer"})
+    if verdict in {"FAIL", "REWORK"}:
+        con.execute(
+            "UPDATE war_tasks SET status='rework_required',revision=revision+1,updated_at=? WHERE id=?",
+            (now, task_id),
+        )
+        _audit(con, task["project_id"], "qa_verdict_rework_required", task_id, {"verdict_id": verdict_id, "verdict": verdict})
+    return verdict
+
+
+def _after_responded_delivery(
+    con: sqlite3.Connection,
+    *,
+    row: sqlite3.Row,
+    adapter: Any,
+    structured_result: dict[str, Any] | None,
+    now: int,
+) -> None:
+    if not row["task_id"]:
+        return
+    task = con.execute("SELECT * FROM war_tasks WHERE id=?", (row["task_id"],)).fetchone()
     if not task:
+        return
+    revision = int(row["task_revision"] or task["revision"] or 1)
+    if int(task["revision"] or 1) != revision:
+        _audit(con, task["project_id"], "stale_revision_response_ignored", row["id"], {
+            "task_id": task["id"],
+            "delivery_revision": revision,
+            "current_revision": int(task["revision"] or 1),
+        })
+        return
+    if str(task["reviewer_agent_id"] or "") == str(row["agent_id"]) and task["status"] == "qa":
+        if structured_result:
+            _record_auto_qa_verdict(
+                con, task_id=task["id"], reviewer=str(row["agent_id"]),
+                result=structured_result, now=now,
+            )
+        return
+    worker_pending = con.execute(
+        """SELECT COUNT(*)
+           FROM war_deliveries d
+           JOIN war_task_agents a ON a.task_id=? AND a.agent_id=d.agent_id
+           WHERE d.message_id=? AND d.task_revision=? AND d.status!='responded'""",
+        (task["id"], row["message_id"], revision),
+    ).fetchone()[0]
+    if worker_pending != 0:
+        return
+    _apply_collaboration_outcome(
+        con, task["id"], row["project_id"], row["message_id"], revision, now
+    )
+    refreshed = con.execute("SELECT * FROM war_tasks WHERE id=?", (task["id"],)).fetchone()
+    if refreshed and refreshed["status"] == "qa" and _auto_qa_enabled():
+        _capture_required_evidence(
+            con, task_id=task["id"], message_id=row["message_id"],
+            task_revision=revision, now=now,
+        )
+        _queue_auto_qa_delivery(
+            con, task_id=task["id"], message_id=row["message_id"],
+            execution_mode=row["execution_mode"], adapter=adapter, now=now,
+        )
+
+
+def _terminal_validation_failure(con: sqlite3.Connection, *, message_id: str, project_id: str, delivery_id: str, task_revision: int, error_code: str, now: int) -> None:
+    task = con.execute("SELECT id,status,revision FROM war_tasks WHERE source_message_id=?", (message_id,)).fetchone()
+    if not task:
+        return
+    if int(task["revision"] or 1) != int(task_revision):
+        _audit(con, project_id, "stale_revision_failure_ignored", delivery_id, {
+            "task_id": task["id"],
+            "delivery_revision": int(task_revision),
+            "current_revision": int(task["revision"] or 1),
+            "error_code": error_code,
+        })
         return
     con.execute("UPDATE war_tasks SET status='rework_required',revision=revision+1,updated_at=? WHERE id=? AND status!='rework_required'", (now, task["id"]))
     con.execute("UPDATE war_deliveries SET status='failed',error_code='cancelled_after_terminal_validation' WHERE message_id=? AND task_revision=? AND id!=? AND status='queued'", (message_id, task_revision, delivery_id))
@@ -178,6 +620,34 @@ def _persist_execution(con: sqlite3.Connection, *, snapshot: dict[str, Any] | No
           validation_error=excluded.validation_error,policy_status=excluded.policy_status,cancel_reason=excluded.cancel_reason,
           escalation_required=excluded.escalation_required,updated_at=excluded.updated_at""",
         (snapshot.get("core_run_id"), project_id, task_id, agent_id, snapshot.get("openclaw_run_id"), snapshot.get("session_key"), snapshot.get("run_status", "UNKNOWN"), snapshot.get("runtime_seconds"), snapshot.get("result_summary"), snapshot.get("result_json"), snapshot.get("evidence_json"), snapshot.get("artifacts_json"), snapshot.get("raw_response"), snapshot.get("rejected_result_json"), snapshot.get("validation_error"), snapshot.get("policy_status"), snapshot.get("cancel_reason"), int(snapshot.get("escalation_required", 0)), now, now))
+
+
+def _binding_for_delivery(
+    con: sqlite3.Connection,
+    row: sqlite3.Row,
+    *,
+    require_delivery_binding: bool = False,
+) -> dict[str, Any] | sqlite3.Row | None:
+    """Return the delivery binding; optionally fail closed instead of project fallback."""
+    keys = row.keys()
+    session_key = row["session_key"] if "session_key" in keys else None
+    session_id = row["session_id"] if "session_id" in keys else None
+    if session_key and session_id and ":war-room-test:" in str(session_key):
+        return {
+            "session_key": session_key,
+            "session_id": session_id,
+            "purpose": "test",
+            "disposable": 1,
+        }
+    if require_delivery_binding:
+        return None
+    return con.execute(
+        """SELECT session_key,session_id,purpose,disposable
+           FROM war_project_sessions
+           WHERE project_id=? AND agent_id=? AND enabled=1
+           ORDER BY rowid DESC LIMIT 1""",
+        (row["project_id"], row["agent_id"]),
+    ).fetchone()
 
 
 def process_due_deliveries(*, db_path: str | Path, adapter: SessionAdapter, adapter_selector: Any | None = None, now: int | None = None) -> list[dict[str, Any]]:
@@ -238,8 +708,12 @@ def process_due_deliveries(*, db_path: str | Path, adapter: SessionAdapter, adap
                 _audit(con, row["project_id"], "delivery_timed_out", row["id"], {"reason":"deadline"})
                 results.append({"delivery_id":row["id"],"status":"timed_out"})
                 continue
-            active_adapter = adapter_selector(row["execution_mode"], db_path) if adapter_selector else adapter
+            is_qa_delivery = bool(row["task_id"] and _qa_delivery_for_task(con, row["task_id"], row["agent_id"]))
+            delivery_execution_mode = "LEGACY" if is_qa_delivery else row["execution_mode"]
+            active_adapter = adapter if is_qa_delivery else (adapter_selector(row["execution_mode"], db_path) if adapter_selector else adapter)
             delivery_body = row["body"]
+            if is_qa_delivery:
+                delivery_body = _qa_review_instruction(con, row["task_id"], row["message_id"])
             if row["task_id"] and not delivery_body.startswith(("[STRUCTURED_RESULT]", "[FAST_GATEWAY_RESULT]")):
                 packet_row = con.execute(
                     "SELECT packet_json FROM war_grounding_packets WHERE task_id=?",
@@ -248,10 +722,10 @@ def process_due_deliveries(*, db_path: str | Path, adapter: SessionAdapter, adap
                 if packet_row:
                     from war_room_actions import _grounded_instruction
                     delivery_body = _grounded_instruction(
-                        row["body"], json.loads(packet_row[0]), row["execution_mode"]
+                        delivery_body, json.loads(packet_row[0]), delivery_execution_mode
                     )
-            binding = con.execute("SELECT session_key,session_id,purpose,disposable FROM war_project_sessions WHERE project_id=? AND agent_id=? AND enabled=1 LIMIT 1", (row["project_id"],row["agent_id"])).fetchone()
-            if binding and row["execution_mode"] != "FAST_GATEWAY":
+            binding = _binding_for_delivery(con, row)
+            if binding and delivery_execution_mode != "FAST_GATEWAY":
                 con.execute("UPDATE war_deliveries SET session_key=?,session_id=? WHERE id=?", (binding["session_key"], binding["session_id"], row["id"]))
             binder = getattr(active_adapter, "bind_delivery", None)
             if binder and not binding:
@@ -270,13 +744,14 @@ def process_due_deliveries(*, db_path: str | Path, adapter: SessionAdapter, adap
             response_message_id = row["response_message_id"]
             response_body = getattr(receipt, "response_body", None)
             validation_error = None
+            structured_result = None
             if status == "responded" and (not isinstance(response_body, str) or not response_body.strip()) and not response_message_id:
                 status = "failed"
                 receipt_error_code = "response_body_missing"
             else:
                 receipt_error_code = getattr(receipt, "error_code", None)
             if status == "responded" and isinstance(response_body, str) and response_body.strip():
-                _, validation_error = (None, None) if row["execution_mode"] == "FAST_GATEWAY" else _structured_result(con, row["message_id"], row["agent_id"], response_body)
+                structured_result, validation_error = (None, None) if (row["execution_mode"] == "FAST_GATEWAY" and not is_qa_delivery) else _structured_result(con, row["message_id"], row["agent_id"], response_body)
                 if validation_error:
                     status = "failed"
                     receipt_error_code = validation_error
@@ -308,7 +783,9 @@ def process_due_deliveries(*, db_path: str | Path, adapter: SessionAdapter, adap
                 continue
             if isinstance(response_body, str) and response_body.strip():
                 if not response_message_id:
-                    response_message_id = _store_response_message(con, row, response_body, current)
+                    response_message_id = _store_response_message(
+                        con, row, response_body, current, structured_result=structured_result
+                    )
                     con.execute("UPDATE war_deliveries SET response_message_id=? WHERE id=? AND status=?", (response_message_id, row["id"], stored_status))
             if status in {"failed", "timed_out"} and not retryable:
                 _terminal_validation_failure(
@@ -319,16 +796,18 @@ def process_due_deliveries(*, db_path: str | Path, adapter: SessionAdapter, adap
             snapshotter = getattr(active_adapter, "execution_snapshot", None)
             if snapshotter:
                 _persist_execution(con, snapshot=snapshotter(row["id"]), project_id=row["project_id"], task_id=row["task_id"], agent_id=row["agent_id"], now=current)
-            task = con.execute("SELECT id,revision FROM war_tasks WHERE source_message_id=?", (row["message_id"],)).fetchone()
+            task = con.execute("SELECT * FROM war_tasks WHERE source_message_id=?", (row["message_id"],)).fetchone()
             if task:
-                # Production Fast Gateway reserves admission in the approval
-                # transaction. Do not charge again on receipt/replay/failure.
-                call_delta = 0 if getattr(active_adapter, "reserves_call_budget", False) is True else 1
-                con.execute("INSERT INTO war_task_calls(task_id,task_revision,call_count,turn_count,updated_at) VALUES (?,?,?,?,?) ON CONFLICT(task_id,task_revision) DO UPDATE SET call_count=call_count+?,turn_count=turn_count+?,updated_at=?", (task["id"],int(row["task_revision"] or task["revision"] or 1),call_delta,1 if status=="responded" else 0,current,call_delta,1 if status=="responded" else 0,current))
+                is_reviewer = str(task["reviewer_agent_id"] or "") == str(row["agent_id"]) and task["status"] == "qa"
+                # QA is a separate review lane and does not consume Worker call/turn budget.
+                call_delta = 0 if is_reviewer or getattr(active_adapter, "reserves_call_budget", False) is True else 1
+                turn_delta = 0 if is_reviewer else (1 if status == "responded" else 0)
+                con.execute("INSERT INTO war_task_calls(task_id,task_revision,call_count,turn_count,updated_at) VALUES (?,?,?,?,?) ON CONFLICT(task_id,task_revision) DO UPDATE SET call_count=call_count+?,turn_count=turn_count+?,updated_at=?", (task["id"],int(row["task_revision"] or task["revision"] or 1),call_delta,turn_delta,current,call_delta,turn_delta,current))
                 if status == "responded":
-                    pending = con.execute("SELECT COUNT(*) FROM war_deliveries WHERE message_id=? AND task_revision=? AND status!='responded'", (row["message_id"], int(row["task_revision"] or 1))).fetchone()[0]
-                    if pending == 0:
-                        _apply_collaboration_outcome(con, task["id"], row["project_id"], row["message_id"], int(row["task_revision"] or 1), current)
+                    _after_responded_delivery(
+                        con, row=row, adapter=adapter,
+                        structured_result=structured_result, now=current,
+                    )
             _audit(con, row["project_id"], "delivery_retry_scheduled" if retryable else "delivery_"+status, row["id"], {"error_code":receipt_error_code,"attempt":total_attempt,"retry_count":cycle_attempt,"max_attempts":maximum,"next_attempt_at":next_attempt_at,"session_key":row["session_key"],"session_id":receipt.session_id or row["session_id"],"run_id":receipt.run_id,"source_message_id":row["message_id"],"response_message_id":response_message_id}, row["correlation_id"])
             results.append({"delivery_id":row["id"],"status":"retry_scheduled" if retryable else status,"state":"system_error" if error_class else stored_status,"attempt_count":total_attempt,"retry_count":cycle_attempt,"next_attempt_at":next_attempt_at})
         con.commit()
@@ -371,11 +850,9 @@ def recover_received_deliveries(*, db_path: str | Path, gateway: Any, gateway_se
                 _audit(con, row["project_id"], "delivery_recovered_timed_out", row["id"], {"run_id": row["run_id"]})
                 results.append({"delivery_id": row["id"], "run_id": row["run_id"], "status": "timed_out"})
                 continue
-            active_gateway = gateway_selector(row["execution_mode"], db_path) if gateway_selector else gateway
-            binding = con.execute(
-                "SELECT session_key,session_id,purpose,disposable FROM war_project_sessions WHERE project_id=? AND agent_id=? AND enabled=1 LIMIT 1",
-                (row["project_id"], row["agent_id"]),
-            ).fetchone()
+            is_qa_delivery = bool(row["task_id"] and _qa_delivery_for_task(con, row["task_id"], row["agent_id"]))
+            active_gateway = gateway if is_qa_delivery else (gateway_selector(row["execution_mode"], db_path) if gateway_selector else gateway)
+            binding = _binding_for_delivery(con, row, require_delivery_binding=True)
             run_binder = getattr(active_gateway, "bind_run", None)
             if run_binder:
                 if not binding:
@@ -404,11 +881,12 @@ def recover_received_deliveries(*, db_path: str | Path, gateway: Any, gateway_se
             response_body = getattr(run, "response_body", None)
             error_code = getattr(run, "error_code", None)
             validation_error = None
+            structured_result = None
             if status == "responded" and (not isinstance(response_body, str) or not response_body.strip()) and not response_message_id:
                 status = "failed"
                 error_code = error_code or "response_body_missing"
             if status == "responded" and isinstance(response_body, str) and response_body.strip():
-                _, validation_error = (None, None) if row["execution_mode"] == "FAST_GATEWAY" else _structured_result(con, row["message_id"], row["agent_id"], response_body)
+                structured_result, validation_error = (None, None) if (row["execution_mode"] == "FAST_GATEWAY" and not is_qa_delivery) else _structured_result(con, row["message_id"], row["agent_id"], response_body)
                 if validation_error:
                     status = "failed"
                     error_code = validation_error
@@ -417,7 +895,9 @@ def recover_received_deliveries(*, db_path: str | Path, gateway: Any, gateway_se
                 continue
             if isinstance(response_body, str) and response_body.strip():
                 if not response_message_id:
-                    response_message_id = _store_response_message(con, row, response_body, current)
+                    response_message_id = _store_response_message(
+                        con, row, response_body, current, structured_result=structured_result
+                    )
                     con.execute("UPDATE war_deliveries SET response_message_id=? WHERE id=? AND status=?", (response_message_id, row["id"], status))
             if status in {"failed", "timed_out"}:
                 _terminal_validation_failure(
@@ -429,16 +909,19 @@ def recover_received_deliveries(*, db_path: str | Path, gateway: Any, gateway_se
             if snapshotter:
                 _persist_execution(con, snapshot=snapshotter(row["id"]), project_id=row["project_id"], task_id=row["task_id"], agent_id=row["agent_id"], now=current)
             if status == "responded":
-                task = con.execute("SELECT id,revision FROM war_tasks WHERE source_message_id=?", (row["message_id"],)).fetchone()
+                task = con.execute("SELECT * FROM war_tasks WHERE source_message_id=?", (row["message_id"],)).fetchone()
                 if task:
-                    con.execute("""INSERT INTO war_task_calls(task_id,task_revision,call_count,turn_count,updated_at)
-                                   VALUES (?,?,0,1,?)
-                                   ON CONFLICT(task_id,task_revision) DO UPDATE SET
-                                     turn_count=turn_count+1,updated_at=excluded.updated_at""",
-                                (task["id"], int(row["task_revision"] or task["revision"] or 1), current))
-                    pending = con.execute("SELECT COUNT(*) FROM war_deliveries WHERE message_id=? AND task_revision=? AND status!='responded'", (row["message_id"], int(row["task_revision"] or 1))).fetchone()[0]
-                    if pending == 0:
-                        _apply_collaboration_outcome(con, task["id"], row["project_id"], row["message_id"], int(row["task_revision"] or 1), current)
+                    is_reviewer = str(task["reviewer_agent_id"] or "") == str(row["agent_id"]) and task["status"] == "qa"
+                    if not is_reviewer:
+                        con.execute("""INSERT INTO war_task_calls(task_id,task_revision,call_count,turn_count,updated_at)
+                                       VALUES (?,?,0,1,?)
+                                       ON CONFLICT(task_id,task_revision) DO UPDATE SET
+                                         turn_count=turn_count+1,updated_at=excluded.updated_at""",
+                                    (task["id"], int(row["task_revision"] or task["revision"] or 1), current))
+                    _after_responded_delivery(
+                        con, row=row, adapter=gateway,
+                        structured_result=structured_result, now=current,
+                    )
             _audit(con, row["project_id"], "delivery_recovered_" + status, row["id"], {"run_id": row["run_id"]})
             results.append({"delivery_id": row["id"], "run_id": row["run_id"], "status": status})
         con.commit()
@@ -464,7 +947,7 @@ def request_project_stop(*, db_path: str | Path, project_id: str, actor_id: str,
             binder = getattr(adapter, "bind_delivery", None)
             run_binder = getattr(adapter, "bind_run", None)
             if binder:
-                binding = con.execute("SELECT session_key,session_id,purpose,disposable FROM war_project_sessions WHERE project_id=? AND agent_id=? AND enabled=1 LIMIT 1", (project_id,row["agent_id"])).fetchone()
+                binding = _binding_for_delivery(con, row)
                 if not binding:
                     receipt = DeliveryReceipt(row["id"], "failed", error_code="explicit_session_binding_missing")
                 else:

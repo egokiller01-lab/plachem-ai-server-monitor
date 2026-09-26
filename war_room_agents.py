@@ -42,14 +42,27 @@ def _openclaw_agent_ids(path: Path) -> list[str]:
     except (OSError, ValueError, TypeError):
         return []
     agents = raw.get("agents", {}) if isinstance(raw, dict) else {}
-    values = agents.get("list", []) if isinstance(agents, dict) else []
-    return [
-        value["id"].strip()
-        for value in values
-        if isinstance(value, dict)
-        and isinstance(value.get("id"), str)
-        and _SAFE_AGENT_ID.fullmatch(value["id"].strip())
-    ]
+    if not isinstance(agents, dict):
+        return []
+    # OpenClaw 9.3 registers agents under agents.entries. Keep agents.list
+    # only as a compatibility fallback for older isolated fixtures.
+    entries = agents.get("entries")
+    if isinstance(entries, dict):
+        candidates = (value.strip() for value in entries if isinstance(value, str))
+    else:
+        values = agents.get("list", [])
+        candidates = (
+            value["id"].strip()
+            for value in values
+            if isinstance(value, dict) and isinstance(value.get("id"), str)
+        ) if isinstance(values, list) else ()
+    result: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if _SAFE_AGENT_ID.fullmatch(candidate) and candidate.casefold() not in seen:
+            result.append(candidate)
+            seen.add(candidate.casefold())
+    return result
 
 
 def _gateway_agents(path: Path) -> dict[str, dict[str, Any]]:
@@ -81,6 +94,7 @@ def load_agent_catalog() -> dict[str, WarRoomAgent]:
     ).expanduser()
     registered = _openclaw_agent_ids(openclaw_path)
     gateway = _gateway_agents(gateway_path)
+    gateway_by_fold = {key.casefold(): value for key, value in gateway.items()}
     # Explicit isolated test mode may intentionally provide neither config.
     # Keep the historical fixtures usable without broadening production
     # execution admission.
@@ -96,11 +110,11 @@ def load_agent_catalog() -> dict[str, WarRoomAgent]:
     for raw_id in registered:
         folded = raw_id.casefold()
         agent_id = display_by_fold[folded]
-        config = gateway.get(raw_id) or next(
-            (value for key, value in gateway.items() if key.casefold() == folded), None
-        )
+        config = gateway_by_fold.get(folded)
         enabled = bool(config.get("enabled", True)) if config is not None else True
-        allowed = bool(config.get("allowed", True)) if config is not None else isolated_fixture
+        # Execution admission is the strict intersection with the existing
+        # Fast Gateway registry; registration alone never grants execution.
+        allowed = bool(config.get("allowed", True)) if config is not None else False
         capabilities = config.get("capabilities", []) if config is not None else []
         safe_capabilities = tuple(
             value for value in capabilities if isinstance(value, str) and value.strip()

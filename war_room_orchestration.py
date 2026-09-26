@@ -82,6 +82,39 @@ class WarRoomOrchestrator:
             from war_room_fast_gateway import FastGatewayWarRoomAdapter
             stop_controller = FastGatewayWarRoomAdapter(core_engine, execution_store.db_path)
         self.stop_controller = stop_controller
+        self._db_path = getattr(execution_store, "db_path", None)
+
+    def _task_approved_paths(self, war_task_id: str) -> list[str]:
+        """Read approved result-document paths from the task grounding packet.
+
+        Returns an empty list when the packet is missing or carries no
+        approved paths; never raises, because path designations are an
+        optional extension of the task contract.
+        """
+        import json as _json
+        import sqlite3 as _sqlite3
+
+        if self._db_path is None:
+            return []
+        try:
+            with _sqlite3.connect(self._db_path) as con:
+                row = con.execute(
+                    "SELECT packet_json FROM war_grounding_packets WHERE task_id=?",
+                    (war_task_id,),
+                ).fetchone()
+            if row is None:
+                return []
+            packet = _json.loads(row[0])
+        except _sqlite3.OperationalError as exc:
+            if str(exc) == "no such table: war_grounding_packets":
+                return []
+            raise
+        except (OSError, ValueError, KeyError, TypeError):
+            return []
+        paths = packet.get("approved_paths")
+        if not isinstance(paths, list):
+            return []
+        return [path for path in paths if isinstance(path, str) and path.strip()]
 
     # ------------------------------------------------------------------
     # Compile & Persist
@@ -408,6 +441,12 @@ class WarRoomOrchestrator:
         if unit is None:
             raise ValueError(f"UNKNOWN_EXECUTION:{execution_id}")
 
+        # Trusted approved_paths come only from the War Room task contract
+        # (immutable grounding packet in the War Room DB).  Worker responses
+        # and request bodies never contribute to this list; the packet is the
+        # server-supplied trust boundary forwarded into the CoreEngine.
+        approved_paths = self._task_approved_paths(unit["war_task_id"])
+
         core_run_id = _core_run_id_for(execution_id)
         idempotency_key = _idempotency_key_for(execution_id)
         contract = _dispatch_contract(message, timeout_seconds, goal_contract)
@@ -440,6 +479,7 @@ class WarRoomOrchestrator:
                             agent_id=str(unit["agent_id"]), message=message,
                             timeout_seconds=float(timeout_seconds), core_run_id=core_run_id,
                             idempotency_key=idempotency_key, goal_contract=goal_contract,
+                            approved_paths=approved_paths or None,
                         )
                     except ValueError as exc:
                         if str(exc).startswith(("IDEMPOTENCY_CONFLICT", "DUPLICATE_DISPATCH")):
@@ -489,6 +529,7 @@ class WarRoomOrchestrator:
                 core_run_id=core_run_id,
                 idempotency_key=idempotency_key,
                 goal_contract=goal_contract,
+                approved_paths=approved_paths or None,
             )
         except ValueError as exc:
             err = str(exc)

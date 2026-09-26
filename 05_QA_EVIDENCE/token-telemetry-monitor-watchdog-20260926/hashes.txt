@@ -1,0 +1,4 @@
+c2cd45ce119c58227eb4bc19bfb93c6a07f02ea5ed386bcac0e32f6d118aec79  /home/plachem-sever/codex-workspaces/cha-secretary/plachem-ai-server-monitor/app.py
+33664a6ab07a01fdce31c84ff0e4b569eaec4d7f65413c964ef2107e7547eea7  /home/plachem-sever/codex-workspaces/cha-secretary/plachem-ai-server-monitor/static/index.html
+e5b82716282710cada1326ceb2bd11ac83df4e11625cb79f9072e7fb1739e766  /home/plachem-sever/codex-workspaces/cha-secretary/plachem-ai-server-monitor/jev_agent_watchdog_supervisor.py
+bacaa53aad211d974a765ad526e150828bde24abf0db974823896ff4c560b216  /home/plachem-sever/codex-workspaces/cha-secretary/plachem-ai-server-monitor/jev_agent_recovery_watchdog_v01.py

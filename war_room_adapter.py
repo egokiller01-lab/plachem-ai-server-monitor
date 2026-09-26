@@ -29,6 +29,9 @@ class GatewayRun:
     response_body: str | None = None
 
 
+WAR_ROOM_DIRECT_TIMEOUT_SECONDS = int(os.environ.get("PLACHEM_WAR_ROOM_DIRECT_TIMEOUT_SECONDS", "3600"))
+
+
 class FakeGatewayAdapter:
     """In-memory gateway for safe recovery/timeout integration tests."""
 
@@ -239,7 +242,7 @@ class OpenClawSessionAdapter:
             "agentId": gateway_agent_id,
             "message": body,
             "idempotencyKey": delivery_id,
-            "timeout": 300,
+            "timeout": WAR_ROOM_DIRECT_TIMEOUT_SECONDS,
         }, delivery_id)
         if error:
             return error

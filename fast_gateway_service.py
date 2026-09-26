@@ -25,6 +25,12 @@ ROOT = Path(__file__).resolve().parent
 _TERMINAL_STATUSES = {"PASS", "FAIL", "BLOCKED", "TIMEOUT", "CANCELLED"}
 
 
+def fastgateway_watchdog_recovery_enabled() -> bool:
+    return str(
+        os.environ.get("PLACHEM_FAST_GATEWAY_WATCHDOG_RECOVERY_ENABLED", "0")
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
 class ActiveRunController:
     """Process-local lease for one run's dispatch-owner connection."""
 
@@ -86,6 +92,7 @@ class PersistentExecutionHarness:
         self._lock = threading.RLock()
         self._terminal_completion_subscriber: Any | None = None
         self._recovery_layer: Any | None = None
+        self._session_watchdog: Any | None = None
         setter = getattr(core_engine, "set_terminal_transition_guard", None)
         if callable(setter):
             setter(self.is_cancel_requested)
@@ -100,6 +107,15 @@ class PersistentExecutionHarness:
         with self._lock:
             self._recovery_layer = layer
 
+    def set_session_watchdog(self, watchdog: Any | None) -> None:
+        """Enable the advisory JEV session watchdog explicitly.
+
+        Production remains disabled until a caller installs a watchdog; the
+        watchdog itself also requires the persisted watchdog-managed flag.
+        """
+        with self._lock:
+            self._session_watchdog = watchdog
+
     def _handle_recovery(self, record: dict[str, Any]) -> None:
         """Post-terminal recovery hook (v0.2).
 
@@ -111,6 +127,8 @@ class PersistentExecutionHarness:
         if status != "FAIL":
             return  # PASS / BLOCKED / TIMEOUT / CANCELLED: no recovery
         core_run_id = str(record.get("core_run_id") or "")
+        if str(record.get("escalation_reason") or "") == "WATCHDOG_REQUEUE_REQUIRED":
+            return
         # A recovery child run reaching terminal state is the end of the
         # chain; never recover a recovery child (max 1, no chaining).
         goal_state = (record.get("policy_state") or {}).get("goal") or {}
@@ -181,6 +199,7 @@ class PersistentExecutionHarness:
                                 # lifecycle observer or alter Core truth.
                                 pass
                         return
+                    self._record(record)
                     controller.stop_event.wait(0.01)
             finally:
                 with self._lock:
@@ -210,6 +229,13 @@ class PersistentExecutionHarness:
             else:
                 controller = self._controller(core_run_id)
                 self._start_observer(controller)
+                watchdog = self._session_watchdog
+                if watchdog is not None:
+                    try:
+                        watchdog.observe(core_run_id)
+                    except Exception:
+                        # Advisory observation cannot alter lifecycle truth.
+                        pass
         return record
 
     def dispatch(self, **kwargs: Any) -> dict[str, Any]:
@@ -327,16 +353,87 @@ def get_persistent_harness(*, run_path: str | Path | None = None,
         # that classify as recoverable get one bounded recovery attempt;
         # PASS and policy/auth-blocked runs are never touched.  The layer
         # reuses the engine's existing auth/policy/validator paths.
+        recovery_layer = None
         try:
             from plachem_fast_gateway.recovery_layer import RecoveryLayer
-            harness.set_recovery_layer(RecoveryLayer(
+            recovery_layer = RecoveryLayer(
                 harness.core_engine,
                 harness.core_engine.registry,
-            ))
+                dispatcher=harness.engine,
+            )
+            harness.set_recovery_layer(recovery_layer)
         except Exception:
             # Recovery wiring is additive; a failure here must not break
             # the primary dispatch path.  The service continues without
             # auto-recovery.
-            pass
+            recovery_layer = None
+
+        # Opt in exactly once per persistent harness when the existing JEV
+        # transport configuration is complete.
+        if (os.environ.get("JEV_OPENCONNECTOR_ENDPOINT")
+                and os.environ.get("JEV_OPENCONNECTOR_CONNECTION")
+                and os.environ.get("JEV_OPENCONNECTOR_TOKEN_FILE")):
+            try:
+                from jev_session_watchdog import JEVSessionRecoveryWatchdog
+
+                def watchdog_recovery(core_run_id: str, snapshot: Any) -> dict[str, Any]:
+                    if not fastgateway_watchdog_recovery_enabled():
+                        return {
+                            "status": "REJECTED",
+                            "reason": "WATCHDOG_RECOVERY_OBSERVE_ONLY",
+                        }
+                    if recovery_layer is None:
+                        return {"status": "REJECTED", "reason": "RECOVERY_LAYER_UNAVAILABLE"}
+                    current = harness.core_engine.registry.get(core_run_id)
+                    if current is None:
+                        return {"status": "REJECTED", "reason": "UNKNOWN_CORE_RUN"}
+
+                    auto_agents = {
+                        value.strip().casefold()
+                        for value in os.environ.get(
+                            "PLACHEM_FAST_GATEWAY_WATCHDOG_AUTO_RECOVERY_AGENTS", ""
+                        ).split(",")
+                        if value.strip()
+                    }
+                    agent_id = str(current.get("agent_id") or "").casefold()
+
+                    # Production default: do not duplicate a protected side
+                    # effect automatically. Mark the run for Main/Process Board
+                    # stop + controlled-lane re-approval instead.
+                    if (
+                        not core_run_id.startswith("direct-")
+                        or agent_id not in auto_agents
+                    ):
+                        return recovery_layer.mark_watchdog_requeue(
+                            core_run_id,
+                            prior_evidence=snapshot,
+                        )
+
+                    # Explicitly allowlisted safe Direct agents may be
+                    # cancelled and restarted through a fresh Auth Broker grant.
+                    if str(current.get("status") or "") not in _TERMINAL_STATUSES:
+                        cancelled = harness.cancel(core_run_id)
+                    else:
+                        cancelled = current
+                    if str(cancelled.get("status") or "") != "CANCELLED":
+                        return {
+                            "status": "REJECTED",
+                            "reason": "SOURCE_CANCEL_UNCONFIRMED",
+                            "source_status": cancelled.get("status"),
+                        }
+                    return recovery_layer.recover_watchdog_cancelled(
+                        core_run_id,
+                        prior_evidence=snapshot,
+                    )
+
+                harness.set_session_watchdog(JEVSessionRecoveryWatchdog(
+                    harness.core_engine.registry,
+                    history_path=run_file.parent / "jev-watchdog-history.jsonl",
+                    recovery=watchdog_recovery,
+                ))
+            except Exception:
+                # Missing/invalid optional wiring must leave auto recovery
+                # disabled; no alternate auth or secret path is invented.
+                pass
         _HARNESSES[key] = harness
         return harness

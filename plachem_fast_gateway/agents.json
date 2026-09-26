@@ -16,8 +16,8 @@
   "secretary": {
     "enabled": true,
     "capabilities": ["secretary"],
-    "runtime_model_id": "vllm/qwen38_27b_opus_q8_mtp_2x160k",
-    "allowed_model_ids": ["vllm/qwen38_27b_opus_q8_mtp_2x160k"],
+    "runtime_model_id": "qwenflash/qwen38-flash-next-q5kxl",
+    "allowed_model_ids": ["qwenflash/qwen38-flash-next-q5kxl"],
     "allowed_policy_profiles": ["LOCAL_STANDARD"]
   },
   "erpmanager": {

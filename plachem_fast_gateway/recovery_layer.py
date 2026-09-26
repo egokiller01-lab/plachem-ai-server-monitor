@@ -52,6 +52,8 @@ MAX_RECOVERY_DISPATCH_ATTEMPTS = 3
 
 RECOVERY_EVENT_CODE = "RECOVERY_ATTEMPTED"
 RECOVERY_EXECUTION_EVENT_CODE = "RECOVERY_EXECUTION_STARTED"
+WATCHDOG_RECOVERY_EVENT_CODE = "WATCHDOG_RECOVERY_DISPATCHED"
+WATCHDOG_REQUEUE_EVENT_CODE = "WATCHDOG_REQUEUE_REQUIRED"
 
 RESULT_RECOVERABLE = "RESULT_RECOVERABLE"
 SESSION_RECOVERABLE = "SESSION_RECOVERABLE"
@@ -139,6 +141,9 @@ class RecoveryDispatcher(Protocol):
         self, *, agent_id: str, message: str, timeout_seconds: float,
         core_run_id: str | None = None, idempotency_key: str | None = None,
         goal_contract: Mapping[str, Any] | None = None,
+        watchdog_managed: bool = False,
+        task_runtime_class: str = "STANDARD",
+        approved_paths: list[str] | None = None,
     ) -> dict[str, Any]: ...
 
 
@@ -169,6 +174,16 @@ def evaluate_recovery(
 
     status = str(record.get("status") or "")
     reason = str(record.get("reason") or "")
+    # Watchdog-managed FastGateway runs belong to the controlled recovery lane.
+    # A later terminal FAIL must not fall through into the legacy automatic
+    # RecoveryLayer; Main / Process Board decides whether to requeue them.
+    if bool(record.get("watchdog_managed")):
+        return RecoveryVerdict(
+            fail_class=classify_fail(reason),
+            eligible=False,
+            reason="WATCHDOG_MANAGED_REQUIRES_CONTROLLED_REQUEUE",
+            detail=reason,
+        )
     if status != CoreRunStatus.FAIL.value:
         return RecoveryVerdict(
             fail_class=classify_fail(reason),
@@ -260,6 +275,27 @@ def build_recovery_message(
         + 'scope: {"compliant": true, "violations": []}.'
     )
     return message
+
+
+def build_watchdog_recovery_message(
+    source: Mapping[str, Any],
+    *,
+    prior_evidence: Mapping[str, Any] | None = None,
+) -> str:
+    """Build a bounded child package after an explicit JEV watchdog SALVAGE."""
+
+    message = build_recovery_message(
+        source,
+        fail_class=SESSION_RECOVERABLE,
+        verdict_detail="JEV_WATCHDOG_SALVAGE",
+        prior_evidence=prior_evidence,
+    )
+    return message.replace(
+        "This is one recovery attempt after a terminal FAIL. ",
+        "This is one recovery attempt after JEV Watchdog stopped a non-progressing session. "
+        "Do not repeat approaches recorded as failed or non-progressing. ",
+        1,
+    )
 
 
 def recovery_goal_contract(source: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -512,6 +548,187 @@ class RecoveryLayer:
         result = dict(attempt)
         result["final_state"] = final_state
         return result
+
+    def mark_watchdog_requeue(
+        self,
+        core_run_id: str,
+        *,
+        prior_evidence: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Mark any managed FastGateway run for controlled stop/re-approval."""
+
+        source = self.registry.get(core_run_id)
+        if source is None:
+            raise ValueError(f"UNKNOWN_CORE_RUN:{core_run_id}")
+        if not source.get("watchdog_managed"):
+            return {"status": "REJECTED", "reason": "WATCHDOG_NOT_MANAGED", "source_run_id": core_run_id}
+        package = {
+            "source_run_id": core_run_id,
+            "source_status": source.get("status"),
+            "agent_id": source.get("agent_id"),
+            "goal_contract": source.get("goal_contract"),
+            "verified_progress": source.get("verified_progress"),
+            "watchdog_snapshot": dict(prior_evidence or {}),
+            "required_action": "STOP_AND_REQUEUE_THROUGH_CONTROLLED_LANE",
+        }
+        self.registry.update_goal_state(
+            core_run_id,
+            event_code=WATCHDOG_REQUEUE_EVENT_CODE,
+            event_details={"source_run_id": core_run_id},
+            escalation_reason=WATCHDOG_REQUEUE_EVENT_CODE,
+            escalation_package=package,
+        )
+        return {
+            "status": "REQUEUE_REQUIRED",
+            "reason": WATCHDOG_REQUEUE_EVENT_CODE,
+            "source_run_id": core_run_id,
+        }
+
+    def recover_watchdog_cancelled(
+        self,
+        core_run_id: str,
+        *,
+        prior_evidence: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Recover a watchdog-cancelled run without bypassing FastGateway auth.
+
+        Direct runs get one fresh child through the same Core/Auth/validator path.
+        War Room / Process Board runs are marked for controlled-lane requeue
+        because their approval is bound to the original delivery/execution id.
+        """
+
+        source = self.registry.get(core_run_id)
+        if source is None:
+            raise ValueError(f"UNKNOWN_CORE_RUN:{core_run_id}")
+        if not source.get("watchdog_managed"):
+            return {"status": "REJECTED", "reason": "WATCHDOG_NOT_MANAGED", "source_run_id": core_run_id}
+
+        source_goal_state = (source.get("policy_state") or {}).get("goal") or {}
+        if source_goal_state.get("watchdog_recovery_source_run_id"):
+            return {
+                "status": "REJECTED",
+                "reason": "MAX_WATCHDOG_RECOVERY_GENERATION",
+                "source_run_id": core_run_id,
+            }
+
+        if not core_run_id.startswith("direct-"):
+            package = {
+                "source_run_id": core_run_id,
+                "source_status": source.get("status"),
+                "agent_id": source.get("agent_id"),
+                "goal_contract": source.get("goal_contract"),
+                "verified_progress": source.get("verified_progress"),
+                "watchdog_snapshot": dict(prior_evidence or {}),
+                "required_action": "REQUEUE_THROUGH_CONTROLLED_LANE",
+            }
+            self.registry.update_goal_state(
+                core_run_id,
+                event_code=WATCHDOG_REQUEUE_EVENT_CODE,
+                event_details={"source_run_id": core_run_id},
+                escalation_reason=WATCHDOG_REQUEUE_EVENT_CODE,
+                escalation_package=package,
+            )
+            return {
+                "status": "REQUEUE_REQUIRED",
+                "reason": WATCHDOG_REQUEUE_EVENT_CODE,
+                "source_run_id": core_run_id,
+            }
+
+        if str(source.get("status") or "") != CoreRunStatus.CANCELLED.value:
+            return {
+                "status": "REJECTED",
+                "reason": "SOURCE_NOT_CANCELLED",
+                "source_run_id": core_run_id,
+                "source_status": source.get("status"),
+            }
+
+        existing = 0
+        for record in self.registry.recent(200):
+            goal_state = (record.get("policy_state") or {}).get("goal") or {}
+            if goal_state.get("watchdog_recovery_source_run_id") == core_run_id:
+                existing += 1
+        if existing >= 1:
+            return {
+                "status": "REJECTED",
+                "reason": "MAX_WATCHDOG_RECOVERY_ATTEMPTS",
+                "source_run_id": core_run_id,
+            }
+
+        child_id = f"direct-{uuid.uuid4().hex}"
+        idempotency_key = f"direct:watchdog:{uuid.uuid4().hex}"
+        goal_contract = recovery_goal_contract(source)
+        message = build_watchdog_recovery_message(
+            source,
+            prior_evidence=prior_evidence,
+        )
+
+        if self.engine.auth_broker is not None and self.engine.grant_authorizer is not None:
+            if not self.engine.grant_authorizer.owns_run(child_id):
+                return {
+                    "status": "POLICY_BLOCKED",
+                    "reason": "AUTH_GRANT_UNAVAILABLE",
+                    "source_run_id": core_run_id,
+                }
+            normalized = normalize_goal_contract(goal_contract)
+            scope = execution_auth_scope(
+                agent_id=source["agent_id"],
+                message=message,
+                core_run_id=child_id,
+                idempotency_key=idempotency_key,
+                goal_contract=normalized.as_dict(),
+            )
+            try:
+                self._register_auth_grant(self.engine.grant_authorizer, child_id, scope)
+            except Exception as exc:
+                return {
+                    "status": "POLICY_BLOCKED",
+                    "reason": "AUTH_GRANT_REGISTRATION_FAILED",
+                    "detail": type(exc).__name__,
+                    "source_run_id": core_run_id,
+                }
+
+        try:
+            dispatched = self._dispatcher.dispatch(
+                agent_id=source["agent_id"],
+                message=message,
+                timeout_seconds=10.0,
+                core_run_id=child_id,
+                idempotency_key=idempotency_key,
+                goal_contract=goal_contract,
+                watchdog_managed=True,
+                task_runtime_class=str(source.get("task_class") or "STANDARD"),
+                approved_paths=list(source.get("approved_paths") or []),
+            )
+        except ValueError as exc:
+            return {
+                "status": "POLICY_BLOCKED",
+                "reason": str(exc).split(":", 1)[0],
+                "source_run_id": core_run_id,
+            }
+
+        child = self.registry.update_goal_state(
+            child_id,
+            goal_state={
+                "watchdog_recovery_source_run_id": core_run_id,
+                "watchdog_recovery_attempt": 1,
+            },
+            event_code=WATCHDOG_RECOVERY_EVENT_CODE,
+            event_details={
+                "source_run_id": core_run_id,
+                "source_status": source.get("status"),
+                "auth_rechecked": True,
+                "approved_paths_preserved": list(source.get("approved_paths") or []),
+            },
+        )
+        return {
+            "status": "DISPATCHED",
+            "source_run_id": core_run_id,
+            "recovery_run_id": child_id,
+            "recovery_status": dispatched.get("status"),
+            "auth_rechecked": True,
+            "goal_contract_preserved": child.get("goal_contract") == source.get("goal_contract"),
+            "approved_paths_preserved": child.get("approved_paths") == source.get("approved_paths"),
+        }
 
     @staticmethod
     def _register_auth_grant(grant_authorizer: Any, child_id: str, scope: Any) -> None:

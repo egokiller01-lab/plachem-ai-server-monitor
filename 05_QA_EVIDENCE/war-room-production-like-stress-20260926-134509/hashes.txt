@@ -1,0 +1,6 @@
+80f48038edf33fd675a6482467a675b9d316cc00a0829d0a0c255de479ea7016  /home/plachem-sever/codex-workspaces/cha-secretary/plachem-ai-server-monitor/05_QA_EVIDENCE/war-room-production-like-stress-20260926-134509/06_IMPLEMENTATION_REPORT.md
+1a799c67f1e5301f79361285cdac9c03afa63e885de5d4d41c7529f879a903b0  /home/plachem-sever/codex-workspaces/cha-secretary/plachem-ai-server-monitor/05_QA_EVIDENCE/war-room-production-like-stress-20260926-134509/08_DATA_IMMUTABILITY.md
+9076aa4077d36b04d3dae37e1b349d7fac69084d38026b6699db40b9fb9713a5  /home/plachem-sever/codex-workspaces/cha-secretary/plachem-ai-server-monitor/05_QA_EVIDENCE/war-room-production-like-stress-20260926-134509/09_SECURITY_REVIEW.md
+3bcec48bc03807b128821897c81ce46df9ed4dba4512ef1c158008c63eedf742  /home/plachem-sever/codex-workspaces/cha-secretary/plachem-ai-server-monitor/05_QA_EVIDENCE/war-room-production-like-stress-20260926-134509/10_UI_OPS_REVIEW.md
+5af288743a57347b7d1d0bdd39e44c3c05dcb6161114b375b1e4ea8ebf776986  /home/plachem-sever/codex-workspaces/cha-secretary/plachem-ai-server-monitor/05_QA_EVIDENCE/war-room-production-like-stress-20260926-134509/RESULT.md
+9dc77fe894af02863cdc8890f0c59849f94bb35363b640940b738f76759c450b  /home/plachem-sever/codex-workspaces/cha-secretary/plachem-ai-server-monitor/05_QA_EVIDENCE/war-room-production-like-stress-20260926-134509/process-board.json

@@ -7,6 +7,7 @@ import os
 import platform
 import re
 import shutil
+import sqlite3
 import subprocess
 import threading
 import time
@@ -24,6 +25,11 @@ from fastapi.staticfiles import StaticFiles
 import war_room
 from war_room import router as war_room_router
 from war_room_actions import router as war_room_actions_router
+from jev_task_router import router as jev_task_router, provision_schema as provision_jev_schema
+from jev_result_verifier import router as jev_result_verifier_router, provision_schema as provision_result_verifier_schema
+from jev_recovery_shadow import router as jev_recovery_shadow_router
+from jev_recovery_live import LIVE_HISTORY as JEV_LIVE_HISTORY
+from jev_recovery_live import router as jev_recovery_live_router
 from fast_gateway_api import router as fast_gateway_router
 
 
@@ -35,6 +41,10 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 app.mount("/vocal-coach", StaticFiles(directory=STATIC_DIR / "vocal-coach", html=True), name="vocal-coach")
 app.include_router(war_room_router)
 app.include_router(war_room_actions_router)
+app.include_router(jev_task_router)
+app.include_router(jev_result_verifier_router)
+app.include_router(jev_recovery_shadow_router)
+app.include_router(jev_recovery_live_router)
 app.include_router(fast_gateway_router)
 
 
@@ -42,6 +52,8 @@ app.include_router(fast_gateway_router)
 def provision_war_room_on_startup() -> None:
     """Idempotently provision the local War Room store before serving UI/API."""
     war_room.provision_database()
+    provision_jev_schema()
+    provision_result_verifier_schema()
     if os.environ.get("PLACHEM_WAR_ROOM_REAL_ADAPTER") == "1" and os.environ.get("PLACHEM_WAR_ROOM_TEST_ADAPTER") != "1":
         from war_room_runtime import get_runtime
         get_runtime().start(db_path=war_room._db_path())
@@ -153,6 +165,94 @@ _runtime_status_cache: dict[str, Any] = {}
 _runtime_status_cache_at = 0.0
 _runtime_status_cache_lock = threading.Lock()
 _RUNTIME_STATUS_CACHE_TTL_SECONDS = 10.0
+
+TOKEN_TELEMETRY_DB_PATH = Path(
+    os.environ.get(
+        "PLACHEM_CONTEXT_INDEX_DB",
+        "/home/plachem-sever/.openclaw/workspace/local_agents/context_index_v3/03_WORK/data/context_index_v3.sqlite",
+    )
+)
+TOKEN_TELEMETRY_MAX_AGE_SECONDS = int(os.environ.get("PLACHEM_TOKEN_TELEMETRY_MAX_AGE_SECONDS", "900"))
+
+
+def read_token_telemetry(agent_id: str, session_id: str | None = None) -> dict[str, Any]:
+    """Read latest deterministic token telemetry without influencing Agent state."""
+    result: dict[str, Any] = {
+        "available": False,
+        "status": "UNAVAILABLE",
+        "source": None,
+        "sampled_at": None,
+        "sample_age_seconds": None,
+        "session_id": session_id,
+    }
+    if not TOKEN_TELEMETRY_DB_PATH.is_file():
+        result["error"] = "telemetry_db_missing"
+        return result
+    try:
+        con = sqlite3.connect(f"file:{TOKEN_TELEMETRY_DB_PATH}?mode=ro", uri=True, timeout=2)
+        con.row_factory = sqlite3.Row
+        try:
+            session = None
+            if session_id:
+                session = con.execute(
+                    """SELECT * FROM token_telemetry_samples
+                       WHERE lower(agent)=lower(?) AND session_id=?
+                       ORDER BY sampled_at_epoch DESC,sample_id DESC LIMIT 1""",
+                    (agent_id, session_id),
+                ).fetchone()
+            agent = con.execute(
+                """SELECT * FROM token_telemetry_agent_samples
+                   WHERE lower(agent)=lower(?)
+                   ORDER BY sampled_at_epoch DESC,sample_id DESC LIMIT 1""",
+                (agent_id,),
+            ).fetchone()
+        finally:
+            con.close()
+    except (sqlite3.Error, OSError) as exc:
+        result["error"] = type(exc).__name__
+        return result
+
+    row = session or agent
+    if row is None:
+        result["error"] = "telemetry_sample_missing"
+        return result
+
+    sampled_epoch = int(row["sampled_at_epoch"] or 0)
+    age = max(0, int(time.time()) - sampled_epoch) if sampled_epoch else None
+    fresh = age is None or age <= TOKEN_TELEMETRY_MAX_AGE_SECONDS
+    result.update({
+        "available": fresh,
+        "status": str(row["classification"] or "NORMAL") if fresh else "UNAVAILABLE",
+        "source": "session" if session is not None else "agent",
+        "sampled_at": row["sampled_at"],
+        "sample_age_seconds": age,
+    })
+    if session is not None:
+        pressure = row["context_pressure"]
+        result.update({
+            "session_id": row["session_id"],
+            "model": row["model_key"],
+            "current_prompt_tokens": int(row["current_prompt_tokens"] or 0),
+            "max_prompt_tokens": int(row["max_prompt_tokens"] or 0),
+            "prompt_source": row["prompt_source"] if "prompt_source" in row.keys() else None,
+            "prompt_reliable": bool(row["prompt_reliable"]) if "prompt_reliable" in row.keys() else False,
+            "context_limit": int(row["context_limit"]) if row["context_limit"] is not None else None,
+            "context_pressure": round(float(pressure), 4) if pressure is not None else None,
+            "delta_processed": int(row["delta_processed"] or 0),
+            "velocity_tokens_per_hour": round(float(row["velocity_tokens_per_hour"] or 0), 1),
+            "calls_per_hour": round(float(row["calls_per_hour"] or 0), 1),
+            "cache_ratio": round(float(row["delta_cache_ratio"]), 4) if row["delta_cache_ratio"] is not None else None,
+            "reasons": json.loads(row["reasons_json"] or "[]"),
+        })
+    if agent is not None:
+        result.update({
+            "processed_24h": int(agent["processed_24h"] or 0),
+            "calls_24h": int(agent["calls_24h"] or 0),
+            "fresh_input_24h": int(agent["fresh_input_24h"] or 0),
+            "cache_read_24h": int(agent["cache_read_24h"] or 0),
+            "output_24h": int(agent["output_24h"] or 0),
+        })
+    return result
 
 
 def pct(value: float | int | None) -> float | None:
@@ -306,11 +406,123 @@ def read_openclaw_runtime_status() -> dict[str, Any]:
         return _runtime_status_cache
 
 
+# ---------------------------------------------------------------------------
+# Agents table "State" column source of truth
+#
+# Read-only overlay: OpenClaw real session state first, then the latest JEV
+# verdict recorded for *that* session_id.  No idle-time guessing, no WARMUP
+# label, no STALL synthesis, and no reuse of another session's JEV verdict.
+# Authoritative JEV source is the same file the JEV Live status endpoint reads
+# (jev_recovery_live.LIVE_HISTORY).  JEV judgement logic is never modified here.
+# ---------------------------------------------------------------------------
+_JEV_DECISIONS = {"CONTINUE", "WATCH", "SALVAGE", "DEAD"}
+_OPENCLAW_TERMINAL_STATE = {
+    "done": "DONE",
+    "timeout": "TIMEOUT",
+    "failed": "FAILED",
+    "killed": "FAILED",
+    "cancelled": "FAILED",
+    "canceled": "FAILED",
+}
+_JEV_WARMUP_MS = 5 * 60 * 1000
+_JEV_DECISION_CACHE_TTL_SECONDS = 10.0
+_jev_decision_cache: dict[str, dict[str, Any]] = {}
+_jev_decision_cache_at = 0.0
+_jev_decision_cache_lock = threading.Lock()
+
+
+def read_jev_decisions() -> dict[str, dict[str, Any]]:
+    """Latest JEV decision per session_id from the live JEV history (read-only)."""
+    global _jev_decision_cache, _jev_decision_cache_at
+    now = time.monotonic()
+    with _jev_decision_cache_lock:
+        if _jev_decision_cache and now - _jev_decision_cache_at < _JEV_DECISION_CACHE_TTL_SECONDS:
+            return _jev_decision_cache
+        try:
+            lines = JEV_LIVE_HISTORY.read_text(encoding="utf-8").splitlines()[-400:]
+        except OSError:
+            return _jev_decision_cache
+        decisions: dict[str, dict[str, Any]] = {}
+        for raw in lines:
+            try:
+                row = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(row, dict) or str(row.get("type") or "") != "live_jev_decision":
+                continue
+            session_id = str(row.get("session_id") or "")
+            choice = str(row.get("choice") or "")
+            if not session_id or choice not in _JEV_DECISIONS:
+                continue
+            decisions[session_id] = {
+                "decision": choice,
+                "confidence": row.get("confidence"),
+                "observed_at": row.get("observed_at"),
+                "kind": str(row.get("kind") or ""),
+            }
+        if decisions:
+            _jev_decision_cache = decisions
+            _jev_decision_cache_at = now
+        return decisions
+
+
+def compute_agent_display_state(agent_sessions: list[dict[str, Any]], jev_decisions: dict[str, dict[str, Any]], now_ms: int) -> dict[str, Any]:
+    """State = OpenClaw terminal truth, else active-session JEV verdict, else IDLE."""
+    detail: dict[str, Any] = {
+        "display_state": "IDLE",
+        "session_id": None,
+        "session_age_seconds": None,
+        "jev_decision": None,
+        "jev_confidence": None,
+        "jev_observed_at": None,
+        "basis": "no_active_session",
+    }
+    usable = [item for item in agent_sessions if isinstance(item, dict)]
+    if not usable:
+        return detail
+    running = [item for item in usable if str(item.get("status") or "") == "running"]
+    if running:
+        current = max(running, key=lambda item: int(item.get("updated_at") or 0))
+        session_id = str(current.get("session_id") or "") or None
+        started = int(current.get("session_started_at") or current.get("updated_at") or 0)
+        age_ms = max(0, now_ms - started) if started else None
+        detail["session_id"] = session_id
+        detail["session_age_seconds"] = round(age_ms / 1000.0, 1) if age_ms is not None else None
+        raw_verdict = jev_decisions.get(session_id) if session_id else None
+        verdict = raw_verdict if isinstance(raw_verdict, dict) and str(raw_verdict.get("decision") or "") in _JEV_DECISIONS else None
+        if age_ms is not None and age_ms <= _JEV_WARMUP_MS:
+            detail["display_state"] = "WORKING"
+            detail["basis"] = "active_session_within_5m"
+            return detail
+        if verdict:
+            detail["display_state"] = verdict["decision"]
+            detail["jev_decision"] = verdict["decision"]
+            detail["jev_confidence"] = verdict.get("confidence")
+            detail["jev_observed_at"] = verdict.get("observed_at")
+            detail["basis"] = "jev_current_session"
+            return detail
+        detail["display_state"] = "WORKING"
+        detail["basis"] = "jev_pending_for_current_session"
+        return detail
+    latest = max(usable, key=lambda item: int(item.get("updated_at") or 0))
+    terminal = _OPENCLAW_TERMINAL_STATE.get(str(latest.get("status") or "").lower())
+    session_id = str(latest.get("session_id") or "") or None
+    started = int(latest.get("session_started_at") or latest.get("updated_at") or 0)
+    detail["session_id"] = session_id
+    detail["session_age_seconds"] = round(max(0, now_ms - started) / 1000.0, 1) if started else None
+    if terminal:
+        detail["display_state"] = terminal
+        detail["basis"] = "openclaw_terminal_" + str(latest.get("status") or "").lower()
+    return detail
+
+
 def read_agent_sessions(runtime_status: dict[str, Any], agent_id: str) -> dict[str, Any]:
     all_sessions = runtime_status.get("sessions")
     source = "openclaw sessions --all-agents --limit all --json"
     if not isinstance(all_sessions, list):
-        return {"state": "unknown", "last_active": None, "session_count": None, "total_tokens": None, "context_tokens": None, "recent_sessions": [], "source": source, "error": "session_status_unavailable"}
+        return {"state": "unknown", "last_active": None, "session_count": None, "total_tokens": None, "context_tokens": None, "recent_sessions": [], "source": source, "error": "session_status_unavailable",
+                "display_state": "IDLE", "session_id": None, "session_age_seconds": None, "jev_decision": None, "jev_confidence": None, "jev_observed_at": None, "basis": "session_status_unavailable",
+                "token_telemetry": read_token_telemetry(agent_id, None)}
     sessions = [
         item
         for item in all_sessions
@@ -328,7 +540,7 @@ def read_agent_sessions(runtime_status: dict[str, Any], agent_id: str) -> dict[s
         last_active = max(last_active or 0, updated) or None
         total_tokens += int(item.get("totalTokens") or 0)
         context_tokens += int(item.get("contextTokens") or 0)
-        rows.append({"key": key, "type": parse_session_type(key), "updated_at": updated, "total_tokens": int(item.get("totalTokens") or 0), "context_tokens": int(item.get("contextTokens") or 0), "system_sent": bool(item.get("systemSent", False))})
+        rows.append({"key": key, "type": parse_session_type(key), "updated_at": updated, "total_tokens": int(item.get("totalTokens") or 0), "context_tokens": int(item.get("contextTokens") or 0), "system_sent": bool(item.get("systemSent", False)), "status": item.get("status"), "session_id": str(item.get("sessionId") or "") or None, "session_started_at": int(item.get("sessionStartedAt") or 0) or None})
     now_ms = int(time.time() * 1000)
     state = "offline"
     if last_active:
@@ -338,7 +550,9 @@ def read_agent_sessions(runtime_status: dict[str, Any], agent_id: str) -> dict[s
         elif diff < 86400000:
             state = "idle"
     rows.sort(key=lambda row: row["updated_at"], reverse=True)
-    return {"state": state, "last_active": last_active, "session_count": len(rows), "total_tokens": total_tokens, "context_tokens": context_tokens, "recent_sessions": redact_sensitive(rows[:8]), "source": source}
+    display = compute_agent_display_state(rows, read_jev_decisions(), now_ms)
+    token_telemetry = read_token_telemetry(agent_id, display.get("session_id"))
+    return {"state": state, "last_active": last_active, "session_count": len(rows), "total_tokens": total_tokens, "context_tokens": context_tokens, "recent_sessions": redact_sensitive(rows[:8]), "source": source, "token_telemetry": token_telemetry, **display}
 
 
 def collect_openclaw_agents(config: dict[str, Any], home: Path, runtime_status: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -2414,6 +2628,50 @@ def _wd_evidence_reason(kind: str, ev: dict) -> str:
         pass
     return "UNAVAILABLE"
 
+# Authoritative state overlay for the front-page Agent Watchdog card.
+# The card must show the same State as OpenClaw Control -> Agents
+# (compute_agent_display_state).  Detector rows only remain auxiliary
+# evidence when they verifiably belong to the agent's CURRENT active session.
+_JEV_ABNORMAL_STATES = {"SALVAGE", "DEAD"}
+
+
+def _authoritative_agent_states() -> tuple[dict[str, dict[str, Any]], str | None]:
+    """Per-agent display_state from OpenClaw real sessions + current-session JEV."""
+    try:
+        home = openclaw_home()
+        config = read_json_file(home / "openclaw.json")
+        if not isinstance(config, dict):
+            return {}, "authoritative_state_unavailable"
+        states: dict[str, dict[str, Any]] = {}
+        for row in collect_openclaw_agents(config, home):
+            session = row.get("session") or {}
+            states[str(row.get("id"))] = {
+                "display_state": str(session.get("display_state") or "IDLE"),
+                "session_id": session.get("session_id"),
+                "basis": session.get("basis"),
+                "jev_decision": session.get("jev_decision"),
+                "jev_confidence": session.get("jev_confidence"),
+                "jev_observed_at": session.get("jev_observed_at"),
+                "session_age_seconds": session.get("session_age_seconds"),
+                "token_telemetry": session.get("token_telemetry") or {},
+            }
+        return states, None
+    except Exception:
+        return {}, "authoritative_state_unavailable"
+
+
+def _detection_is_current(r: _sqlite3.Row, states: dict[str, dict[str, Any]]) -> bool:
+    """True only when the detection verifiably belongs to the agent's current session."""
+    if r["core_run_id"]:
+        return False  # FastGateway run records never define agent State
+    agent_state = states.get(str(r["agent_id"] or ""))
+    if not agent_state:
+        return False
+    current_sid = agent_state.get("session_id")
+    detection_sid = str(r["session_id"] or "")
+    return bool(current_sid) and bool(detection_sid) and detection_sid == current_sid
+
+
 def _collect_agent_watchdog() -> dict[str, Any]:
     now = _wd_now_ms()
     agents: dict[str, dict[str, Any]] = {}
@@ -2434,7 +2692,7 @@ def _collect_agent_watchdog() -> dict[str, Any]:
             rows = con.execute(
                 """SELECT agent_id, kind, severity, status, label,
                           ts_detected_ms, first_seen_ms, last_seen_ms,
-                          evidence_json
+                          evidence_json, session_id, core_run_id
                    FROM detections
                    WHERE status IN ('NEW','CONFIRMED')
                    ORDER BY ts_detected_ms DESC"""
@@ -2455,11 +2713,41 @@ def _collect_agent_watchdog() -> dict[str, Any]:
     if scan_ts is None:
         unavailable_reason = "no scan data found"
 
+    states, state_error = _authoritative_agent_states()
+    for agent_id, st in states.items():
+        agents[agent_id] = {
+            "status": st["display_state"],
+            "display_state": st["display_state"],
+            "session_id": st.get("session_id"),
+            "basis": st.get("basis"),
+            "jev_decision": st.get("jev_decision"),
+            "jev_confidence": st.get("jev_confidence"),
+            "jev_observed_at": st.get("jev_observed_at"),
+            "session_age_seconds": st.get("session_age_seconds"),
+            "buckets": {},
+            "warnings": [],
+            "ignored_detection_count": 0,
+            "token_telemetry": st.get("token_telemetry") or {},
+            "token_status": (st.get("token_telemetry") or {}).get("status", "UNAVAILABLE"),
+        }
+    legacy_agents: dict[str, dict[str, Any]] = {}
     for r in rows:
         agent = r["agent_id"] or "UNAVAILABLE"
         kind = r["kind"] or "UNAVAILABLE"
         bucket = _KIND_BUCKET.get(kind, "OTHER")
-        info = agents.setdefault(agent, {"status": "NORMAL", "buckets": {}, "warnings": []})
+        legacy = legacy_agents.setdefault(agent, {"status": "ABNORMAL", "buckets": {}, "warnings": []})
+        lb = legacy["buckets"].setdefault(bucket, {"count": 0, "worst": "WARN", "latest_ts": None})
+        lb["count"] += 1
+        if (r["severity"] or "WARN") == "FAIL":
+            lb["worst"] = "FAIL"
+        if not _detection_is_current(r, states):
+            # Past/other-session/FastGateway detection: kept in the detector DB
+            # untouched but excluded from current State, summary and ALERT.
+            info = agents.get(agent)
+            if info is not None:
+                info["ignored_detection_count"] = int(info.get("ignored_detection_count") or 0) + 1
+            continue
+        info = agents.setdefault(agent, {"status": "IDLE", "display_state": "IDLE", "buckets": {}, "warnings": [], "ignored_detection_count": 0})
         sev = r["severity"] or "WARN"
         try:
             ev = json.loads(r["evidence_json"]) if r["evidence_json"] else {}
@@ -2483,13 +2771,29 @@ def _collect_agent_watchdog() -> dict[str, Any]:
                 "ts_text": _fmt_ts(ts) or "UNAVAILABLE",
                 "reason": r["label"] or _wd_evidence_reason(kind, ev) or "UNAVAILABLE",
             })
-        if info["status"] == "NORMAL":
-            info["status"] = "ABNORMAL"
-
     # cap warnings per agent, newest first
     for agent, info in agents.items():
         info["warnings"].sort(key=lambda w: w["ts"] or 0, reverse=True)
         info["warnings"] = info["warnings"][:5]
+
+    # Agents the authoritative source cannot see keep an UNAVAILABLE card; they
+    # are never promoted to ABNORMAL by stale detector rows.
+    for agent_id, legacy in legacy_agents.items():
+        if agent_id in states:
+            continue
+        info = agents.setdefault(agent_id, {"buckets": {}, "warnings": [], "ignored_detection_count": 0})
+        info["status"] = "UNAVAILABLE"
+        info["display_state"] = "UNAVAILABLE"
+        info["buckets"] = legacy["buckets"]
+        info["ignored_detection_count"] = sum(b["count"] for b in legacy["buckets"].values())
+
+    abnormal = [a for a in agents.values() if str(a.get("display_state") or "") in _JEV_ABNORMAL_STATES]
+    token_abnormal_agents = sorted(
+        str(agent_id) for agent_id, info in agents.items()
+        if str((info.get("token_telemetry") or {}).get("status") or "") == "ABNORMAL"
+    )
+    if state_error and not states:
+        unavailable_reason = unavailable_reason or state_error
 
     return {
         "available": unavailable_reason is None,
@@ -2498,7 +2802,12 @@ def _collect_agent_watchdog() -> dict[str, Any]:
         "scan_ts_text": _fmt_ts(scan_ts) or "UNAVAILABLE",
         "stale": unavailable_reason is not None,
         "agent_count": len(agents),
-        "abnormal_count": sum(1 for a in agents.values() if a["status"] != "NORMAL"),
+        "abnormal_count": len(abnormal),
+        "abnormal_agents": sorted(str(k) for k, v in agents.items() if str(v.get("display_state") or "") in _JEV_ABNORMAL_STATES),
+        "state_source": "openclaw_sessions+jev",
+        "legacy_detector_abnormal_count": len(legacy_agents),
+        "token_abnormal_count": len(token_abnormal_agents),
+        "token_abnormal_agents": token_abnormal_agents,
         "agents": agents,
     }
 

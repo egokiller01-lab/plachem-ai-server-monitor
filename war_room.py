@@ -52,8 +52,10 @@ SENSITIVE_VALUE_PATTERN = re.compile(
 # bearer-like, opaque credential-looking values.
 OPAQUE_SECRET_PATTERN = re.compile(
     r"(?ix)(?:"
+    # Generic credential words require an assignment separator. Hyphenated
+    # domain terms such as token-telemetry/token-usage are ordinary data.
     r"\b(?:token|secret|credential|password|api[_-]?key|oauth|cookie)\b"
-    r"\s*[-_=:/]\s*[A-Za-z0-9._~+/=-]{8,}"
+    r"\s*[:=]\s*[A-Za-z0-9._~+/=-]{8,}"
     r"|\b(?:sk|ghp|xox[baprs])[-_][A-Za-z0-9._-]{8,}\b"
     r")"
 )
@@ -186,7 +188,7 @@ def provision_database(path: str | Path | None = None) -> Path:
                 """,
                 (row_id, PROJECT_ID, agent_id, role, can_comment, can_approve, can_execute),
             )
-        for principal in representative_principals():
+        for principal in representative_principals() | set(_human_login_principal_map().values()):
             if canonical_agent_id(principal) is not None:
                 # An Agent representative is supported only by the explicit
                 # isolated-test compatibility switch and already has a row.
@@ -271,6 +273,37 @@ def _sanitize_stored_string(value: str) -> str:
     return value
 
 
+def path_within_approved_roots(path_value: str, roots: list[str]) -> bool:
+    """Resolve real filesystem identity and reject traversal/symlink escape."""
+    if not isinstance(path_value, str) or not path_value.startswith("/"):
+        return False
+    candidate = Path(path_value).expanduser()
+    if ".." in candidate.parts:
+        return False
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError:
+        return False
+    for raw_root in roots:
+        if not isinstance(raw_root, str) or not raw_root.startswith("/"):
+            continue
+        root_path = Path(raw_root).expanduser()
+        if ".." in root_path.parts:
+            continue
+        try:
+            resolved_root = root_path.resolve(strict=True)
+        except OSError:
+            # A result root may not exist before the worker creates it. Its
+            # nearest existing parent still defines the server-approved scope.
+            try:
+                resolved_root = root_path.resolve(strict=False)
+            except OSError:
+                continue
+        if resolved == resolved_root or resolved_root in resolved.parents:
+            return True
+    return False
+
+
 def _known_principal(value: str | None) -> bool:
     if not value:
         return False
@@ -280,7 +313,60 @@ def _known_principal(value: str | None) -> bool:
         token_map = json.loads(os.environ.get("PLACHEM_WAR_ROOM_PRINCIPAL_TOKENS", "{}"))
     except json.JSONDecodeError:
         token_map = {}
-    return value in token_map or value in representative_principals()
+    return value in token_map or value in representative_principals() or value in _human_login_principal_map()
+
+
+def _human_login_principal_map() -> dict[str, str]:
+    """Map a trusted server-side login identity to a representative principal.
+
+    The trusted identity is the authenticated reverse-proxy/Tailscale login
+    (PLACHEM_WAR_ROOM_HUMAN_TAILSCALE_LOGIN), e.g. the representative's Tailscale
+    account email.  It is not a client-supplied value: the caller must have
+    already presented a verified reverse-proxy secret, a signed server session
+    cookie, or a server-side token.  The mapped principal must be a configured
+    non-Agent representative (PLACHEM_WAR_ROOM_HUMAN_REPRESENTATIVE_PRINCIPAL
+    or a member of PLACHEM_WAR_ROOM_REPRESENTATIVE_PRINCIPALS); anything else is
+    ignored so a misconfigured value can never widen access.
+    """
+    login = os.environ.get("PLACHEM_WAR_ROOM_HUMAN_TAILSCALE_LOGIN", "").strip()
+    principal = os.environ.get("PLACHEM_WAR_ROOM_HUMAN_REPRESENTATIVE_PRINCIPAL", "").strip()
+    if not login or not principal:
+        return {}
+    if canonical_agent_id(principal) is not None:
+        return {}
+    if principal not in representative_principals():
+        return {}
+    return {login: principal}
+
+
+def _resolve_trusted_principal(value: str | None) -> str | None:
+    """Apply the trusted login-to-principal mapping to an already-verified identity."""
+    if not value:
+        return None
+    return _human_login_principal_map().get(value)
+
+
+def _session_cookie_principal(request: Request) -> str | None:
+    """Verify the signed HttpOnly server session cookie.
+
+    The cookie is only issued by this server (app.py) after the trusted
+    reverse-proxy secret is verified, so its principal is already a
+    server-side identity; the mapping may then translate the raw Tailscale
+    login into the representative principal.
+    """
+    cookie = request.cookies.get("war_room_session")
+    if not cookie:
+        return None
+    try:
+        principal, signature = cookie.split(".", 1)
+    except ValueError:
+        return None
+    secret = os.environ.get("PLACHEM_WAR_ROOM_SESSION_SECRET", "")
+    if not secret or not hmac.compare_digest(signature, hmac.new(secret.encode(), principal.encode(), hashlib.sha256).hexdigest()):
+        return None
+    if not _known_principal(principal):
+        return None
+    return _resolve_trusted_principal(principal) or principal
 
 
 def _redact(value: Any) -> Any:
@@ -317,19 +403,17 @@ def _request_principal(request: Request | None, actor: str | None, token: str | 
         presented_proxy_secret = request.headers.get("X-War-Room-Proxy-Secret", "")
         if (
             proxy_secret
-            and _known_principal(proxy_principal)
             and hmac.compare_digest(proxy_secret, presented_proxy_secret)
+            and (_known_principal(proxy_principal) or _resolve_trusted_principal(proxy_principal))
         ):
-            return proxy_principal
-        cookie = request.cookies.get("war_room_session")
-        if cookie:
-            try:
-                principal, signature = cookie.split(".", 1)
-                secret = os.environ.get("PLACHEM_WAR_ROOM_SESSION_SECRET", "")
-                if secret and hmac.compare_digest(signature, hmac.new(secret.encode(), principal.encode(), hashlib.sha256).hexdigest()):
-                    return principal if _known_principal(principal) else None
-            except ValueError:
-                pass
+            return _resolve_trusted_principal(proxy_principal) or proxy_principal
+        cookie_principal = _session_cookie_principal(request)
+        if cookie_principal:
+            return cookie_principal
+        # Proxy/cookie authentication did not resolve a principal. Preserve
+        # the existing explicit API-client path: a server-side token-map
+        # credential may still authenticate this request. Actor/header alone
+        # remains insufficient because the token must match the server map.
     supplied_token = token or (request.headers.get("X-War-Room-Token") if request is not None else None)
     advertised = actor or (request.headers.get("X-War-Room-Actor") if request is not None else None)
     try:

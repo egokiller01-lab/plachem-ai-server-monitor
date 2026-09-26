@@ -5,7 +5,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from war_room_execution_units import ExecutionUnitStore
 from war_room_orchestration import (
@@ -35,6 +35,7 @@ class FakeCoreEngine:
         core_run_id: str | None = None,
         idempotency_key: str | None = None,
         goal_contract: dict | None = None,
+        approved_paths: list[str] | None = None,
     ) -> dict:
         actual_id = core_run_id or f"core-{len(self.records)}"
         self.dispatch_calls.append({
@@ -44,6 +45,7 @@ class FakeCoreEngine:
             "core_run_id": core_run_id,
             "idempotency_key": idempotency_key,
             "goal_contract": goal_contract,
+            "approved_paths": approved_paths,
         })
         existing = self.records.get(actual_id)
         if existing is not None:
@@ -295,6 +297,27 @@ class TestOrchestratorDispatch(unittest.TestCase):
 
     def tearDown(self):
         self.tmpdir.cleanup()
+
+    def test_task_approved_paths_legacy_db_without_grounding_table_returns_empty(self):
+        self.assertEqual([], self.orch._task_approved_paths("task-1"))
+
+    def test_task_approved_paths_current_db_returns_approved_paths(self):
+        approved = ["/home/plachem-sever/.openclaw/agents/ERPmanager/05_QA_EVIDENCE/result.md"]
+        packet_json = '{"approved_paths": ["/home/plachem-sever/.openclaw/agents/ERPmanager/05_QA_EVIDENCE/result.md"]}'
+        with sqlite3.connect(self.db_path) as con:
+            con.execute(
+                "CREATE TABLE war_grounding_packets (task_id TEXT PRIMARY KEY, packet_json TEXT)"
+            )
+            con.execute(
+                "INSERT INTO war_grounding_packets VALUES (?, ?)",
+                ("task-1", packet_json),
+            )
+        self.assertEqual(approved, self.orch._task_approved_paths("task-1"))
+
+    def test_task_approved_paths_does_not_hide_other_sqlite_errors(self):
+        with patch("sqlite3.connect", side_effect=sqlite3.OperationalError("database is locked")):
+            with self.assertRaisesRegex(sqlite3.OperationalError, "database is locked"):
+                self.orch._task_approved_paths("task-1")
 
     def test_dispatch_persists_core_run_id(self):
         """Dispatch persists the core_run_id to the execution unit."""

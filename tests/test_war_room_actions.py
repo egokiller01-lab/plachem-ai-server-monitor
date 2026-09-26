@@ -300,8 +300,13 @@ class WarRoomControlledApiTests(unittest.TestCase):
             scope = con.execute("SELECT scope,document_version,revision,qa_cycle FROM war_tasks WHERE id=?", (task_id,)).fetchone()
             con.execute("UPDATE war_tasks SET status='qa',qa_cycle=1 WHERE id=?", (task_id,))
             scope_hash = hashlib.sha256(scope[0].encode()).hexdigest()
-            con.execute("INSERT INTO war_evidence (id,task_id,evidence_type,uri,summary,task_revision,scope_hash,document_version,qa_cycle,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)", ("rep-evidence",task_id,"test","/tmp/rep","pass",scope[2],scope_hash,scope[1],1,int(time.time())))
-            con.execute("INSERT INTO war_qa_verdicts (id,task_id,qa_principal,verdict,evidence_profile,signature,signed_payload,task_revision,scope_hash,document_version,qa_cycle,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", ("rep-verdict",task_id,"ERPqa","PASS","required:test","sig","payload",scope[2],scope_hash,scope[1],1,int(time.time())))
+            now = int(time.time())
+            con.execute("INSERT INTO war_evidence (id,task_id,evidence_type,uri,summary,task_revision,scope_hash,document_version,qa_cycle,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)", ("rep-evidence-test",task_id,"test","/tmp/rep-test","pass",scope[2],scope_hash,scope[1],1,now))
+            con.execute("INSERT INTO war_evidence (id,task_id,evidence_type,uri,summary,task_revision,scope_hash,document_version,qa_cycle,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)", ("rep-evidence-artifact",task_id,"artifact","/tmp/rep-artifact","pass",scope[2],scope_hash,scope[1],1,now))
+            profile = "required:test,artifact"
+            signed_payload = json.dumps({"task_id":task_id,"verdict":"PASS","evidence_profile":profile,"qa_principal":"ERPqa","task_revision":scope[2],"scope_hash":scope_hash,"document_version":scope[1],"qa_cycle":1}, sort_keys=True)
+            signature = hmac.new(b"fixture-qa-secret", signed_payload.encode(), hashlib.sha256).hexdigest()
+            con.execute("INSERT INTO war_qa_verdicts (id,task_id,qa_principal,verdict,evidence_profile,signature,signed_payload,task_revision,scope_hash,document_version,qa_cycle,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", ("rep-verdict",task_id,"ERPqa","PASS",profile,signature,signed_payload,scope[2],scope_hash,scope[1],1,now))
             con.commit()
         generic = self.client.post(f"/api/war-room/tasks/{task_id}/transition", json={"status":"completed"}, headers={**headers,"Idempotency-Key":"rep-generic"})
         self.assertEqual(403, generic.status_code, generic.text)
@@ -816,6 +821,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
         self.assertEqual(["agent","bridge.status","chat.abort"], [call[0] for call in bridge.calls])
         submit = bridge.calls[0][1]
         self.assertEqual("erpcoder", submit["agentId"])
+        self.assertEqual(3600, submit["timeout"])
         self.assertEqual({"sessionKey","agentId","message","idempotencyKey","timeout"}, set(submit))
 
     def test_real_adapter_creates_only_explicit_agent_owned_disposable_session(self) -> None:
@@ -1002,8 +1008,8 @@ class WarRoomControlledApiTests(unittest.TestCase):
         restarted=WarRoomRuntime(adapter=OwnedAdapter())
         self.assertEqual("failed",restarted.stop_project(db_path=db,project_id=war_room.PROJECT_ID,actor_id="main",now=now+2)["deliveries"][0]["status"])
 
-    def test_fresh_real_adapter_rebinds_received_run_from_database_before_poll(self) -> None:
-        """Worker restart must not lose the session needed to collect chat.history."""
+    def test_fresh_real_adapter_recovery_requires_delivery_scoped_binding_before_poll(self) -> None:
+        """Restart recovery must use the delivery's original session, never the current project session."""
         import war_room
         from war_room_adapter import DeliveryReceipt
         from war_room_worker import recover_received_deliveries
@@ -1029,9 +1035,26 @@ class WarRoomControlledApiTests(unittest.TestCase):
             con.execute("INSERT INTO war_deliveries (id,message_id,agent_id,status,attempt_count,max_attempts,deadline_at,created_at,run_id) VALUES (?,?,?,?,?,?,?,?,?)", ("restart-delivery","restart-message","ERPcoder","received",1,3,now+30,now,"run-restart"))
             con.commit()
         adapter = FreshAdapter()
+
+        # Project-level binding alone is not sufficient for restart recovery.
         result = recover_received_deliveries(db_path=db, gateway=adapter, now=now+1)
+        self.assertEqual([{"delivery_id":"restart-delivery","run_id":"run-restart","status":"failed"}], result)
+        self.assertNotIn("run-restart", adapter.bound)
+
+        # Once the original delivery-scoped binding is present, recovery may
+        # safely rebind the run and collect its terminal response.
+        with sqlite3.connect(db) as con:
+            con.execute(
+                """UPDATE war_deliveries
+                   SET status='received',error_code=NULL,error_class=NULL,
+                       session_key=?,session_id=?
+                   WHERE id='restart-delivery'""",
+                ("agent:erpcoder:war-room-test:original","session-original"),
+            )
+            con.commit()
+        result = recover_received_deliveries(db_path=db, gateway=adapter, now=now+2)
         self.assertEqual([{"delivery_id":"restart-delivery","run_id":"run-restart","status":"responded"}], result)
-        self.assertEqual(("agent:erpcoder:war-room-test:fixture","session-disposable"), adapter.bound["run-restart"])
+        self.assertEqual(("agent:erpcoder:war-room-test:original","session-original"), adapter.bound["run-restart"])
 
     def test_grounding_accepts_short_and_full_git_revision_of_same_commit(self) -> None:
         from war_room_worker import _structured_result
@@ -1246,7 +1269,8 @@ class WarRoomControlledApiTests(unittest.TestCase):
             self.assertIn(f'id="{stable_id}"', html)
         self.assertIn("retryDemoDelivery", javascript)
         self.assertIn("processDemoQueue", javascript)
-        self.assertEqual(3, html.count('data-screen='))
+        self.assertEqual(4, html.count('data-screen='))
+        self.assertIn('data-screen="process-board"', html)
         self.assertIn('execution_mode: "FAST_GATEWAY"', javascript)
         self.assertIn("reviewer_agent_id", javascript)
         self.assertIn("Agent 호출 0건", javascript)

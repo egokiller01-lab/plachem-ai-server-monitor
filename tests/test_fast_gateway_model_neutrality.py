@@ -125,7 +125,9 @@ def test_retry_limit_is_independent_of_record_model(running, timers, case):
     assert len(timers) == 1  # Events must not reset the original deadline.
     assert timers[0].seconds == 240.0
     assert adapter.submitted["run-1"]["timeout"] == 300.0
-    assert set(adapter.submitted["run-1"]) == {"message", "agentId", "idempotencyKey", "timeout"}
+    assert set(adapter.submitted["run-1"]) == {
+        "message", "agentId", "idempotencyKey", "timeout", "_trustedValidationContext"
+    }
 
 
 @pytest.mark.parametrize("case,elapsed,expected", [

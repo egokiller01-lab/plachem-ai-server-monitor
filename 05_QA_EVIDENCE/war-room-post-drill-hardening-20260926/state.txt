@@ -1,0 +1,4 @@
+board_counts= {'WAITING': 0, 'READY': 0, 'RUNNING': 0, 'PASS': 7, 'FAIL': 0, 'REWORK': 0, 'BLOCKED': 0, 'SUPERSEDED': 6, 'DONE': 0}
+attention= []
+integrity_check= ok
+superseded_events= 6

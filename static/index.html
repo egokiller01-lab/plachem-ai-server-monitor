@@ -613,6 +613,18 @@
       50% { box-shadow: 0 0 10px 2px rgba(255, 92, 113, 0.55); }
     }
     .oc-state-plain { color: var(--muted); font-size: 12px; }
+    .oc-state.jev-idle { color: var(--muted); background: rgba(120, 140, 170, 0.14); border: 1px solid rgba(120, 140, 170, 0.3); }
+    .oc-state.jev-working, .oc-state.jev-continue { color: var(--green); background: rgba(99, 239, 102, 0.12); border: 1px solid rgba(99, 239, 102, 0.35); }
+    .oc-state.jev-watch { color: var(--amber); background: rgba(255, 178, 28, 0.14); border: 1px solid rgba(255, 178, 28, 0.4); }
+    .oc-state.jev-salvage { color: #fff; background: rgba(255, 138, 61, 0.55); border: 1px solid rgba(255, 138, 61, 0.75); }
+    .oc-state.jev-dead { color: #fff; background: rgba(255, 92, 113, 0.6); border: 1px solid rgba(255, 92, 113, 0.8); }
+    .oc-state.jev-done { color: var(--green); background: rgba(99, 239, 102, 0.18); border: 1px solid rgba(99, 239, 102, 0.45); }
+    .oc-state.jev-timeout, .oc-state.jev-failed { color: #fff; background: rgba(255, 92, 113, 0.45); border: 1px solid rgba(255, 92, 113, 0.65); }
+    .token-state { display:inline-block; padding:2px 8px; border-radius:999px; font-size:10px; font-weight:750; letter-spacing:.04em; }
+    .token-state.token-normal { color:var(--green); background:rgba(99,239,102,.10); border:1px solid rgba(99,239,102,.3); }
+    .token-state.token-high { color:var(--amber); background:rgba(255,178,28,.13); border:1px solid rgba(255,178,28,.38); }
+    .token-state.token-abnormal { color:#fff; background:rgba(255,92,113,.55); border:1px solid rgba(255,92,113,.75); }
+    .token-state.token-unavailable { color:var(--muted); background:rgba(120,140,170,.10); border:1px solid rgba(120,140,170,.25); }
 
     .gpu-grid, .agent-grid {
       display: grid;
@@ -1750,24 +1762,29 @@
         return;
       }
       scanEl.textContent = `last scan: ${wdEscape(data.scan_ts_text)} · agents ${data.agent_count} · abnormal ${data.abnormal_count}`;
-      const abnormal = data.abnormal_count || 0;
-      const hasFail = Object.values(data.agents).some(a => Object.values(a.buckets || {}).some(b => b.worst === "FAIL"));
-      if (hasFail) { pill.textContent = "ALERT"; pill.className = "watchdog-pill fail"; }
-      else if (abnormal > 0) { pill.textContent = `${abnormal} ABNORMAL`; pill.className = "watchdog-pill warn"; }
+      // Badge/summary/list use the authoritative State (OpenClaw sessions + JEV),
+      // identical to OpenClaw Control -> Agents.  Detector rows never set ALERT by
+      // themselves; only current-session JEV SALVAGE/DEAD counts as abnormal.
+      const ABNORMAL_STATES = ["SALVAGE", "DEAD"];
+      const isAbn = info => ABNORMAL_STATES.includes(String((info || {}).display_state || ""));
+      const abnormal = (data.abnormal_agents || Object.keys(data.agents).filter(n => isAbn(data.agents[n]))).length;
+      const anyTimeoutFailed = Object.values(data.agents).some(a => ["TIMEOUT", "FAILED"].includes(String(a.display_state || "")));
+      if (abnormal > 0) { pill.textContent = "ALERT"; pill.className = "watchdog-pill fail"; }
+      else if (anyTimeoutFailed) { pill.textContent = "CHECK"; pill.className = "watchdog-pill warn"; }
       else { pill.textContent = "ALL NORMAL"; pill.className = "watchdog-pill ok"; }
 
       const agents = data.agents;
       const names = Object.keys(agents).sort((a, b) => {
-        const sa = agents[a].status === "ABNORMAL" ? 0 : 1;
-        const sb = agents[b].status === "ABNORMAL" ? 0 : 1;
+        const sa = isAbn(agents[a]) ? 0 : 1;
+        const sb = isAbn(agents[b]) ? 0 : 1;
         return sa - sb || a.localeCompare(b);
       });
       const summaryEl = document.getElementById("watchdog-summary");
       if (summaryEl) {
-        const abnormalNames = names.filter(n => (agents[n] || {}).status === "ABNORMAL");
+        const abnormalNames = names.filter(n => isAbn(agents[n]));
         if (abnormalNames.length) {
           summaryEl.innerHTML = `이상 <span class="wd-abn">${abnormalNames.length}</span> / ${names.length} agent — ` +
-            abnormalNames.slice(0, 6).map(n => wdEscape(n)).join(", ") +
+            abnormalNames.slice(0, 6).map(n => `${wdEscape(n)}(${wdEscape((agents[n] || {}).display_state)})`).join(", ") +
             (abnormalNames.length > 6 ? ` 외 ${abnormalNames.length - 6}건` : "") +
             ` · 상세: OpenClaw Control → Agents`;
         } else {
@@ -1780,17 +1797,32 @@
       }
       grid.innerHTML = names.map(name => {
         const info = agents[name] || {};
-        const status = info.status || "UNAVAILABLE";
-        const cls = status === "NORMAL" ? "wd-normal" : status === "ABNORMAL" ? "wd-abnormal" : "wd-unavailable";
-        const statusCls = status === "NORMAL" ? "normal" : status === "ABNORMAL" ? "abnormal" : "unavailable";
+        const status = info.display_state || info.status || "UNAVAILABLE";
+        const cls = isAbn(info) ? "wd-abnormal" : status === "UNAVAILABLE" ? "wd-unavailable" : "wd-normal";
+        const statusCls = isAbn(info) ? "abnormal" : status === "UNAVAILABLE" ? "unavailable" : "normal";
+        // Detector buckets only survive when attributed to the current session;
+        // ignored counts are explicitly labelled so they cannot read as State.
         const buckets = Object.entries(info.buckets || {}).map(([bk, b]) => {
           const worstFail = b.worst === "FAIL" ? " worst-fail" : "";
-          return `<span class="wd-bucket${worstFail}">${wdEscape(bk)} ×${b.count}</span>`;
+          return `<span class="wd-bucket${worstFail}">${wdEscape(bk)} ×${b.count} (현 세션)</span>`;
         }).join("");
         const warns = (info.warnings || []).slice(0, 3).map(w =>
           `<span class="wd-w"><b>${wdEscape(w.ts_text)}</b> ${wdEscape(w.kind)} — ${wdEscape(w.reason)}</span>`
         ).join("");
-        const body = warns || '<span class="wd-w">No active detections</span>';
+        const meta = [];
+        if (info.session_id) meta.push(`session ${wdEscape(String(info.session_id).slice(0, 8))}`);
+        if (info.jev_decision) meta.push(`JEV ${wdEscape(info.jev_decision)}${info.jev_confidence != null ? " conf " + wdEscape(info.jev_confidence) : ""}`);
+        const token = info.token_telemetry || {};
+        if (token.status && token.status !== "UNAVAILABLE") {
+          const tokBits = [`Token ${wdEscape(token.status)}`];
+          if (token.current_prompt_tokens) tokBits.push(`prompt ${formatK(token.current_prompt_tokens)}`);
+          if (token.velocity_tokens_per_hour) tokBits.push(`${formatK(token.velocity_tokens_per_hour)}/h`);
+          if (token.cache_ratio != null) tokBits.push(`cache ${Math.round(token.cache_ratio * 100)}%`);
+          meta.push(tokBits.join(" · "));
+        }
+        if (info.ignored_detection_count) meta.push(`과거/타 세션 탐지 ${info.ignored_detection_count}건은 상태 미반영`);
+        const metaLine = meta.length ? `<span class="wd-w">${meta.join(" · ")}</span>` : "";
+        const body = [metaLine, warns].filter(Boolean).join("") || `<span class="wd-w">${status === "UNAVAILABLE" ? "상태 원본 미확인" : "현재 세션 유효 탐지 없음"}</span>`;
         return `<div class="wd-agent ${cls}">
           <div class="wd-agent-top"><span class="wd-agent-name">${wdEscape(name)}</span><span class="wd-status ${statusCls}">${wdEscape(status)}</span></div>
           <div class="wd-buckets">${buckets}</div>
@@ -2127,31 +2159,40 @@
       const agents = data.agents || [];
       const providers = data.providers || [];
       const skills = data.skills || { items: [], by_source: {} };
-      const wd = (typeof watchdogData !== "undefined" && watchdogData && watchdogData.available) ? (watchdogData.agents || {}) : {};
+      // State column = OpenClaw real session state + latest JEV verdict for the
+      // current session only (server-computed).  Watchdog STALL/LOOP estimation
+      // no longer overrides this column; it keeps its own watchdog card.
+      const jevClass = s => ({ CONTINUE: "jev-continue", WATCH: "jev-watch", SALVAGE: "jev-salvage", DEAD: "jev-dead", WORKING: "jev-working", DONE: "jev-done", TIMEOUT: "jev-timeout", FAILED: "jev-failed", IDLE: "jev-idle" }[s] || "");
       const agentRows = agents.map(a => {
-        const baseState = a.session?.state || "unknown";
-        const wdInfo = wd[a.id] || wd[String(a.id).toLowerCase()] || null;
-        const buckets = wdInfo ? (wdInfo.buckets || {}) : {};
-        const has = k => buckets[k] && buckets[k].count > 0;
-        let label = null, cls = "";
-        if (has("LOOP")) { label = "LOOP"; cls = "wd-loop"; }
-        else if (has("STALL")) { label = "STALL"; cls = "wd-stall"; }
-        else if (has("CONTEXT")) { label = "CONTEXT"; cls = "wd-context"; }
-        let title = `OpenClaw state: ${baseState}`;
-        if (label) {
-          const warns = (wdInfo.warnings || []).slice(0, 3).map(w => `${w.kind} [${w.severity}] ${w.reason}`);
-          title += ` | Watchdog: ${label} | ` + (warns.join(" | ") || "detection evidence unavailable");
-        }
-        const stateCell = "\u0001" + (label
-          ? `<td><span class="oc-state ${cls}" title="${escapeHtml(title)}">${label}</span></td>`
-          : `<td><span class="oc-state-plain" title="${escapeHtml(title)}">${escapeHtml(baseState)}</span></td>`);
-        return [a.id, `${a.emoji || ""} ${a.name || a.id}`, a.model || "unknown", (a.platforms || []).join(", ") || "-", stateCell, a.session?.session_count ?? 0, a.session?.total_tokens ?? 0];
+        const ds = a.session?.display_state || "IDLE";
+        const parts = [];
+        if (a.session?.basis) parts.push(`basis: ${a.session.basis}`);
+        if (a.session?.session_id) parts.push(`session: ${String(a.session.session_id).slice(0, 8)}`);
+        if (a.session?.session_age_seconds != null) parts.push(`age: ${Math.round(a.session.session_age_seconds / 60)}m`);
+        if (a.session?.jev_decision) parts.push(`JEV ${a.session.jev_decision}${a.session.jev_confidence != null ? ` conf ${a.session.jev_confidence}` : ""}`);
+        if (a.session?.jev_observed_at) parts.push(`JEV at ${new Date(a.session.jev_observed_at * 1000).toLocaleTimeString()}`);
+        const title = `State: ${ds}` + (parts.length ? ` | ${parts.join(" | ")}` : "");
+        const stateCell = "\u0001" + `<td><span class="oc-state ${jevClass(ds)}" title="${escapeHtml(title)}">${escapeHtml(ds)}</span></td>`;
+        const token = a.session?.token_telemetry || {};
+        const ts = token.status || "UNAVAILABLE";
+        const tokenClass = ({NORMAL:"token-normal",HIGH:"token-high",ABNORMAL:"token-abnormal"}[ts] || "token-unavailable");
+        const tokenMeta = [];
+        if (token.source) tokenMeta.push(`source: ${token.source}`);
+        if (token.current_prompt_tokens != null) tokenMeta.push(`prompt: ${formatK(token.current_prompt_tokens)}`);
+        if (token.context_pressure != null) tokenMeta.push(`context: ${Math.round(token.context_pressure * 100)}%`);
+        if (token.velocity_tokens_per_hour != null) tokenMeta.push(`velocity: ${formatK(token.velocity_tokens_per_hour)}/h`);
+        if (token.calls_per_hour != null) tokenMeta.push(`calls: ${Math.round(token.calls_per_hour)}/h`);
+        if (token.cache_ratio != null) tokenMeta.push(`cache: ${Math.round(token.cache_ratio * 100)}%`);
+        if (token.processed_24h != null) tokenMeta.push(`24h: ${formatK(token.processed_24h)}`);
+        if ((token.reasons || []).length) tokenMeta.push(`reason: ${(token.reasons || []).join(", ")}`);
+        const tokenCell = "\u0001" + `<td><span class="token-state ${tokenClass}" title="${escapeHtml(tokenMeta.join(" | ") || "Token telemetry unavailable")}">${escapeHtml(ts)}</span></td>`;
+        return [a.id, `${a.emoji || ""} ${a.name || a.id}`, a.model || "unknown", (a.platforms || []).join(", ") || "-", stateCell, tokenCell, a.session?.session_count ?? 0, a.session?.total_tokens ?? 0];
       });
       const modelRows = providers.flatMap(p => (p.models || []).map(m => [p.id, p.api || "-", p.access_mode || "-", m.id || m.name, m.context_window || "-", m.max_tokens || "-", (p.used_by || []).map(a => a.name || a.id).join(", ") || "-"]));
       const skillRows = (skills.items || []).map(skill => [skill.name || skill.id, skill.source || "-", skill.description || "-"]);
       const sourceRows = Object.entries(skills.by_source || {}).map(([source, count]) => [source, count]);
       document.getElementById("openclaw-content").innerHTML = [
-        card("Agents", table(["ID", "Name", "Model", "Platforms", "State", "Sessions", "Tokens"], agentRows), true),
+        card("Agents", table(["ID", "Name", "Model", "Platforms", "State", "Token State", "Sessions", "Tokens"], agentRows), true),
         card("Models / Providers", table(["Provider", "API", "Access", "Model", "Context", "Max", "Used By"], modelRows), true),
         card("Skills Summary", table(["Source", "Count"], sourceRows), true),
         card("Skills", table(["Name", "Source", "Description"], skillRows), true),

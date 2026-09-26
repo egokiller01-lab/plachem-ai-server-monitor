@@ -61,6 +61,30 @@
     .stage .done,.stage .current { border-color:var(--cyan); color:var(--text); } .stage .done { border-color:var(--green); color:var(--green); }
     .evidence-list { display:grid; gap:8px; } .evidence { border-left:3px solid var(--blue); padding:8px 10px; background:#0b1526; }
     .screen-note { margin-bottom:14px; color:var(--muted); }
+    .jev-advisory { border:1px solid var(--cyan); background:rgba(85,216,255,.08); }
+    .jev-advisory .notice { color:var(--amber); font-weight:700; }
+    .process-board { display:grid; gap:12px; }
+    .readiness-banner { padding:12px; border:1px solid var(--line); border-radius:9px; margin-bottom:12px; }
+    .readiness-banner.ready { border-color:var(--green); background:rgba(94,230,168,.10); }
+    .readiness-banner.blocked,.readiness-banner.unavailable { border-color:var(--red); background:rgba(255,143,155,.10); }
+    .process-board-summary { display:grid; grid-template-columns:repeat(auto-fit,minmax(90px,1fr)); gap:8px; }
+    .process-board-state { padding:9px; border:1px solid var(--line); border-radius:9px; background:#0b1526; }
+    .process-board-state strong { display:block; font-size:18px; color:var(--cyan); }
+    .process-board-state.running,.process-board-state.fail,.process-board-state.rework,.process-board-state.blocked { border-color:var(--red); background:rgba(255,143,155,.10); }
+    .process-board-state.superseded { border-color:var(--muted); background:rgba(159,176,207,.08); }
+    .process-board-state.superseded strong { color:var(--muted); }
+    .process-board-state.running strong { color:var(--green); } .process-board-state.fail strong,.process-board-state.rework strong,.process-board-state.blocked strong { color:var(--red); }
+    .process-board-table-wrap { overflow:auto; border:1px solid var(--line); border-radius:10px; }
+    .process-board-table { width:100%; min-width:920px; border-collapse:collapse; }
+    .process-board-table th,.process-board-table td { padding:10px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }
+    .process-board-table th { color:var(--muted); font-size:12px; background:#0b1526; position:sticky; top:0; }
+    .process-board-table tr:last-child td { border-bottom:0; }
+    .process-board-table tr.emphasis-running,.process-board-table tr.emphasis-fail,.process-board-table tr.emphasis-rework,.process-board-table tr.emphasis-blocked { background:rgba(255,143,155,.08); }
+    .process-board-table tr.emphasis-running { background:rgba(94,230,168,.08); }
+    .process-board-table .order { color:var(--muted); font-variant-numeric:tabular-nums; white-space:nowrap; }
+    .process-board-table .subline { display:block; color:var(--muted); font-size:12px; margin-top:3px; }
+@media(max-width:1050px){ .process-board-summary{grid-template-columns:repeat(4,minmax(0,1fr));} }
+@media(max-width:700px){ .process-board-summary{grid-template-columns:repeat(2,minmax(0,1fr));} }
     @media(max-width:1050px){ .shell{grid-template-columns:210px minmax(0,1fr)} .stat-grid{grid-template-columns:repeat(3,1fr)} }
     @media(max-width:700px){ header{padding:13px; align-items:flex-start; flex-direction:column; gap:8px; max-width:100%; overflow:hidden} .shell{grid-template-columns:1fr;padding:10px;width:100%;min-width:0;max-width:100%;overflow:hidden}.sidebar{position:static;min-width:0;max-width:100%}.project-list{max-height:none;display:flex;overflow-x:auto;overflow-y:hidden;max-width:100%;min-width:0}.project-list .project{min-width:0;flex:0 1 220px;width:min(220px,calc(100vw - 32px))}.stat-grid,.attention-grid,.two-col,.review-grid,.three-col{grid-template-columns:1fr;min-width:0;max-width:100%}.quick-steps,.stage{grid-template-columns:1fr}.event{grid-template-columns:1fr}.panel,.card,.flow-card,.project,.event,.three-col>*{padding:12px;min-width:0;max-width:100%;overflow-x:clip}.nav{overflow:visible;flex-wrap:wrap;min-width:0;max-width:100%}.nav button{white-space:normal;flex:1 1 42%;min-width:0;max-width:100%;overflow-wrap:anywhere}.filterbar{min-width:0;max-width:100%}.filterbar>*{flex:1 1 0;min-width:0;max-width:100%;overflow-wrap:anywhere}.toolbar{align-items:flex-start;min-width:0;max-width:100%}.stage div{text-align:left}.project button{min-width:0;max-width:100%;overflow-wrap:anywhere}
     }
@@ -81,6 +105,7 @@
       <nav class="nav" aria-label="War Room 화면">
         <button type="button" data-screen="dashboard" aria-current="page" onclick="navigateScreen('dashboard')">프로젝트 목록</button>
         <button type="button" data-screen="project" onclick="navigateScreen('project')">공동 작전실</button>
+        <button type="button" data-screen="process-board" onclick="navigateScreen('process-board' )">Process Board</button>
         <button type="button" data-screen="task" onclick="navigateScreen('task')">작업 상세</button>
       </nav>
 
@@ -104,9 +129,17 @@
         <details class="card" style="margin-top:14px"><summary><strong>참여자·참고 자료·설정</strong></summary><form id="participant-form" data-permission="manage" class="filterbar"><select id="participant-principal" aria-label="등록된 Agent"></select><select id="participant-role" onchange="syncParticipantFlags()" aria-label="역할"><option>developer</option><option>qa</option><option>observer</option><option>project_manager</option></select><label class="check"><input id="participant-read" type="checkbox" checked>읽기</label><label class="check"><input id="participant-comment" type="checkbox" checked>댓글</label><label class="check"><input id="participant-approve" type="checkbox">승인</label><label class="check"><input id="participant-execute" type="checkbox">실행</label><button>참여자 추가</button></form><div id="agent-candidate-note" class="muted"></div><div id="participant-list" class="stack muted">참여자 불러오는 중…</div></details>
       </section>
 
+      <section id="screen-process-board" class="screen" hidden aria-labelledby="process-board-title">
+        <div class="toolbar"><div><h2 id="process-board-title">Process Board</h2><p class="screen-note">기존 작업·QA·delivery 데이터를 읽기 전용으로 단계별 표시합니다. 같은 작업의 순서는 번호로 확인할 수 있습니다.</p></div><span id="process-board-updated" class="muted"></span></div>
+        <div id="process-board-readiness" class="readiness-banner unavailable" role="status" aria-live="polite">프로젝트 준비 상태를 확인하는 중입니다.</div>
+        <div id="process-board" class="process-board"><div class="empty">프로젝트를 선택하면 Process Board를 불러옵니다.</div></div>
+      </section>
+
       <section id="screen-task" class="screen" hidden aria-labelledby="task-screen-title">
         <div class="toolbar"><div><h2 id="task-screen-title">작업 상세·실시간 관제</h2><div id="task-detail-subtitle" class="muted">프로젝트에서 작업을 선택하세요.</div></div><span id="task-status"></span></div>
         <div id="task-detail" class="card"><div class="empty">작업을 선택하면 목표·금지사항·완료조건·담당자와 현재 상태가 표시됩니다.</div></div>
+        <section id="jev-task-detail-panel" class="card" aria-labelledby="jev-task-detail-title"><h3 id="jev-task-detail-title">JEV Advisory · advisory only</h3><div id="jev-task-detail-content" class="muted">작업을 선택하면 최신 advisory를 불러옵니다.</div></section>
+        <section id="jev-result-verifier-panel" class="card" aria-labelledby="jev-result-verifier-title"><h3 id="jev-result-verifier-title">JEV Result Verifier · advisory only</h3><div id="jev-result-verifier-content" class="muted">작업 결과의 보조 신호를 조회합니다. lifecycle/assignment/dispatch/QA 판정은 변경하지 않습니다.</div></section>
         <form id="legacy-reviewer-form" class="card" data-representative="true" hidden><strong>기존 작업 검수자 지정</strong><div class="muted">검수자 미지정 비완료 작업만 대상입니다. 기존 유효 승인은 해제되며 새 대표 승인이 필요합니다.</div><div class="filterbar"><select id="legacy-reviewer" required aria-label="기존 작업 검수자"></select><input id="legacy-reviewer-reason" required maxlength="1024" placeholder="지정 사유" aria-label="검수자 지정 사유"><button type="submit">검수자 지정</button></div><small id="legacy-reviewer-result" class="muted" role="status"></small></form>
         <div class="two-col"><section class="card"><h3>원문·연결 작업</h3><form id="message-form" data-permission="manage"><select id="message-type" aria-label="메시지 유형"><option value="instruction">연결 작업 지시</option><option value="opinion" disabled>Agent 의견 요청 · 미구현</option></select><select id="message-agent" aria-label="선택 Agent" disabled title="Agent 의견 실제 요청은 아직 미구현입니다"></select><select id="message-task" aria-label="연결 작업"><option value="">작업 선택(선택)</option></select><textarea id="message-body" required maxlength="4096" placeholder="연결 작업 지시"></textarea><button>기록</button></form><small id="message-result" class="muted" role="status">Agent 의견 요청은 기록만 남기는 기존 동작을 중단했으며 실제 요청 기능은 미구현입니다.</small><div id="delivery-cards" class="stack"></div></section><section class="card"><h3>실시간 타임라인</h3><div class="filterbar"><select id="timeline-type" onchange="loadTimeline()" aria-label="유형"><option value="">전체 유형</option><option>instruction</option><option>opinion</option><option>result</option><option>status</option><option>decision</option></select><select id="timeline-author" onchange="loadTimeline()" aria-label="작성자"><option value="">전체 작성자</option></select><button type="button" onclick="resetTimelineFilters()">초기화</button></div><div id="timeline" class="stack"><div class="empty">불러오는 중…</div></div></section></div>
         <div class="two-col"><section class="flow-card"><h3>승인·실행·중지·재개</h3><form id="approval-form"><select id="approval-task" required aria-label="승인 작업"><option value="">작업 선택</option></select><input id="approval-expiry" type="number" min="60" max="604800" value="1800" required aria-label="승인 유효 초"><button type="button" data-requires-task data-permission="approve" data-mutation onclick="approveSelectedTask()">승인</button><button type="button" data-requires-task data-permission="approve" data-mutation onclick="rejectSelectedTask()">거절</button><button type="button" data-requires-task data-permission="execute" data-mutation onclick="runSelectedTask()">실행·전달</button><button type="button" data-requires-task data-permission="execute" data-mutation onclick="stopSelectedTask()">선택 작업 중지</button><button type="button" data-permission="execute" data-mutation onclick="stopProject()">프로젝트 전체 중지</button><button type="button" data-requires-task data-permission="approve" data-mutation onclick="prepareSelectedTaskForReapproval()">재작업·중지 작업 재승인 준비</button><button type="button" data-permission="approve" data-mutation onclick="resumeProject()">프로젝트 재개</button></form><small id="task-selection-hint" class="warning" role="status" hidden>작업을 선택하면 승인·실행·선택 작업 중지·재작업 버튼이 활성화됩니다.</small><small id="approval-result" class="muted" role="status"></small><div class="filterbar"><select id="stop-ack-delivery" aria-label="중지 확인 delivery"><option value="">중지된 delivery 선택</option></select><button type="button" data-requires-task data-permission="execute" data-mutation onclick="acknowledgeStop()">중지 확인</button></div><small id="stop-result" class="muted" role="status"></small></section><section class="flow-card"><h3>안전 경계</h3><p class="muted">상태 전이는 서버 권한·idempotency·감사 기록을 거칩니다. 시스템 오류, agent 전달 실패, QA FAIL/REWORK는 서로 다른 상태와 다음 행동으로 표시됩니다.</p><div id="audit-summary" class="muted"></div></section></div>
