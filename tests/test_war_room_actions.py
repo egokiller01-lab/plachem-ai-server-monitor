@@ -731,6 +731,15 @@ class WarRoomControlledApiTests(unittest.TestCase):
             static_direct = self.client.get("/static/war-room.html", follow_redirects=False)
             self.assertEqual(307, static_direct.status_code)
             self.assertEqual(external, static_direct.headers["location"])
+            simple_direct = self.client.get("/war-room/simple?project_id=p1", follow_redirects=False)
+            self.assertEqual(307, simple_direct.status_code)
+            self.assertEqual(external + "/simple?project_id=p1", simple_direct.headers["location"])
+            advanced_direct = self.client.get("/war-room/advanced", follow_redirects=False)
+            self.assertEqual(307, advanced_direct.status_code)
+            self.assertEqual(external + "/advanced", advanced_direct.headers["location"])
+            static_simple = self.client.get("/static/war-room-simple.html", follow_redirects=False)
+            self.assertEqual(307, static_simple.status_code)
+            self.assertEqual(external + "/simple", static_simple.headers["location"])
 
             os.environ["PLACHEM_WAR_ROOM_SESSION_SECRET"] = "fixture-session-secret"
             os.environ["PLACHEM_WAR_ROOM_REVERSE_PROXY_SECRET"] = "fixture-proxy-secret"
@@ -746,6 +755,40 @@ class WarRoomControlledApiTests(unittest.TestCase):
             self.assertEqual(200, proxied.status_code)
             self.assertIn("war_room_session=", proxied.headers.get("set-cookie", ""))
             self.assertIn("Secure", proxied.headers.get("set-cookie", ""))
+            simple = self.client.get(
+                "/war-room/simple",
+                headers={
+                    "X-Authenticated-Principal": "main",
+                    "X-War-Room-Proxy-Secret": "fixture-proxy-secret",
+                    "X-Forwarded-Proto": "https",
+                },
+                follow_redirects=False,
+            )
+            self.assertEqual(200, simple.status_code)
+            self.assertIn("대표용 Simple Mode", simple.text)
+            self.assertIn("war-room-simple.js", simple.text)
+            advanced = self.client.get(
+                "/war-room/advanced",
+                headers={"X-Authenticated-Principal":"main", "X-War-Room-Proxy-Secret":"fixture-proxy-secret"},
+                follow_redirects=False,
+            )
+            self.assertEqual(200, advanced.status_code)
+            self.assertIn("Process Board", advanced.text)
+
+    def test_simple_mode_hides_operator_details_and_reuses_controlled_api(self) -> None:
+        root = Path(__file__).parents[1]
+        html = (root / "static" / "war-room-simple.html").read_text(encoding="utf-8")
+        javascript = (root / "static" / "war-room-simple.js").read_text(encoding="utf-8")
+        for text in ("새 작업 지시", "현재 작업", "최근 결과", "프로젝트 문서", "고급 관리"):
+            self.assertIn(text, html)
+        for hidden in ("correlation", "Delivery ID", "Session ID", "JEV Advisory", "call limit", "turn limit"):
+            self.assertNotIn(hidden, html)
+        self.assertIn("/prepare", javascript)
+        self.assertIn("task_approve_execute", javascript)
+        self.assertIn("task_stop", javascript)
+        self.assertIn("representative_completion", javascript)
+        self.assertIn('credentials:"same-origin"', javascript)
+        self.assertNotIn("X-War-Room-Token", html + javascript)
 
     def test_reverse_proxy_session_cookie_drives_headerless_ui_api(self) -> None:
         os.environ["PLACHEM_WAR_ROOM_SESSION_SECRET"] = "fixture-session-secret"

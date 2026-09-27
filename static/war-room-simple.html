@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>PLACHEM War Room · Simple</title>
+  <style>
+    :root{
+      color-scheme:dark;
+      --bg:#0b1017;--panel:#121a24;--panel2:#17212e;--line:#273447;
+      --text:#eef4fb;--muted:#98a7ba;--accent:#61c4ff;--green:#58d68d;
+      --amber:#f5c451;--red:#ff7b7b;--blue:#7fb3ff;--shadow:0 16px 50px rgba(0,0,0,.24)
+    }
+    *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-system,"Segoe UI",sans-serif}
+    button,select,textarea{font:inherit} button{cursor:pointer}
+    .top{position:sticky;top:0;z-index:10;display:flex;align-items:center;justify-content:space-between;gap:18px;padding:15px 24px;background:rgba(11,16,23,.94);backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
+    .brand h1{font-size:20px;margin:0}.brand small{color:var(--muted)}
+    .top-actions{display:flex;gap:10px;align-items:center}.pill{border:1px solid var(--line);border-radius:999px;padding:7px 11px;color:var(--muted);font-size:12px}
+    .link,.btn{border:1px solid var(--line);background:var(--panel2);color:var(--text);padding:10px 14px;border-radius:10px;text-decoration:none}
+    .btn.primary{background:var(--accent);border-color:var(--accent);color:#04131d;font-weight:800}.btn.danger{color:#ffd4d4;border-color:#744}
+    .btn:disabled{opacity:.45;cursor:not-allowed}
+    main{max-width:1180px;margin:0 auto;padding:22px}
+    .project-head{display:grid;grid-template-columns:minmax(260px,1.5fr) repeat(4,minmax(105px,.55fr));gap:12px;margin-bottom:18px}
+    .project-picker,.stat,.card{background:var(--panel);border:1px solid var(--line);border-radius:15px;box-shadow:var(--shadow)}
+    .project-picker{padding:16px}.project-picker label{display:block;color:var(--muted);font-size:12px;margin-bottom:7px}
+    .project-picker select{width:100%;background:#0e1620;color:var(--text);border:1px solid var(--line);border-radius:10px;padding:11px}
+    .project-meta{margin-top:9px;display:flex;gap:8px;align-items:center;color:var(--muted);font-size:12px;flex-wrap:wrap}
+    .stat{padding:15px}.stat strong{display:block;font-size:25px;margin-bottom:4px}.stat span{color:var(--muted);font-size:12px}
+    .layout{display:grid;grid-template-columns:1.05fr .95fr;gap:18px;margin-bottom:18px}
+    .card{padding:18px}.card h2{font-size:17px;margin:0 0 4px}.sub{color:var(--muted);font-size:13px;margin:0 0 14px}
+    textarea{width:100%;min-height:118px;resize:vertical;background:#0e1620;color:var(--text);border:1px solid var(--line);border-radius:12px;padding:13px;line-height:1.5}
+    .form-row{display:grid;grid-template-columns:1fr 1fr auto;gap:10px;margin-top:10px}
+    .form-row select{min-width:0;background:#0e1620;color:var(--text);border:1px solid var(--line);border-radius:10px;padding:10px}
+    .notice{padding:12px;border-radius:11px;background:#0e1620;border:1px solid var(--line);color:var(--muted);font-size:13px;margin-top:10px}
+    .notice.good{border-color:#285d41;color:#b9f3cf}.notice.warn{border-color:#6d5922;color:#ffe29a}.notice.bad{border-color:#743c3c;color:#ffc0c0}
+    .section-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}.section-head h2{margin:0;font-size:17px}
+    .stack{display:grid;gap:10px}.task{border:1px solid var(--line);border-radius:12px;padding:14px;background:#0f1721}
+    .task-top{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.task-title{font-weight:750;line-height:1.45}.task-meta{font-size:12px;color:var(--muted);margin-top:7px}
+    .status{display:inline-flex;align-items:center;white-space:nowrap;border-radius:999px;padding:5px 9px;font-size:11px;font-weight:800;border:1px solid var(--line)}
+    .status.running{color:#baddff;border-color:#345f86}.status.waiting{color:#ffe29a;border-color:#6d5922}.status.qa{color:#cbd6ff;border-color:#525c87}.status.good{color:#b9f3cf;border-color:#285d41}.status.bad{color:#ffc0c0;border-color:#743c3c}.status.muted{color:var(--muted)}
+    .task-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:11px}.task-actions .btn{padding:8px 11px;font-size:12px}
+    .result-summary{margin-top:9px;color:#c7d4e3;font-size:13px;line-height:1.55}
+    .doc-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.doc{border:1px solid var(--line);border-radius:12px;padding:13px;background:#0f1721}.doc strong{display:block}.doc small{display:block;color:var(--muted);margin-top:6px}
+    .empty{padding:18px;text-align:center;color:var(--muted);border:1px dashed var(--line);border-radius:12px}
+    .toolbar{display:flex;gap:8px;align-items:center}.refresh{background:transparent;color:var(--muted);border:0;padding:7px}
+    #toast{position:fixed;right:20px;bottom:20px;max-width:360px;padding:12px 15px;border-radius:11px;background:#152233;border:1px solid var(--line);box-shadow:var(--shadow);display:none}
+    .hidden{display:none!important}
+    @media(max-width:900px){.project-head{grid-template-columns:1fr 1fr}.project-picker{grid-column:1/-1}.layout{grid-template-columns:1fr}.form-row{grid-template-columns:1fr}.doc-grid{grid-template-columns:1fr}}
+    @media(max-width:560px){.top{padding:12px 14px}.brand small{display:none}.top-actions .pill{display:none}main{padding:14px}.project-head{grid-template-columns:1fr 1fr}.stat strong{font-size:21px}.card{padding:14px}}
+  </style>
+</head>
+<body>
+<header class="top">
+  <div class="brand"><h1>War Room</h1><small>대표용 Simple Mode</small></div>
+  <div class="top-actions">
+    <span id="auth-pill" class="pill">권한 확인 중</span>
+    <a id="advanced-link" class="link" href="/war-room/advanced">고급 관리</a>
+  </div>
+</header>
+
+<main>
+  <section class="project-head">
+    <div class="project-picker">
+      <label for="project-select">현재 프로젝트</label>
+      <select id="project-select"></select>
+      <div class="project-meta"><span id="project-status">-</span><span id="last-refresh">-</span></div>
+    </div>
+    <div class="stat"><strong id="stat-running">0</strong><span>작업중</span></div>
+    <div class="stat"><strong id="stat-approval">0</strong><span>승인 대기</span></div>
+    <div class="stat"><strong id="stat-issues">0</strong><span>확인 필요</span></div>
+    <div class="stat"><strong id="stat-documents">0</strong><span>프로젝트 문서</span></div>
+  </section>
+
+  <section class="layout">
+    <article class="card">
+      <h2>새 작업 지시</h2>
+      <p class="sub">하고 싶은 일을 평소처럼 적고 담당자와 검수자만 선택하십시오.</p>
+      <form id="task-form">
+        <textarea id="instruction" maxlength="4096" placeholder="예: War Room Simple 화면에서 작업 상태가 한눈에 보이도록 개선하고 테스트 결과까지 보고해라." required></textarea>
+        <div class="form-row">
+          <select id="assignee" aria-label="담당 Agent"></select>
+          <select id="reviewer" aria-label="QA Agent"></select>
+          <button id="prepare-button" class="btn primary" type="submit">작업 준비</button>
+        </div>
+      </form>
+      <div id="composer-note" class="notice">작업 준비만으로 Agent가 실행되지는 않습니다. 아래 승인 대기 카드에서 대표 승인 후 실행됩니다.</div>
+    </article>
+
+    <article class="card">
+      <div class="section-head"><h2>프로젝트 상태</h2><button class="refresh" type="button" onclick="refreshAll()">새로고침</button></div>
+      <div id="project-summary" class="stack"></div>
+    </article>
+  </section>
+
+  <section class="card" style="margin-bottom:18px">
+    <div class="section-head"><h2>현재 작업</h2><span class="sub" id="active-count"></span></div>
+    <div id="active-tasks" class="stack"></div>
+  </section>
+
+  <section class="card" style="margin-bottom:18px">
+    <div class="section-head"><h2>최근 결과</h2><span class="sub">Worker 결과와 QA 상태만 간단히 표시합니다.</span></div>
+    <div id="recent-results" class="stack"></div>
+  </section>
+
+  <section class="card">
+    <div class="section-head">
+      <div><h2>프로젝트 문서</h2><p class="sub" style="margin:4px 0 0">Agent가 만든 중요한 문서는 프로젝트 자산으로 축적됩니다.</p></div>
+      <button id="documents-toggle" class="btn" type="button">전체 보기</button>
+    </div>
+    <div id="documents" class="doc-grid"></div>
+  </section>
+</main>
+<div id="toast" role="status"></div>
+<script src="/static/war-room-simple.js"></script>
+</body>
+</html>

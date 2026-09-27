@@ -101,6 +101,25 @@ def _war_room_read_project(path: str) -> str | None:
     return None
 
 
+_WAR_ROOM_UI_PATHS = {
+    "/war-room", "/war-room/simple", "/war-room/advanced",
+    "/static/war-room.html", "/static/war-room-simple.html",
+}
+
+
+def _war_room_external_target(external_url: str, request_path: str, query: str) -> str:
+    base = external_url.rstrip("/")
+    if request_path in {"/war-room/simple", "/static/war-room-simple.html"}:
+        target = base + "/simple" if base.endswith("/war-room") else base + "/war-room/simple"
+    elif request_path == "/war-room/advanced":
+        target = base + "/advanced" if base.endswith("/war-room") else base + "/war-room/advanced"
+    else:
+        target = base
+    if query:
+        target += ("&" if "?" in target else "?") + query
+    return target
+
+
 @app.middleware("http")
 async def war_room_read_rbac(request: Request, call_next):
     """Require authenticated membership for every War Room GET route.
@@ -109,7 +128,7 @@ async def war_room_read_rbac(request: Request, call_next):
     functions remain usable by isolated unit tests without bypassing production
     route protection.
     """
-    if request.url.path in {"/war-room", "/static/war-room.html"}:
+    if request.url.path in _WAR_ROOM_UI_PATHS:
         proxy_secret = os.environ.get("PLACHEM_WAR_ROOM_REVERSE_PROXY_SECRET", "")
         proxy_principal = request.headers.get("X-Authenticated-Principal") or request.headers.get("X-Forwarded-User")
         presented_secret = request.headers.get("X-War-Room-Proxy-Secret")
@@ -121,13 +140,13 @@ async def war_room_read_rbac(request: Request, call_next):
         )
         external_url = os.environ.get("PLACHEM_WAR_ROOM_EXTERNAL_URL", "").strip()
         if not proxy_authenticated and external_url:
-            target = external_url
-            if request.url.query:
-                target += ("&" if "?" in target else "?") + request.url.query
-            return RedirectResponse(target, status_code=307)
+            return RedirectResponse(
+                _war_room_external_target(external_url, request.url.path, request.url.query),
+                status_code=307,
+            )
         response = await call_next(request)
         if (
-            request.url.path == "/war-room"
+            request.url.path in {"/war-room", "/war-room/simple", "/war-room/advanced"}
             and proxy_authenticated
             and os.environ.get("PLACHEM_WAR_ROOM_SESSION_SECRET")
         ):
@@ -2262,6 +2281,16 @@ def openclaw_control_page() -> FileResponse:
 
 @app.get("/war-room")
 def war_room_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "war-room.html")
+
+
+@app.get("/war-room/simple")
+def war_room_simple_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "war-room-simple.html")
+
+
+@app.get("/war-room/advanced")
+def war_room_advanced_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "war-room.html")
 
 
