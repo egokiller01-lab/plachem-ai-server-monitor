@@ -6,6 +6,7 @@ let currentProjects = [];
 let currentParticipants = [];
 let currentAgentCatalog = [];
 let currentTasks = [];
+let currentDocuments = [];
 let currentDeliveries = [];
 let currentProcessBoard = null;
 let currentReadiness = null;
@@ -98,6 +99,7 @@ function navigateScreen(name, {push = true} = {}) {
   if (name === "task") renderTaskDetail();
   if (name === "task") renderReview();
   if (name === "process-board") renderProcessBoard();
+  if (name === "documents") renderDocuments();
   if (push) updateLocation({push:true});
 }
 
@@ -418,6 +420,64 @@ function selectedTask(selectId) {
   return task;
 }
 
+
+function resetDocumentForm() {
+  document.getElementById("document-id").value = "";
+  document.getElementById("document-title").value = "";
+  document.getElementById("document-uri").value = "";
+  document.getElementById("document-summary").value = "";
+  document.getElementById("document-expected-version").value = "";
+  document.getElementById("document-category").value = "requirements";
+  document.getElementById("document-relation").value = "output";
+  document.getElementById("document-task").value = "";
+  document.getElementById("document-result").textContent = "";
+}
+
+function editDocumentVersion(documentId) {
+  const row = currentDocuments.find(item => item.id === documentId);
+  if (!row) return;
+  document.getElementById("document-id").value = row.id;
+  document.getElementById("document-title").value = row.title || "";
+  document.getElementById("document-category").value = row.category || "other";
+  document.getElementById("document-uri").value = row.uri || "";
+  document.getElementById("document-summary").value = row.summary || "";
+  document.getElementById("document-expected-version").value = row.current_version || "";
+  navigateScreen("documents");
+  document.getElementById("document-uri").focus();
+}
+
+async function showDocumentHistory(documentId) {
+  const target = document.getElementById("document-history");
+  target.innerHTML = '<div class="empty">버전 이력 불러오는 중…</div>';
+  try {
+    const data = await get(`/api/war-room/documents/${encodeURIComponent(documentId)}/versions`);
+    target.innerHTML = (data.items || []).map(row =>
+      `<div class="project"><strong>v${esc(row.version)} · ${esc(row.sha256?.slice(0,12) || "-")}</strong><div>${esc(row.uri)}</div><small>${esc(row.source_agent_id || "system")} · task ${esc(row.source_task_id || "project")} · session ${esc(row.source_session_id || "-")}</small><small>${esc(row.summary || "")}</small></div>`
+    ).join("") || '<div class="empty">버전 없음</div>';
+  } catch (error) { fail("document-history", error); }
+}
+
+function renderDocuments() {
+  const target = document.getElementById("documents");
+  if (!target) return;
+  const category = document.getElementById("document-category-filter")?.value || "";
+  const search = (document.getElementById("document-search-filter")?.value || "").trim().toLowerCase();
+  const visible = currentDocuments.filter(row => {
+    if (category && row.category !== category) return false;
+    if (!search) return true;
+    return [row.title, row.summary, row.uri, row.category].some(value => String(value || "").toLowerCase().includes(search));
+  });
+  document.getElementById("documents-count").textContent = `${currentDocuments.length} documents`;
+  target.innerHTML = visible.map(row =>
+    `<div class="project"><button class="project" onclick="showDocumentHistory('${esc(row.id)}')"><strong>${esc(row.title)}</strong><div>${esc(row.category)} · v${esc(row.current_version)} · ${esc(row.status)}</div><small>${esc(row.uri)}</small><small>작성 ${esc(row.source_agent_id || row.created_by || "system")} · task ${esc(row.source_task_id || "project")}</small></button><div class="filterbar"><button data-permission="manage" onclick="editDocumentVersion('${esc(row.id)}')">새 버전 등록</button></div></div>`
+  ).join("") || '<div class="empty">조건에 맞는 프로젝트 문서 없음</div>';
+  const taskOptions = '<option value="">Project 공용</option>' + currentTasks.map(task =>
+    `<option value="${esc(task.id)}">${esc(task.scope.slice(0,48))}</option>`
+  ).join("");
+  setSelectOptions("document-task", taskOptions, document.getElementById("document-task")?.value || "");
+  applyAccess();
+}
+
 function renderTasks() {
   if (pinnedTaskId !== null) {
     // A supplied task_id is an explicit safety boundary: never fall back to
@@ -664,16 +724,17 @@ async function load() {
   catch (error) { fail("audit-summary", error); return; }
   try {
     const base = `/api/war-room/projects/${encodeURIComponent(projectId)}`;
-    const [detail, participants, operations, baseline, tasks, audit, deliveries, candidates, processBoard, readiness] = await Promise.all([
+    const [detail, participants, operations, baseline, tasks, audit, deliveries, candidates, processBoard, readiness, documents] = await Promise.all([
       get(base), get(`${base}/participants`), get(`${base}/operations`),
       get(`${base}/manyfast-baseline`), get(`${base}/tasks`), get(`${base}/audit?limit=100`), get(`${base}/deliveries`), get(`${base}/agent-candidates`), get(`${base}/process-board`),
-      get(`${base}/readiness`).catch(() => ({mode:"unavailable"})),
+      get(`${base}/readiness`).catch(() => ({mode:"unavailable"})), get(`${base}/documents`),
     ]);
     if (generation !== loadGeneration || projectId !== selectedProjectId) return;
     currentProject = detail.project;
     currentParticipants = participants.items;
     currentAgentCatalog = candidates.items || [];
     currentTasks = tasks.items;
+    currentDocuments = documents.items || [];
     currentDeliveries = deliveries.items || [];
     currentProcessBoard = processBoard;
     currentReadiness = readiness;
@@ -687,7 +748,7 @@ async function load() {
     if (selectedTaskId && !currentTasks.some(task => task.id === selectedTaskId)) selectedTaskId = null;
     if (pinnedTaskId && currentTasks.some(task => task.id === pinnedTaskId)) selectedTaskId = pinnedTaskId;
     renderProjectDetail(); renderDashboard(currentProjects, operations);
-    renderTasks(); renderParticipants(); renderAgentControls(); renderAudit(audit.items); applyAccess();
+    renderTasks(); renderDocuments(); renderParticipants(); renderAgentControls(); renderAudit(audit.items); applyAccess();
     renderQuickDeliveries(currentDeliveries);
     document.getElementById("delivery-cards").innerHTML = currentDeliveries.map(row => `<div class="project"><strong>${esc(row.agent_id)} · ${statusChip(row.error_class === "system_error" ? "system_error" : row.status)}</strong><small>run ${esc(row.run_id || "-")} · source ${esc(row.message_id || "-")} · response ${esc(row.response_message_id || "-")}</small><small>retry ${row.retry_count || row.attempt_count || 0}/${row.max_attempts} · ${esc(row.error_code || "정상")}</small>${row.error_class === "system_error" && ["failed","timed_out"].includes(row.status) ? `<button data-permission="execute" onclick="retryDelivery('${esc(row.id)}')">수동 재전송</button>` : ""}</div>`).join("") || '<div class="empty">delivery 없음</div>';
     document.getElementById("stop-ack-delivery").innerHTML = '<option value="">현재 중지 cycle delivery 선택</option>' + currentDeliveries.filter(row => row.status === "stopped" && row.stop_cycle_at === deliveries.stop_requested_at).map(row => `<option value="${esc(row.id)}">${esc(row.agent_id)} · ${esc(row.id.slice(0,8))}</option>`).join("");
@@ -705,7 +766,7 @@ function showProjectForm() {
 function selectProject(id) {
   selectedProjectId = id;
   selectedTaskId = null; quickTaskId = null; pinnedTaskId = null;
-  currentProject = null; currentParticipants = []; currentTasks = []; currentReadiness = null;
+  currentProject = null; currentParticipants = []; currentTasks = []; currentDocuments = []; currentReadiness = null;
   updateLocation({push:true});
   load();
 }
@@ -1044,6 +1105,31 @@ async function quickProcessResults() {
   try { out.textContent = "시연 응답을 처리하고 있습니다…"; await processDemoQueue(); out.textContent = "응답 처리가 끝났습니다. 결과 상태를 확인하세요."; }
   catch (error) { out.textContent = `응답 처리 실패: ${error.message}`; }
 }
+
+document.getElementById("document-form")?.addEventListener("submit", async event => {
+  event.preventDefault();
+  const out = document.getElementById("document-result");
+  try {
+    const documentId = document.getElementById("document-id").value.trim();
+    const expectedRaw = document.getElementById("document-expected-version").value;
+    const taskId = document.getElementById("document-task").value;
+    const body = {
+      title: document.getElementById("document-title").value,
+      category: document.getElementById("document-category").value,
+      uri: document.getElementById("document-uri").value,
+      summary: document.getElementById("document-summary").value,
+      relation: document.getElementById("document-relation").value,
+    };
+    if (documentId) body.document_id = documentId;
+    if (expectedRaw !== "") body.expected_version = Number(expectedRaw);
+    if (taskId) body.task_id = taskId;
+    const result = await post(
+      `/api/war-room/projects/${encodeURIComponent(selectedProjectId)}/documents/register`, body
+    );
+    out.textContent = `등록 완료 · v${result.version} · ${result.changed ? "새 버전" : "동일 내용"}`;
+    await load();
+  } catch (error) { out.textContent = error.message; }
+});
 
 document.getElementById("project-form").addEventListener("submit", async event => {
   event.preventDefault(); const out = document.getElementById("project-result");

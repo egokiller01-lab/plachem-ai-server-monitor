@@ -19,6 +19,15 @@ from fastapi import APIRouter, Header, HTTPException, Request
 import war_room
 from war_room_agents import canonical_agent_id, load_agent_catalog
 from war_room_adapter import OpenClawSessionAdapter, TestSessionAdapter
+from war_room_documents import (
+    DocumentRegistrationError,
+    context_documents,
+    get_document as get_project_document,
+    list_project_documents,
+    list_versions as list_document_versions,
+    provision_document_schema,
+    register_document,
+)
 
 
 router = APIRouter(prefix="/api/war-room", tags=["war-room-actions"])
@@ -401,6 +410,7 @@ def provision_action_schema(path: str | None = None) -> str:
     target = path or str(war_room._db_path())
     with _transaction_connection(target) as con:
         con.executescript(SCHEMA)
+        provision_document_schema(con)
         participant_columns = {row[1] for row in con.execute("PRAGMA table_info(war_participants)")}
         if "active" not in participant_columns:
             con.execute("ALTER TABLE war_participants ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
@@ -1118,7 +1128,10 @@ def _grounded_instruction(instruction: str, packet: dict[str, Any], execution_mo
         )
     return "[STRUCTURED_RESULT]\nFINAL RESPONSE CONTRACT (highest priority): return only one JSON object with exactly: " + (
         '{"confirmed_worktree":"...","confirmed_revision":"...","verdict":"PASS|FAIL|REWORK",'
-        '"evidence":["/absolute/path"],"summary":"...","representative_completion_claimed":false}. '
+        '"evidence":["/absolute/path"],"summary":"...","representative_completion_claimed":false,'
+        '"documents":[{"title":"...","category":"requirements|architecture|decision|reference|report|handoff|other",'
+        '"path":"/absolute/path","action":"create|update","summary":"...","document_id":"optional",'
+        '"expected_version":1,"relation":"input|output|reference|decision|handoff"}]}. '
         "confirmed_worktree MUST exactly copy IMMUTABLE_GROUNDING_PACKET.worktree. "
         "confirmed_revision MUST exactly copy IMMUTABLE_GROUNDING_PACKET.revision; it is a War Room grounding revision, "
         "not a Git revision lookup. Never replace it with HEAD/commit hash unless the packet itself contains that hash. "
@@ -1177,6 +1190,23 @@ async def prepare_task(project_id: str, request: Request, x_war_room_actor: str 
         _require_execution_agents(con, project_id, agents)
         task_id, message_id, correlation = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
         packet = _grounding_packet(body, project_id, document_version)
+        grounding_input = body.get("grounding") if isinstance(body.get("grounding"), dict) else {}
+        required_document_ids_raw = grounding_input.get("required_document_ids") or []
+        if not isinstance(required_document_ids_raw, list) or any(
+            not isinstance(value, str) or not value.strip() for value in required_document_ids_raw
+        ):
+            raise HTTPException(422, "required_document_ids must be a list of document IDs")
+        required_document_ids = list(dict.fromkeys(value.strip() for value in required_document_ids_raw))
+        project_documents = context_documents(
+            con, project_id, required_ids=required_document_ids or None, limit=12
+        )
+        if required_document_ids:
+            found = {item["document_id"] for item in project_documents}
+            missing = [value for value in required_document_ids if value not in found]
+            if missing:
+                raise HTTPException(422, f"required project documents not found: {', '.join(missing)}")
+        packet["required_document_ids"] = required_document_ids
+        packet["project_documents"] = project_documents
         # Persist and display the validated original itself. The worker adds
         # the immutable result contract immediately before submission, so the
         # contract cannot consume the instruction's 4096-character budget.
@@ -1989,6 +2019,114 @@ async def supersede_task(
         _save_idem(con, actor, idempotency_key, idem_scope, body, result)
         con.commit()
         return result
+
+
+
+def _document_roots_for_registration(con: sqlite3.Connection, project_id: str, task_id: str | None) -> list[str]:
+    if task_id:
+        task = con.execute("SELECT project_id FROM war_tasks WHERE id=?", (task_id,)).fetchone()
+        if not task or str(task["project_id"]) != project_id:
+            raise HTTPException(422, "document task does not belong to project")
+        packet_row = con.execute("SELECT packet_json FROM war_grounding_packets WHERE task_id=?", (task_id,)).fetchone()
+        if packet_row:
+            try:
+                packet = json.loads(packet_row[0])
+            except (TypeError, ValueError):
+                packet = {}
+            roots = packet.get("approved_paths") or [packet.get("worktree")]
+            roots = [value for value in roots if isinstance(value, str) and value.startswith("/")]
+            if roots:
+                return roots
+    configured = os.environ.get("PLACHEM_WAR_ROOM_WORKTREE")
+    return [configured] if configured and configured.startswith("/") else [str(Path.cwd().resolve())]
+
+
+@router.get("/projects/{project_id}/documents")
+def list_documents(project_id: str, task_id: str | None = None, category: str | None = None) -> dict[str, Any]:
+    with _connect_ro() as con:
+        war_room._project_or_404(con, project_id)
+        try:
+            items = list_project_documents(con, project_id, task_id=task_id, category=category)
+        except DocumentRegistrationError as exc:
+            raise HTTPException(422, str(exc)) from exc
+    return {"mode": "readonly", "items": war_room._redact(items)}
+
+
+@router.get("/documents/{document_id}")
+def get_document_record(document_id: str) -> dict[str, Any]:
+    with _connect_ro() as con:
+        item = get_project_document(con, document_id)
+        if not item:
+            raise HTTPException(404, "Document not found")
+    return {"mode": "readonly", "document": war_room._redact(item)}
+
+
+@router.get("/documents/{document_id}/versions")
+def get_document_versions(document_id: str) -> dict[str, Any]:
+    with _connect_ro() as con:
+        if not get_project_document(con, document_id):
+            raise HTTPException(404, "Document not found")
+        items = list_document_versions(con, document_id)
+    return {"mode": "readonly", "items": war_room._redact(items)}
+
+
+@router.post("/projects/{project_id}/documents/register", status_code=201)
+async def register_project_document(
+    project_id: str,
+    request: Request,
+    x_war_room_actor: str | None = Header(default=None),
+    x_war_room_token: str | None = Header(default=None),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict[str, Any]:
+    body = await _body(request)
+    with _connect_rw() as con:
+        war_room._project_or_404(con, project_id)
+        actor = _actor(con, x_war_room_actor, "manage", project_id, x_war_room_token, request)
+        _require_mutable_project(con, project_id)
+        con.execute("BEGIN IMMEDIATE")
+        idem_scope = f"POST:/projects/{project_id}/documents/register"
+        previous = _idem(con, actor, idempotency_key, idem_scope, body)
+        if previous:
+            return previous
+        task_id = body.get("task_id")
+        if task_id is not None and (not isinstance(task_id, str) or not task_id.strip()):
+            raise HTTPException(422, "task_id must be a non-empty string")
+        expected_version = body.get("expected_version")
+        if expected_version is not None and (not isinstance(expected_version, int) or expected_version < 0):
+            raise HTTPException(422, "expected_version must be a non-negative integer")
+        try:
+            result = register_document(
+                con,
+                project_id=project_id,
+                title=body.get("title"),
+                uri=body.get("uri"),
+                approved_roots=_document_roots_for_registration(con, project_id, task_id),
+                created_by=actor,
+                category=body.get("category"),
+                summary=body.get("summary") or "",
+                source_task_id=task_id,
+                source_agent_id=actor,
+                source_session_id=None,
+                source_run_id=None,
+                document_id=body.get("document_id"),
+                expected_version=expected_version,
+                relation=body.get("relation"),
+            )
+        except DocumentRegistrationError as exc:
+            status_code = 409 if "version conflict" in str(exc) else 422
+            raise HTTPException(status_code, str(exc)) from exc
+        correlation = str(uuid.uuid4())
+        _audit(
+            con, project_id, actor,
+            "document_version_registered" if result["changed"] else "document_registration_noop",
+            "document", result["document_id"],
+            {"version": result["version"], "uri": result["uri"], "sha256": result["sha256"], "task_id": task_id},
+            correlation,
+        )
+        response = {"mode": "controlled", **result, "correlation_id": correlation}
+        _save_idem(con, actor, idempotency_key, idem_scope, body, response)
+        con.commit()
+        return response
 
 
 @router.get("/projects/{project_id}/tasks")

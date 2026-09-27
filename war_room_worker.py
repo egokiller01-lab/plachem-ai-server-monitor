@@ -19,6 +19,12 @@ from typing import Any
 
 import war_room
 from war_room_adapter import DeliveryReceipt, SessionAdapter
+from war_room_documents import (
+    DocumentRegistrationError,
+    document_candidate,
+    inferred_title,
+    register_document,
+)
 
 
 def _now() -> int:
@@ -51,10 +57,18 @@ def _connect(db_path: str | Path) -> sqlite3.Connection:
     return con
 
 
-def _audit(con: sqlite3.Connection, project_id: str, event: str, target_id: str, payload: dict[str, Any], correlation_id: str | None = None) -> None:
+def _audit(
+    con: sqlite3.Connection,
+    project_id: str,
+    event: str,
+    target_id: str,
+    payload: dict[str, Any],
+    correlation_id: str | None = None,
+    target_type: str = "delivery",
+) -> None:
     con.execute(
         "INSERT INTO war_audit_events VALUES (?,?,?,?,?,?,?,?,?)",
-        (str(uuid.uuid4()), project_id, "worker", event, "delivery", target_id,
+        (str(uuid.uuid4()), project_id, "worker", event, target_type, target_id,
          json.dumps(war_room._redact(payload), sort_keys=True), correlation_id or str(uuid.uuid4()), _now()),
     )
 
@@ -71,8 +85,11 @@ def _structured_result(con: sqlite3.Connection, message_id: str, agent_id: str, 
     except (ValueError, TypeError, IndexError):
         return None, "structured_response_invalid_json"
     required = {"confirmed_worktree","confirmed_revision","verdict","evidence","summary","representative_completion_claimed"}
-    if not isinstance(result, dict) or set(result) != required:
+    allowed = required | {"documents"}
+    if not isinstance(result, dict) or not required.issubset(result) or not set(result).issubset(allowed):
         return None, "structured_response_fields_mismatch"
+    if "documents" not in result:
+        result["documents"] = []
     packet = json.loads(con.execute("SELECT packet_json FROM war_grounding_packets WHERE task_id=?", (task["id"],)).fetchone()[0])
     expected_revision = packet["revision"]
     confirmed_revision = result["confirmed_revision"]
@@ -100,6 +117,26 @@ def _structured_result(con: sqlite3.Connection, message_id: str, agent_id: str, 
         return None, "structured_response_evidence_missing"
     if result["representative_completion_claimed"] is not False:
         return None, "representative_authority_exceeded"
+    documents = result.get("documents")
+    if not isinstance(documents, list):
+        return None, "structured_response_documents_invalid"
+    for item in documents:
+        if not isinstance(item, dict):
+            return None, "structured_response_documents_invalid"
+        required_document_fields = {"title", "category", "path", "action", "summary"}
+        allowed_document_fields = required_document_fields | {"document_id", "expected_version", "relation"}
+        if not required_document_fields.issubset(item) or not set(item).issubset(allowed_document_fields):
+            return None, "structured_response_documents_invalid"
+        if item.get("action") not in {"create", "update"}:
+            return None, "structured_response_documents_invalid"
+        if not isinstance(item.get("path"), str) or not item["path"].startswith("/"):
+            return None, "structured_response_documents_invalid"
+        if not all(isinstance(item.get(key), str) for key in ("title", "category", "summary")):
+            return None, "structured_response_documents_invalid"
+        if item.get("expected_version") is not None and (
+            not isinstance(item["expected_version"], int) or item["expected_version"] < 0
+        ):
+            return None, "structured_response_documents_invalid"
     return result, None
 
 
@@ -516,6 +553,117 @@ def _record_auto_qa_verdict(
     return verdict
 
 
+
+def _capture_project_documents(
+    con: sqlite3.Connection,
+    *,
+    task: sqlite3.Row,
+    delivery_row: sqlite3.Row,
+    structured_result: dict[str, Any] | None,
+    now: int,
+) -> None:
+    packet_row = con.execute(
+        "SELECT packet_json FROM war_grounding_packets WHERE task_id=?", (task["id"],)
+    ).fetchone()
+    if not packet_row:
+        return
+    try:
+        packet = json.loads(packet_row[0])
+    except (TypeError, ValueError):
+        return
+    roots = packet.get("approved_paths") or [packet.get("worktree")]
+    roots = [value for value in roots if isinstance(value, str) and value.startswith("/")]
+    if not roots:
+        return
+
+    current_delivery = con.execute(
+        "SELECT response_message_id,session_id,run_id FROM war_deliveries WHERE id=?",
+        (delivery_row["id"],),
+    ).fetchone()
+    session_id = current_delivery["session_id"] if current_delivery else delivery_row["session_id"]
+    run_id = current_delivery["run_id"] if current_delivery else delivery_row["run_id"]
+
+    declared: list[dict[str, Any]] = []
+    if structured_result and isinstance(structured_result.get("documents"), list):
+        declared.extend(structured_result["documents"])
+
+    # Fast Gateway keeps its existing strict result contract. Its newly produced
+    # document-like artifacts are projected into the Registry without changing
+    # the Core result schema.
+    if not declared and str(task["execution_mode"] or "") == "FAST_GATEWAY":
+        response_message_id = current_delivery["response_message_id"] if current_delivery else None
+        if response_message_id:
+            message = con.execute("SELECT body FROM war_messages WHERE id=?", (response_message_id,)).fetchone()
+            if message:
+                try:
+                    fast_value = json.loads(str(message["body"] or "").strip())
+                except (TypeError, ValueError):
+                    fast_value = {}
+                artifacts = fast_value.get("artifacts") if isinstance(fast_value, dict) else None
+                summary = fast_value.get("summary") if isinstance(fast_value, dict) else ""
+                if isinstance(artifacts, list):
+                    for artifact in artifacts:
+                        path = artifact.get("path") if isinstance(artifact, dict) else None
+                        if isinstance(path, str) and document_candidate(path):
+                            declared.append({
+                                "title": inferred_title(path),
+                                "category": "",
+                                "path": path,
+                                "action": "create",
+                                "summary": str(summary or "")[:4096],
+                                "relation": "output",
+                            })
+
+    seen_paths: set[str] = set()
+    for item in declared:
+        path = item.get("path")
+        if not isinstance(path, str) or path in seen_paths or not document_candidate(path):
+            continue
+        seen_paths.add(path)
+        try:
+            result = register_document(
+                con,
+                project_id=str(task["project_id"]),
+                title=str(item.get("title") or inferred_title(path)),
+                uri=path,
+                approved_roots=roots,
+                created_by=str(delivery_row["agent_id"]),
+                category=item.get("category") or None,
+                summary=str(item.get("summary") or "")[:4096],
+                source_task_id=str(task["id"]),
+                source_agent_id=str(delivery_row["agent_id"]),
+                source_session_id=session_id,
+                source_run_id=run_id,
+                document_id=item.get("document_id"),
+                expected_version=item.get("expected_version"),
+                relation=item.get("relation"),
+                now=now,
+            )
+        except DocumentRegistrationError as exc:
+            _audit(
+                con, str(task["project_id"]), "document_registration_rejected",
+                str(delivery_row["id"]),
+                {"task_id": task["id"], "path": path, "reason": str(exc)},
+                target_type="document",
+            )
+            continue
+        _audit(
+            con, str(task["project_id"]),
+            "document_version_registered" if result["changed"] else "document_registration_noop",
+            str(result["document_id"]),
+            {
+                "task_id": task["id"],
+                "version": result["version"],
+                "uri": result["uri"],
+                "sha256": result["sha256"],
+                "agent_id": delivery_row["agent_id"],
+                "session_id": session_id,
+                "run_id": run_id,
+            },
+            target_type="document",
+        )
+
+
 def _after_responded_delivery(
     con: sqlite3.Connection,
     *,
@@ -544,6 +692,9 @@ def _after_responded_delivery(
                 result=structured_result, now=now,
             )
         return
+    _capture_project_documents(
+        con, task=task, delivery_row=row, structured_result=structured_result, now=now
+    )
     worker_pending = con.execute(
         """SELECT COUNT(*)
            FROM war_deliveries d

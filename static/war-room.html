@@ -105,6 +105,7 @@
       <nav class="nav" aria-label="War Room 화면">
         <button type="button" data-screen="dashboard" aria-current="page" onclick="navigateScreen('dashboard')">프로젝트 목록</button>
         <button type="button" data-screen="project" onclick="navigateScreen('project')">공동 작전실</button>
+        <button type="button" data-screen="documents" onclick="navigateScreen('documents')">프로젝트 문서</button>
         <button type="button" data-screen="process-board" onclick="navigateScreen('process-board' )">Process Board</button>
         <button type="button" data-screen="task" onclick="navigateScreen('task')">작업 상세</button>
       </nav>
@@ -127,6 +128,45 @@
         <form id="task-form" class="card" data-permission="manage"><strong>새 작업 준비</strong><div class="muted">원문·범위는 한 번 저장되며 준비 단계에서는 호출하지 않습니다.</div><textarea id="task-scope" required maxlength="4096" placeholder="지시 원문과 승인 범위" aria-label="지시 원문과 작업 범위" style="width:100%;margin:8px 0"></textarea><div class="filterbar"><select id="task-assignee" required aria-label="담당 에이전트"></select><select id="task-reviewer" required aria-label="독립 검수자"></select><input id="task-call-limit" type="number" min="1" max="100" value="1" required aria-label="호출 한도"><input id="task-turn-limit" type="number" min="1" max="1000" value="1" required aria-label="턴 한도"><input id="task-deadline" type="number" min="60" value="600" required aria-label="마감 초"><input id="task-document-version" required maxlength="128" placeholder="참고 버전" aria-label="참고 버전"></div><fieldset id="task-agent-targets" aria-label="수행 에이전트"><span class="muted">후보 불러오는 중…</span></fieldset><button type="submit" class="primary">승인 요청 준비</button><span id="task-result" class="muted" role="status"></span></form>
         <div class="filterbar"><label for="task-status-filter">상태</label><select id="task-status-filter" onchange="renderTasks()"><option value="">전체</option><option>draft</option><option>awaiting_approval</option><option>approved</option><option>running</option><option>qa</option><option>completed</option><option>rework_required</option><option>stopped</option><option>stop_unconfirmed</option></select><input id="task-search-filter" oninput="renderTasks()" placeholder="작업 ID·내용·담당자 검색" aria-label="작업 검색"><button type="button" onclick="clearTaskFilters()">필터 초기화</button></div><div id="tasks" class="stack"><div class="empty">작업 없음</div></div>
         <details class="card" style="margin-top:14px"><summary><strong>참여자·참고 자료·설정</strong></summary><form id="participant-form" data-permission="manage" class="filterbar"><select id="participant-principal" aria-label="등록된 Agent"></select><select id="participant-role" onchange="syncParticipantFlags()" aria-label="역할"><option>developer</option><option>qa</option><option>observer</option><option>project_manager</option></select><label class="check"><input id="participant-read" type="checkbox" checked>읽기</label><label class="check"><input id="participant-comment" type="checkbox" checked>댓글</label><label class="check"><input id="participant-approve" type="checkbox">승인</label><label class="check"><input id="participant-execute" type="checkbox">실행</label><button>참여자 추가</button></form><div id="agent-candidate-note" class="muted"></div><div id="participant-list" class="stack muted">참여자 불러오는 중…</div></details>
+      </section>
+
+
+      <section id="screen-documents" class="screen" hidden aria-labelledby="documents-screen-title">
+        <div class="toolbar">
+          <div><h2 id="documents-screen-title">Project Documents</h2><p class="screen-note">문서는 Project가 소유하며 Agent·Session·Task는 작성 이력으로만 연결됩니다.</p></div>
+          <span id="documents-count" class="muted"></span>
+        </div>
+        <form id="document-form" class="card" data-permission="manage">
+          <strong>문서 등록 / 새 버전 등록</strong>
+          <input id="document-id" type="hidden">
+          <div class="filterbar">
+            <input id="document-title" required maxlength="300" placeholder="문서 제목" aria-label="문서 제목">
+            <select id="document-category" aria-label="문서 분류">
+              <option value="requirements">Requirements</option><option value="architecture">Architecture</option>
+              <option value="decision">Decision</option><option value="reference">Reference</option>
+              <option value="report">Report</option><option value="handoff">Handoff</option><option value="other">Other</option>
+            </select>
+            <select id="document-task" aria-label="연결 Task"><option value="">Project 공용</option></select>
+            <select id="document-relation" aria-label="Task 관계">
+              <option value="output">Output</option><option value="input">Input</option><option value="reference">Reference</option>
+              <option value="decision">Decision</option><option value="handoff">Handoff</option>
+            </select>
+          </div>
+          <input id="document-uri" required placeholder="/absolute/server/path/document.md" aria-label="서버 문서 경로" style="width:100%;margin:8px 0">
+          <textarea id="document-summary" maxlength="4096" placeholder="문서 요약" aria-label="문서 요약" style="width:100%;margin:8px 0"></textarea>
+          <div class="filterbar">
+            <input id="document-expected-version" type="number" min="0" placeholder="기대 버전(신규는 비움)" aria-label="기대 버전">
+            <button class="primary" type="submit">Registry 등록</button>
+            <button type="button" onclick="resetDocumentForm()">신규 문서로 초기화</button>
+          </div>
+          <small id="document-result" class="muted" role="status"></small>
+        </form>
+        <div class="filterbar">
+          <select id="document-category-filter" onchange="renderDocuments()"><option value="">전체 분류</option><option>requirements</option><option>architecture</option><option>decision</option><option>reference</option><option>report</option><option>handoff</option><option>other</option></select>
+          <input id="document-search-filter" oninput="renderDocuments()" placeholder="제목·요약·경로 검색" aria-label="문서 검색">
+        </div>
+        <div id="documents" class="stack"><div class="empty">문서 없음</div></div>
+        <section class="card" style="margin-top:14px"><h3>문서 버전 이력</h3><div id="document-history" class="stack"><div class="empty">문서를 선택하세요.</div></div></section>
       </section>
 
       <section id="screen-process-board" class="screen" hidden aria-labelledby="process-board-title">

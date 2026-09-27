@@ -156,6 +156,9 @@ async def war_room_read_rbac(request: Request, call_next):
                     elif "messages" in ref:
                         message_id = ref[ref.index("messages") + 1]
                         allowed = con.execute("SELECT 1 FROM war_participants p JOIN war_messages m ON m.project_id=p.project_id WHERE m.id=? AND p.principal_id=? AND p.can_read=1 AND p.active=1", (message_id, principal)).fetchone()
+                    elif "documents" in ref:
+                        document_id = ref[ref.index("documents") + 1]
+                        allowed = con.execute("SELECT 1 FROM war_participants p JOIN war_documents d ON d.project_id=p.project_id WHERE d.id=? AND p.principal_id=? AND p.can_read=1 AND p.active=1", (document_id, principal)).fetchone()
                 if not allowed:
                     return JSONResponse({"detail": "War Room permission denied"}, status_code=403)
         except sqlite3.Error:

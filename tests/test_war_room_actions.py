@@ -1298,7 +1298,7 @@ class WarRoomControlledApiTests(unittest.TestCase):
             self.assertIn(f'id="{stable_id}"', html)
         self.assertIn("retryDemoDelivery", javascript)
         self.assertIn("processDemoQueue", javascript)
-        self.assertEqual(4, html.count('data-screen='))
+        self.assertEqual(5, html.count('data-screen='))
         self.assertIn('data-screen="process-board"', html)
         self.assertIn('execution_mode: "FAST_GATEWAY"', javascript)
         self.assertIn("reviewer_agent_id", javascript)
