@@ -22,6 +22,7 @@ Add a representative-facing Simple Mode without removing or rewriting the existi
 - One-click Advanced Mode link
 - Current-task view limited to tasks updated within 72 hours or backed by a live delivery
 - Older unfinished lifecycle records are summarized as hidden historical cleanup items instead of presented as current work
+- Recent Results is limited to the latest 7 days; older historical results remain available in Advanced Mode
 
 Hidden from the Simple UI:
 

@@ -287,7 +287,9 @@ function parseResult(output) {
   return trim(text, 260);
 }
 function renderRecentResults() {
+  const resultCutoff = Date.now() / 1000 - (7 * 24 * 60 * 60);
   const items = board
+    .filter(row => Number(row.updated_at || 0) >= resultCutoff)
     .filter(row => row.output || ["PASS","FAIL","REWORK","DONE","BLOCKED"].includes(row.mapped_state))
     .sort((a,b) => Number(b.updated_at||0)-Number(a.updated_at||0))
     .slice(0,5);
@@ -297,7 +299,7 @@ function renderRecentResults() {
     const summary = parseResult(row.output) || "결과 요약이 아직 없습니다.";
     const complete = task?.status === "qa" && task?.latest_qa_verdict?.verdict === "PASS" && Number(task?.evidence_count||0)>0;
     return `<div class="task"><div class="task-top"><div><div class="task-title">${esc(trim(row.input || task?.scope || "작업",170))}</div><div class="task-meta">${esc(row.assigned_agent || task?.assignee_agent_id || "-")} · ${fmtTime(row.updated_at)}</div></div><span class="status ${mapped[1]}">${esc(mapped[0])}</span></div><div class="result-summary">${esc(summary)}</div><div class="task-actions">${complete ? `<button class="btn primary" onclick="completeTask('${esc(row.task_id)}')" ${representative() ? "" : "disabled"}>최종 승인</button>` : ""}<a class="btn" href="/war-room/advanced?project_id=${encodeURIComponent(selectedProjectId)}&task_id=${encodeURIComponent(row.task_id)}&screen=task">결과 상세</a></div></div>`;
-  }).join("") : '<div class="empty">표시할 최근 결과가 없습니다.</div>';
+  }).join("") : '<div class="empty">최근 7일 결과가 없습니다. 이전 결과는 고급 관리에서 확인할 수 있습니다.</div>';
 }
 
 function renderDocuments() {
