@@ -722,6 +722,31 @@ class WarRoomControlledApiTests(unittest.TestCase):
         self.assertEqual(200, archived.status_code, archived.text)
         self.assertEqual(archived.json(), self.client.post(f"/api/war-room/projects/{project_id}/archive", json={}, headers=archive_headers).json())
 
+    def test_direct_war_room_entry_redirects_to_authenticated_external_url(self) -> None:
+        external = "https://openclaw.example.ts.net:10000/war-room"
+        with mock.patch.dict(os.environ, {"PLACHEM_WAR_ROOM_EXTERNAL_URL": external}, clear=False):
+            direct = self.client.get("/war-room?screen=documents", follow_redirects=False)
+            self.assertEqual(307, direct.status_code)
+            self.assertEqual(external + "?screen=documents", direct.headers["location"])
+            static_direct = self.client.get("/static/war-room.html", follow_redirects=False)
+            self.assertEqual(307, static_direct.status_code)
+            self.assertEqual(external, static_direct.headers["location"])
+
+            os.environ["PLACHEM_WAR_ROOM_SESSION_SECRET"] = "fixture-session-secret"
+            os.environ["PLACHEM_WAR_ROOM_REVERSE_PROXY_SECRET"] = "fixture-proxy-secret"
+            proxied = self.client.get(
+                "/war-room",
+                headers={
+                    "X-Authenticated-Principal": "main",
+                    "X-War-Room-Proxy-Secret": "fixture-proxy-secret",
+                    "X-Forwarded-Proto": "https",
+                },
+                follow_redirects=False,
+            )
+            self.assertEqual(200, proxied.status_code)
+            self.assertIn("war_room_session=", proxied.headers.get("set-cookie", ""))
+            self.assertIn("Secure", proxied.headers.get("set-cookie", ""))
+
     def test_reverse_proxy_session_cookie_drives_headerless_ui_api(self) -> None:
         os.environ["PLACHEM_WAR_ROOM_SESSION_SECRET"] = "fixture-session-secret"
         os.environ["PLACHEM_WAR_ROOM_REVERSE_PROXY_SECRET"] = "fixture-proxy-secret"

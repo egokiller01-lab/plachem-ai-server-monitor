@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 
 import psutil
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 import war_room
@@ -109,22 +109,33 @@ async def war_room_read_rbac(request: Request, call_next):
     functions remain usable by isolated unit tests without bypassing production
     route protection.
     """
-    if request.url.path == "/war-room":
-        response = await call_next(request)
+    if request.url.path in {"/war-room", "/static/war-room.html"}:
         proxy_secret = os.environ.get("PLACHEM_WAR_ROOM_REVERSE_PROXY_SECRET", "")
         proxy_principal = request.headers.get("X-Authenticated-Principal") or request.headers.get("X-Forwarded-User")
         presented_secret = request.headers.get("X-War-Room-Proxy-Secret")
-        if (
+        proxy_authenticated = bool(
             proxy_secret
             and proxy_principal
             and hmac.compare_digest(proxy_secret, presented_secret or "")
             and (war_room._known_principal(proxy_principal) or war_room._resolve_trusted_principal(proxy_principal))
+        )
+        external_url = os.environ.get("PLACHEM_WAR_ROOM_EXTERNAL_URL", "").strip()
+        if not proxy_authenticated and external_url:
+            target = external_url
+            if request.url.query:
+                target += ("&" if "?" in target else "?") + request.url.query
+            return RedirectResponse(target, status_code=307)
+        response = await call_next(request)
+        if (
+            request.url.path == "/war-room"
+            and proxy_authenticated
             and os.environ.get("PLACHEM_WAR_ROOM_SESSION_SECRET")
         ):
             session_secret = os.environ["PLACHEM_WAR_ROOM_SESSION_SECRET"]
             mapped = war_room._resolve_trusted_principal(proxy_principal) or proxy_principal
             signature = hmac.new(session_secret.encode(), mapped.encode(), hashlib.sha256).hexdigest()
-            response.set_cookie("war_room_session", f"{mapped}.{signature}", httponly=True, samesite="lax", secure=request.url.scheme == "https", path="/")
+            secure_cookie = request.url.scheme == "https" or request.headers.get("X-Forwarded-Proto", "").lower() == "https"
+            response.set_cookie("war_room_session", f"{mapped}.{signature}", httponly=True, samesite="lax", secure=secure_cookie, path="/")
         return response
     if request.url.path.startswith("/api/war-room"):
         principal = _war_room_principal(request)
