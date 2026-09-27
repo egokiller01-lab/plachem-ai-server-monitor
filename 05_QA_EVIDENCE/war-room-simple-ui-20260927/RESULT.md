@@ -20,6 +20,8 @@ Add a representative-facing Simple Mode without removing or rewriting the existi
 - Representative final approval
 - Project documents
 - One-click Advanced Mode link
+- Current-task view limited to tasks updated within 72 hours or backed by a live delivery
+- Older unfinished lifecycle records are summarized as hidden historical cleanup items instead of presented as current work
 
 Hidden from the Simple UI:
 

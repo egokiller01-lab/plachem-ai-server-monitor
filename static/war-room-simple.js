@@ -6,6 +6,7 @@ let board = [];
 let documents = [];
 let candidates = [];
 let baseline = null;
+let deliveries = [];
 let selectedProjectId = null;
 let showAllDocuments = false;
 let busy = false;
@@ -113,9 +114,10 @@ async function loadProject(projectId) {
   const current = ++generation;
   const base = `/api/war-room/projects/${encodeURIComponent(projectId)}`;
   try {
-    const [detail, accessData, taskData, candidateData, boardData, documentData, baselineData] = await Promise.all([
+    const [detail, accessData, taskData, candidateData, boardData, documentData, baselineData, deliveryData] = await Promise.all([
       get(base), get(`${base}/access`), get(`${base}/tasks`), get(`${base}/agent-candidates`),
       get(`${base}/process-board`), get(`${base}/documents`), get(`${base}/manyfast-baseline`),
+      get(`${base}/deliveries`),
     ]);
     if (current !== generation || projectId !== selectedProjectId) return;
     project = detail.project;
@@ -125,6 +127,7 @@ async function loadProject(projectId) {
     board = boardData.items || [];
     documents = documentData.items || [];
     baseline = baselineData;
+    deliveries = deliveryData.items || [];
     render();
   } catch (error) {
     toast(`프로젝트 조회 실패: ${error.message}`, "bad");
@@ -141,12 +144,31 @@ function render() {
   renderDocuments();
 }
 
+const OPEN_TASK_STATUSES = new Set(["awaiting_approval","approved","running","qa","rework_required","stopped","stop_unconfirmed"]);
+const CURRENT_WINDOW_SECONDS = 72 * 60 * 60;
+
+function hasLiveDelivery(taskId) {
+  return deliveries.some(row => row.task_id === taskId && ["queued","sent","received"].includes(row.status));
+}
+function isCurrentTask(task) {
+  if (hasLiveDelivery(task.id)) return true;
+  const updated = Number(task.updated_at || 0);
+  return updated > 0 && (Date.now() / 1000 - updated) <= CURRENT_WINDOW_SECONDS;
+}
+function openTasks() {
+  return tasks.filter(task => OPEN_TASK_STATUSES.has(task.status) || task.state === "system_error");
+}
+function currentOpenTasks() {
+  return openTasks().filter(isCurrentTask);
+}
 function taskCounts() {
-  const running = tasks.filter(t => t.status === "running").length;
-  const approval = tasks.filter(t => ["awaiting_approval","approved"].includes(t.status)).length;
-  const issues = tasks.filter(t => t.state === "system_error" || ["rework_required","stop_unconfirmed"].includes(t.status)).length;
-  const qa = tasks.filter(t => t.status === "qa").length;
-  return {running, approval, issues, qa};
+  const current = currentOpenTasks();
+  const running = current.filter(t => t.status === "running").length;
+  const approval = current.filter(t => ["awaiting_approval","approved"].includes(t.status)).length;
+  const issues = current.filter(t => t.state === "system_error" || ["rework_required","stop_unconfirmed"].includes(t.status)).length;
+  const qa = current.filter(t => t.status === "qa").length;
+  const stale = Math.max(0, openTasks().length - current.length);
+  return {running, approval, issues, qa, stale};
 }
 
 function renderHeader() {
@@ -214,6 +236,7 @@ function renderProjectSummary() {
   if (counts.approval) notices.push(['warn',`대표 승인 대기 작업이 ${counts.approval}건 있습니다.`]);
   if (counts.issues) notices.push(['bad',`재작업 또는 오류 확인이 필요한 작업이 ${counts.issues}건 있습니다.`]);
   if (counts.qa) notices.push(['',`검수 중인 작업이 ${counts.qa}건 있습니다.`]);
+  if (counts.stale) notices.push(['',`72시간 이상 갱신되지 않은 미정리 작업 ${counts.stale}건은 Simple 화면에서 숨겼습니다. 필요하면 고급 관리에서 확인할 수 있습니다.`]);
   if (!counts.running && !counts.approval && !counts.issues && !counts.qa) notices.push(['good',"현재 즉시 확인이 필요한 작업이 없습니다."]);
   $("project-summary").innerHTML = notices.map(([tone,text]) => `<div class="notice ${tone}">${esc(text)}</div>`).join("");
 }
@@ -246,8 +269,7 @@ function taskCard(task) {
 }
 
 function renderActiveTasks() {
-  const active = tasks
-    .filter(task => ["awaiting_approval","approved","running","qa","rework_required","stopped","stop_unconfirmed"].includes(task.status) || task.state === "system_error")
+  const active = currentOpenTasks()
     .sort((a,b) => Number(b.updated_at||0)-Number(a.updated_at||0))
     .slice(0,8);
   $("active-count").textContent = active.length ? `최근 ${active.length}건` : "";
