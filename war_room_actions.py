@@ -538,6 +538,8 @@ def provision_action_schema(path: str | None = None) -> str:
         con.execute("INSERT OR IGNORE INTO war_task_agents(task_id,agent_id) SELECT id,assignee_agent_id FROM war_tasks WHERE assignee_agent_id IS NOT NULL")
         con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_war_participants_project_principal ON war_participants(project_id,principal_id)")
         con.execute("INSERT OR IGNORE INTO war_project_control(project_id,updated_at) SELECT id, strftime('%s','now') FROM war_projects")
+        from war_room_stage_recovery import ensure_schema
+        ensure_schema(con)
     return target
 
 
@@ -732,6 +734,7 @@ _FRESH_CONTEXT_ACTIONS = {
     "project_stop": "project",
     "project_resume": "project",
     "task_stop": "task",
+    "task_resume_qa": "task",
     "task_approve_execute": "task",
     "task_supersede": "task",
     "representative_completion": "task",
@@ -1790,6 +1793,9 @@ def _representative_completion_checks(con: sqlite3.Connection, task: sqlite3.Row
         evidence_error = _qa_evidence_validation(con, task, packet)
         if evidence_error:
             missing.append(evidence_error)
+    from war_room_stage_recovery import issues
+    if issues(con, task["id"], int(task["revision"])):
+        missing.append("PROCESSING_UNRESOLVED")
     return {"binding": binding, "missing": missing}
 
 
@@ -2155,11 +2161,12 @@ def list_tasks(project_id: str, status: str | None = None, assignee_agent_id: st
             WHERE t.project_id=? ORDER BY t.updated_at DESC""", (project_id,)).fetchall()
         agents={row["id"]:[item[0] for item in con.execute("SELECT agent_id FROM war_task_agents WHERE task_id=? ORDER BY agent_id",(row["id"],)).fetchall()] for row in rows}
         from war_room_task_contract import public_contract
+        from war_room_stage_recovery import issues
         reviews = {}
         for row in rows:
             evidence_count = con.execute("SELECT COUNT(*) FROM war_evidence WHERE task_id=?", (row["id"],)).fetchone()[0]
             verdict = con.execute("SELECT verdict,qa_principal,created_at FROM war_qa_verdicts WHERE task_id=? ORDER BY created_at DESC,id DESC LIMIT 1", (row["id"],)).fetchone()
-            reviews[row["id"]] = {"evidence_count": evidence_count, "latest_qa_verdict": dict(verdict) if verdict else None, "execution_contract": public_contract(con, row["id"])}
+            reviews[row["id"]] = {"evidence_count": evidence_count, "latest_qa_verdict": dict(verdict) if verdict else None, "execution_contract": public_contract(con, row["id"]), "processing_issues": issues(con, row["id"], row["revision"])}
         delivery_map = {row["id"]: con.execute("SELECT status,error_class,retry_count,attempt_count,max_attempts FROM war_deliveries WHERE message_id=?", (row["source_message_id"],)).fetchall() if row["source_message_id"] else [] for row in rows}
     items = []
     for row in rows:
@@ -2206,9 +2213,12 @@ def get_task(task_id: str) -> dict[str, Any]:
         ).fetchall() if row["source_message_id"] else []
         from war_room_task_contract import public_contract
         execution_contract = public_contract(con, task_id)
+        from war_room_stage_recovery import issues
+        processing_issues = issues(con, task_id, row["revision"])
     item = {
         **dict(row),
         "execution_contract": execution_contract,
+        "processing_issues": processing_issues,
         "agent_ids": agent_ids,
         "evidence_count": evidence_count,
         "latest_qa_verdict": dict(verdict) if verdict else None,
@@ -2906,8 +2916,8 @@ async def stop_project(project_id: str, request: Request, x_war_room_actor: str 
         ).fetchall()
         stop_results: list[dict[str, str]] = []
         for delivery in active:
-            active_adapter = _adapter_for_mode(delivery["execution_mode"], str(war_room._db_path()))
-            receipt = active_adapter.stop(delivery_id=delivery["id"], agent_id=delivery["agent_id"])
+            from war_room_worker import stop_bound_delivery
+            active_adapter, receipt = stop_bound_delivery(con, delivery, adapter=_adapter(), adapter_selector=_adapter_for_mode)
             if delivery["execution_mode"] == "FAST_GATEWAY":
                 snapshotter = getattr(active_adapter, "execution_snapshot", None)
                 if snapshotter:
@@ -2976,8 +2986,8 @@ async def stop_task(task_id: str, request: Request, x_war_room_actor: str | None
             for delivery_id in queued_ids
         ]
         for delivery in active:
-            active_adapter = _adapter_for_mode(delivery["execution_mode"], str(war_room._db_path()))
-            receipt = active_adapter.stop(delivery_id=delivery["id"], agent_id=delivery["agent_id"])
+            from war_room_worker import stop_bound_delivery
+            active_adapter, receipt = stop_bound_delivery(con, delivery, adapter=_adapter(), adapter_selector=_adapter_for_mode)
             status = receipt.status if receipt.status in {"stopped", "failed", "timed_out"} else "failed"
             con.execute(
                 "UPDATE war_deliveries SET status=?,error_code=?,stop_cycle_at=? WHERE id=? AND status IN ('sent','received')",
@@ -3194,6 +3204,42 @@ async def qa_verdict(task_id: str, request: Request, x_war_room_actor: str | Non
             con.execute("UPDATE war_tasks SET status=?,revision=revision+1,updated_at=? WHERE id=?", (status, now, task_id))
             _audit(con, task["project_id"], actor, "qa_verdict_rework_required", "task", task_id, {"verdict_id":vid,"verdict":verdict,"from":"qa","to":status}, correlation)
         result = {"mode":"controlled","verdict_id":vid,"verdict":verdict,"status":status}
+        _save_idem(con, actor, idempotency_key, idem_scope, body, result)
+        con.commit()
+        return result
+
+
+@router.post("/tasks/{task_id}/resume-qa")
+async def resume_task_qa(task_id: str, request: Request,
+                         x_war_room_actor: str | None = Header(default=None),
+                         x_war_room_token: str | None = Header(default=None),
+                         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
+    """Resume QA only; neither worker execution nor final approval is performed."""
+    body = await _body(request)
+    with _connect_rw() as con:
+        con.execute("BEGIN IMMEDIATE")
+        task = con.execute("SELECT * FROM war_tasks WHERE id=?", (task_id,)).fetchone()
+        if not task:
+            raise HTTPException(404, "Task not found")
+        _validate_mutation_contract(body, task)
+        actor = _actor(con, x_war_room_actor, "execute", task['project_id'], x_war_room_token, request)
+        _require_representative(actor)
+        _require_mutable_project(con, task['project_id'])
+        _require_not_stopped(con, task['project_id'])
+        idem_scope = f"POST:/tasks/{task_id}/resume-qa"
+        previous = _idem(con, actor, idempotency_key, idem_scope, body)
+        if previous:
+            return previous
+        _require_fresh_context(con, body, actor=actor, project_id=task['project_id'],
+                              action="task_resume_qa", target_id=task_id)
+        from war_room_stage_recovery import resume_qa
+        try:
+            result = resume_qa(con, task, adapter=_adapter(), now=_now())
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        result.update(task_id=task_id, task_revision=task['revision'])
+        _audit(con, task['project_id'], actor, 'qa_only_resume_requested', 'task', task_id,
+               result, str(uuid.uuid4()))
         _save_idem(con, actor, idempotency_key, idem_scope, body, result)
         con.commit()
         return result

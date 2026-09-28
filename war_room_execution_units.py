@@ -148,7 +148,7 @@ class ExecutionUnitStore:
                 "created_at": now,
             }
 
-    def create_units(self, units: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def create_units(self, units: list[dict[str, Any]], *, reject_existing_workflow: bool = False) -> list[dict[str, Any]]:
         """Create multiple execution units atomically.
 
         Raises:
@@ -157,6 +157,12 @@ class ExecutionUnitStore:
         if not units:
             return []
         with self._lock, self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            if reject_existing_workflow:
+                groups = {(u["war_project_id"], u["war_task_id"]) for u in units}
+                for project_id, task_id in groups:
+                    if con.execute("SELECT 1 FROM war_execution_units WHERE war_project_id=? AND war_task_id=?", (project_id, task_id)).fetchone():
+                        raise ValueError(f"DUPLICATE_COMPILE:{project_id}/{task_id}")
             try:
                 for unit in units:
                     deps_json = json.dumps(unit.get("depends_on_execution_ids") or [], ensure_ascii=False)

@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import os
 import threading
+import logging
+from concurrent.futures import ThreadPoolExecutor
+
+_LOG = logging.getLogger(__name__)
 from pathlib import Path
 from typing import Any
 
@@ -90,6 +94,8 @@ class PersistentExecutionHarness:
         self._controllers: dict[str, ActiveRunController] = {}
         self._observers: set[threading.Thread] = set()
         self._closed = False
+        self._watchdog_jobs: set[str] = set()
+        self._watchdog_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="gateway-judgment")
         self._cancel_intents: set[str] = set()
         self._lock = threading.RLock()
         self._terminal_completion_subscriber: Any | None = None
@@ -188,7 +194,10 @@ class PersistentExecutionHarness:
                             timeout_seconds=min(controller.timeout_seconds, 1.0),
                         )
                     except Exception:
-                        return
+                        _LOG.exception("Result observer error for %s; retrying observation only", controller.core_run_id)
+                        if controller.stop_event.wait(2.0):
+                            return
+                        continue
                     if str(record.get("status") or "") in _TERMINAL_STATUSES:
                         with self._lock:
                             self._record(record)
@@ -197,9 +206,7 @@ class PersistentExecutionHarness:
                             try:
                                 subscriber(record)
                             except Exception:
-                                # Completion observation must not kill the
-                                # lifecycle observer or alter Core truth.
-                                pass
+                                _LOG.exception("Completion continuation failed for %s", controller.core_run_id)
                         return
                     self._record(record)
                     controller.stop_event.wait(0.01)
@@ -215,6 +222,21 @@ class PersistentExecutionHarness:
         )
         self._observers.add(controller.observer)
         controller.observer.start()
+
+    def _schedule_watchdog(self, core_run_id: str, watchdog: Any) -> None:
+        if self._closed or core_run_id in self._watchdog_jobs:
+            return
+        self._watchdog_jobs.add(core_run_id)
+        def assess() -> None:
+            try:
+                if not self._closed:
+                    watchdog.observe(core_run_id)
+            except Exception:
+                _LOG.exception("JEV observation failed for %s", core_run_id)
+            finally:
+                with self._lock:
+                    self._watchdog_jobs.discard(core_run_id)
+        self._watchdog_pool.submit(assess)
 
     def _record(self, record: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
@@ -241,11 +263,7 @@ class PersistentExecutionHarness:
                 self._start_observer(controller)
                 watchdog = self._session_watchdog
                 if watchdog is not None:
-                    try:
-                        watchdog.observe(core_run_id)
-                    except Exception:
-                        # Advisory observation cannot alter lifecycle truth.
-                        pass
+                    self._schedule_watchdog(core_run_id, watchdog)
         return record
 
     def dispatch(self, **kwargs: Any) -> dict[str, Any]:
@@ -293,6 +311,7 @@ class PersistentExecutionHarness:
         close = getattr(self.core_engine.adapter, "close", None)
         if callable(close):
             close()
+        self._watchdog_pool.shutdown(wait=True, cancel_futures=True)
         for observer in observers:
             if observer is not threading.current_thread():
                 observer.join(timeout=5.0)

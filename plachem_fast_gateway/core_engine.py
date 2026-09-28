@@ -854,6 +854,7 @@ class CoreEngine:
         self.grant_authorizer = grant_authorizer
         self._lock = threading.RLock()
         self._deadline_timers: dict[str, threading.Timer] = {}
+        self._wait_locks: dict[str, threading.Lock] = {}
         self._terminal_transition_guard: Callable[[str], bool] | None = None
         set_output_observer = getattr(self.adapter, "set_output_observer", None)
         if callable(set_output_observer):
@@ -959,6 +960,8 @@ class CoreEngine:
             contract = normalize_goal_contract(goal_contract)
             # Agent model metadata is descriptive routing data only.  Gateway
             # lifecycle policy is deliberately a single neutral profile.
+            if actual_id.startswith(("war-", "core-exec-")) and self.grant_authorizer is not None and self.grant_authorizer.owns_run(actual_id):
+                task_runtime_class = TaskRuntimeClass.WAR_ROOM
             profile = task_runtime_profile(task_runtime_class)
             policy = self._policy_metadata(profile)
             effective_timeout = profile.max_runtime
@@ -1197,8 +1200,13 @@ class CoreEngine:
                 goal_state={"drift_count": int(source_goal_state.get("drift_count", 0))},
             )
 
-    def wait(self, core_run_id: str, *, timeout_seconds: float) -> dict[str, Any]:
+    def _observation_lock(self, core_run_id: str) -> threading.Lock:
         with self._lock:
+            return self._wait_locks.setdefault(core_run_id, threading.Lock())
+
+    def wait(self, core_run_id: str, *, timeout_seconds: float) -> dict[str, Any]:
+        # Network waits serialize only the same run, never unrelated workers.
+        with self._observation_lock(core_run_id):
             record = self._require(core_run_id)
             if CoreRunStatus(record["status"]) in _TERMINAL:
                 return record
@@ -1225,10 +1233,14 @@ class CoreEngine:
                 try:
                     outcome = self.adapter.wait(core_run_id, timeout_seconds=bounded_wait)
                 except TimeoutError:
-                    outcome = AdapterOutcome(CoreRunStatus.TIMEOUT, "TRANSPORT_TIMEOUT")
+                    self.registry.update_policy(core_run_id, event_code="OBSERVATION_TIMEOUT")
+                    outcome = AdapterOutcome(CoreRunStatus.RUNNING, "OBSERVATION_TIMEOUT")
                 except AdapterError as exc:
-                    reason = "TRANSPORT_FAILURE" if isinstance(exc, TransportError) else "WAIT_REJECTED"
-                    outcome = AdapterOutcome(CoreRunStatus.FAIL, reason)
+                    if isinstance(exc, TransportError):
+                        self.registry.update_policy(core_run_id, event_code="OBSERVATION_TRANSPORT_FAILURE")
+                        outcome = AdapterOutcome(CoreRunStatus.RUNNING, "OBSERVATION_TRANSPORT_FAILURE")
+                    else:
+                        outcome = AdapterOutcome(CoreRunStatus.FAIL, "WAIT_REJECTED")
                 elapsed = self._runtime_seconds(self._require(core_run_id))
                 self.registry.update_policy(core_run_id, runtime_seconds=elapsed)
                 guard = self._terminal_transition_guard
@@ -1264,7 +1276,14 @@ class CoreEngine:
                 meaningful_wait = min(1.0, bounded_wait / 2.0)
                 if elapsed - elapsed_before < meaningful_wait:
                     return self._require(core_run_id)
-            return self._apply_adapter_outcome(core_run_id, outcome)
+            with self._lock:
+                current = self._require(core_run_id)
+                if CoreRunStatus(current["status"]) in _TERMINAL:
+                    return current
+                guard = self._terminal_transition_guard
+                if guard is not None and guard(core_run_id):
+                    return current
+                return self._apply_adapter_outcome(core_run_id, outcome)
 
     def _apply_adapter_outcome(self, core_run_id: str, outcome: AdapterOutcome) -> dict[str, Any]:
         if outcome.status == CoreRunStatus.RUNNING:

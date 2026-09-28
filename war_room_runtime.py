@@ -7,6 +7,9 @@ connection's abort ownership.
 from __future__ import annotations
 
 import threading
+import logging
+
+_LOG = logging.getLogger(__name__)
 import time
 import sqlite3
 from pathlib import Path
@@ -78,7 +81,7 @@ class WarRoomRuntime:
         return self._fast_adapter
 
     def stop_project(self, *, db_path: str | Path, project_id: str, actor_id: str, now: int | None = None) -> dict[str, Any]:
-        return request_project_stop(db_path=db_path, project_id=project_id, actor_id=actor_id, adapter=self.adapter, now=now)
+        return request_project_stop(db_path=db_path, project_id=project_id, actor_id=actor_id, adapter=self.adapter, adapter_selector=self.adapter_for, now=now)
 
     def start(self, *, db_path: str | Path, interval_seconds: float = 1.0) -> None:
         if self._thread and self._thread.is_alive():
@@ -89,8 +92,7 @@ class WarRoomRuntime:
                 try:
                     self.tick(db_path=db_path)
                 except Exception:
-                    # Individual delivery failures are persisted by the worker;
-                    # an unexpected loop error must not kill the service owner.
+                    _LOG.exception("War Room runtime tick failed; pending work retained for observation retry")
                     continue
         self._thread = threading.Thread(target=loop, name="war-room-runtime", daemon=True)
         self._thread.start()

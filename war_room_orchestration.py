@@ -111,7 +111,7 @@ class WarRoomOrchestrator:
             raise
         except (OSError, ValueError, KeyError, TypeError):
             return []
-        paths = packet.get("approved_paths")
+        paths = packet.get("result_artifact_paths") or packet.get("approved_paths")
         if not isinstance(paths, list):
             return []
         return [path for path in paths if isinstance(path, str) and path.strip()]
@@ -153,28 +153,11 @@ class WarRoomOrchestrator:
                 workflow=workflow,
                 correlation_id=correlation_id,
             )
-            persisted: list[dict[str, Any]] = []
-            for unit in compiled["execution_units"]:
-                try:
-                    row = self.store.create_unit(
-                        execution_id=unit["execution_id"],
-                        war_project_id=war_project_id,
-                        war_task_id=war_task_id,
-                        correlation_id=compiled["correlation_id"],
-                        agent_id=unit["agent_id"],
-                        workflow_role=unit.get("workflow_role", "implementation"),
-                        depends_on_execution_ids=unit["depends_on_execution_ids"],
-                        dispatch_message=unit.get("dispatch_message"),
-                        dispatch_timeout_seconds=unit.get("dispatch_timeout_seconds"),
-                        dispatch_goal_contract=unit.get("dispatch_goal_contract"),
-                    )
-                    persisted.append(row)
-                except ValueError as exc:
-                    if str(exc).startswith("EXECUTION_UNIT_EXISTS:"):
-                        raise ValueError(
-                            f"DUPLICATE_COMPILE:{war_project_id}/{war_task_id}"
-                        ) from exc
-                    raise
+            import time
+            units = [{**unit, "war_project_id": war_project_id, "war_task_id": war_task_id,
+                      "created_at": int(time.time())} for unit in compiled["execution_units"]]
+            self.store.create_units(units, reject_existing_workflow=True)
+            persisted = [self.store.get_unit(unit["execution_id"]) for unit in units]
 
         return {
             "correlation_id": compiled["correlation_id"],
@@ -451,15 +434,12 @@ class WarRoomOrchestrator:
         idempotency_key = _idempotency_key_for(execution_id)
         contract = _dispatch_contract(message, timeout_seconds, goal_contract)
 
-        # Persist the exact input so a terminal callback can dispatch this
-        # unit without inventing a second source of execution intent.
-        self.store.update_dispatch_input(
-            execution_id, message=message, timeout_seconds=float(timeout_seconds),
-            goal_contract=dict(goal_contract or {}) if goal_contract is not None else None,
-        )
-
         # Check if already dispatched
         if unit.get("core_run_id"):
+            saved_message = unit.get("dispatch_message")
+            saved_timeout = unit.get("dispatch_timeout_seconds")
+            if saved_message and saved_timeout is not None and _dispatch_contract(saved_message, saved_timeout, unit.get("dispatch_goal_contract")) != contract:
+                raise DuplicateDispatchError(f"DUPLICATE_DISPATCH_CONFLICT:{execution_id}")
             # Already has a core_run_id - this is a replay or conflict
             try:
                 record = self.core_engine.status(unit["core_run_id"])
@@ -505,6 +485,13 @@ class WarRoomOrchestrator:
             raise NotReadyError(
                 f"EXECUTION_NOT_READY:{execution_id}:{readiness.get('reason')}"
             )
+
+        # Persist the exact input so a terminal callback can dispatch this
+        # unit without inventing a second source of execution intent.
+        self.store.update_dispatch_input(
+            execution_id, message=message, timeout_seconds=float(timeout_seconds),
+            goal_contract=dict(goal_contract or {}) if goal_contract is not None else None,
+        )
 
         if not _claimed:
             claimed = self.store.claim_for_dispatch(execution_id)

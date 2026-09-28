@@ -54,6 +54,8 @@ def _connect(db_path: str | Path) -> sqlite3.Connection:
     for column, definition in (("session_key", "TEXT"), ("session_id", "TEXT"), ("correlation_id", "TEXT")):
         if column not in columns:
             con.execute(f"ALTER TABLE war_deliveries ADD COLUMN {column} {definition}")
+    from war_room_stage_recovery import ensure_schema
+    ensure_schema(con)
     return con
 
 
@@ -465,7 +467,8 @@ def _queue_auto_qa_delivery(
     # even when the Worker used Fast Gateway / Controlled Lane.
     qa_binding, reason = _ensure_auto_qa_session(con, task=task, adapter=adapter)
     if not qa_binding:
-        con.execute("UPDATE war_tasks SET status='rework_required',revision=revision+1,updated_at=? WHERE id=?", (now, task_id))
+        from war_room_stage_recovery import mark
+        mark(con, task, "qa-provision", "QA", reason or "QA_PROVISION_FAILED", now)
         _audit(con, task["project_id"], "qa_auto_blocked", task_id, {"reason": reason})
         return False
     packet_row = con.execute("SELECT packet_json FROM war_grounding_packets WHERE task_id=?", (task_id,)).fetchone()
@@ -525,10 +528,8 @@ def _record_auto_qa_verdict(
     if verdict == "PASS":
         error = _qa_evidence_validation(con, task, packet, required_ids)
         if error:
-            con.execute(
-                "UPDATE war_tasks SET status='rework_required',revision=revision+1,updated_at=? WHERE id=?",
-                (now, task_id),
-            )
+            from war_room_stage_recovery import mark
+            mark(con, task, "qa-evidence", "QA", error, now)
             _audit(con, task["project_id"], "qa_auto_pass_blocked", task_id, {"reason": error, "reviewer": reviewer})
             return error
     profile = "required:" + ",".join(required_ids)
@@ -692,6 +693,8 @@ def _after_responded_delivery(
     task = con.execute("SELECT * FROM war_tasks WHERE id=?", (row["task_id"],)).fetchone()
     if not task:
         return
+    from war_room_stage_recovery import resolve
+    resolve(con, task["id"], int(row["task_revision"] or task["revision"] or 1), row["id"], now)
     revision = int(row["task_revision"] or task["revision"] or 1)
     if int(task["revision"] or 1) != revision:
         _audit(con, task["project_id"], "stale_revision_response_ignored", row["id"], {
@@ -734,9 +737,24 @@ def _after_responded_delivery(
         )
 
 
+def _safe_after_responded_delivery(con: sqlite3.Connection, **kwargs: Any) -> None:
+    try:
+        _after_responded_delivery(con, **kwargs)
+    except Exception as exc:
+        row, now = kwargs['row'], kwargs['now']
+        task = con.execute("SELECT * FROM war_tasks WHERE id=?", (row['task_id'],)).fetchone()
+        if task:
+            from war_room_stage_recovery import mark
+            mark(con, task, 'qa-postprocess', 'QA', 'POSTPROCESS_ERROR:'+type(exc).__name__, now)
+            _audit(con, task['project_id'], 'postprocess_failed_result_preserved', row['id'], {'error_type':type(exc).__name__})
+
+
 def _terminal_validation_failure(con: sqlite3.Connection, *, message_id: str, project_id: str, delivery_id: str, task_revision: int, error_code: str, now: int) -> None:
-    task = con.execute("SELECT id,status,revision FROM war_tasks WHERE source_message_id=?", (message_id,)).fetchone()
+    task = con.execute("SELECT * FROM war_tasks WHERE source_message_id=?", (message_id,)).fetchone()
     if not task:
+        return
+    if task["status"] in {"completed", "stopped", "stop_unconfirmed"}:
+        _audit(con, project_id, "late_failure_after_stop_ignored", delivery_id, {"code":error_code})
         return
     if int(task["revision"] or 1) != int(task_revision):
         _audit(con, project_id, "stale_revision_failure_ignored", delivery_id, {
@@ -745,6 +763,16 @@ def _terminal_validation_failure(con: sqlite3.Connection, *, message_id: str, pr
             "current_revision": int(task["revision"] or 1),
             "error_code": error_code,
         })
+        return
+    from war_room_stage_recovery import mark, recoverable_stage
+    delivery = con.execute("SELECT agent_id FROM war_deliveries WHERE id=?", (delivery_id,)).fetchone()
+    stage = recoverable_stage(error_code, qa=bool(delivery and delivery["agent_id"] == task["reviewer_agent_id"] and task["status"] == "qa"))
+    from war_room_task_contract import profiled
+    packet_row = con.execute("SELECT packet_json FROM war_grounding_packets WHERE task_id=?", (task["id"],)).fetchone()
+    packet = json.loads(packet_row[0]) if packet_row else {}
+    if stage and profiled(packet) and task["status"] in {"running", "qa"}:
+        mark(con, task, delivery_id, stage, error_code, now)
+        _audit(con, project_id, "processing_stage_held", delivery_id, {"task_id":task["id"],"stage":stage,"code":error_code})
         return
     con.execute("UPDATE war_tasks SET status='rework_required',revision=revision+1,updated_at=? WHERE id=? AND status!='rework_required'", (now, task["id"]))
     con.execute("UPDATE war_deliveries SET status='failed',error_code='cancelled_after_terminal_validation' WHERE message_id=? AND task_revision=? AND id!=? AND status='queued'", (message_id, task_revision, delivery_id))
@@ -851,6 +879,17 @@ def process_due_deliveries(*, db_path: str | Path, adapter: SessionAdapter, adap
                 con.commit()
                 results.append({"delivery_id": row["id"], "status": "failed", "reason": "agent_admission_revoked"})
                 continue
+            if row["deadline_at"] is not None and int(row["deadline_at"]) <= current:
+                con.execute("UPDATE war_deliveries SET status='timed_out',error_code='delivery_deadline_exceeded',error_class='system_error',last_error_at=? WHERE id=?", (current,row["id"]))
+                if row["task_id"]:
+                    _terminal_validation_failure(
+                        con, message_id=row["message_id"], project_id=row["project_id"],
+                        delivery_id=row["id"], task_revision=int(row["task_revision"] or 1),
+                        error_code="delivery_deadline_exceeded", now=current,
+                    )
+                _audit(con, row["project_id"], "delivery_timed_out", row["id"], {"reason":"deadline"})
+                results.append({"delivery_id":row["id"],"status":"timed_out"})
+                continue
             active_other = con.execute("SELECT 1 FROM war_deliveries WHERE agent_id=? AND id!=? AND status IN ('sent','received') LIMIT 1", (row["agent_id"], row["id"])).fetchone()
             if active_other:
                 con.execute("UPDATE war_deliveries SET error_code='agent_busy_queued' WHERE id=? AND status='queued'", (row["id"],))
@@ -863,17 +902,6 @@ def process_due_deliveries(*, db_path: str | Path, adapter: SessionAdapter, adap
             if claimed.rowcount != 1:
                 continue
             con.commit()
-            if row["deadline_at"] is not None and int(row["deadline_at"]) <= current:
-                con.execute("UPDATE war_deliveries SET status='timed_out',error_code='delivery_deadline_exceeded',error_class='system_error',last_error_at=? WHERE id=?", (current,row["id"]))
-                if row["task_id"]:
-                    _terminal_validation_failure(
-                        con, message_id=row["message_id"], project_id=row["project_id"],
-                        delivery_id=row["id"], task_revision=int(row["task_revision"] or 1),
-                        error_code="delivery_deadline_exceeded", now=current,
-                    )
-                _audit(con, row["project_id"], "delivery_timed_out", row["id"], {"reason":"deadline"})
-                results.append({"delivery_id":row["id"],"status":"timed_out"})
-                continue
             is_qa_delivery = bool(row["task_id"] and _qa_delivery_for_task(con, row["task_id"], row["agent_id"]))
             delivery_execution_mode = "LEGACY" if is_qa_delivery else row["execution_mode"]
             active_adapter = adapter if is_qa_delivery else (adapter_selector(row["execution_mode"], db_path) if adapter_selector else adapter)
@@ -970,7 +998,7 @@ def process_due_deliveries(*, db_path: str | Path, adapter: SessionAdapter, adap
                 turn_delta = 0 if is_reviewer else (1 if status == "responded" else 0)
                 con.execute("INSERT INTO war_task_calls(task_id,task_revision,call_count,turn_count,updated_at) VALUES (?,?,?,?,?) ON CONFLICT(task_id,task_revision) DO UPDATE SET call_count=call_count+?,turn_count=turn_count+?,updated_at=?", (task["id"],int(row["task_revision"] or task["revision"] or 1),call_delta,turn_delta,current,call_delta,turn_delta,current))
                 if status == "responded":
-                    _after_responded_delivery(
+                    _safe_after_responded_delivery(
                         con, row=row, adapter=adapter,
                         structured_result=structured_result, now=current,
                     )
@@ -1005,17 +1033,7 @@ def recover_received_deliveries(*, db_path: str | Path, gateway: Any, gateway_se
     with _connect(db_path) as con:
         rows = con.execute("SELECT d.*,m.project_id,m.body,t.id AS task_id,COALESCE(t.execution_mode,'LEGACY') AS execution_mode FROM war_deliveries d JOIN war_messages m ON m.id=d.message_id LEFT JOIN war_tasks t ON t.source_message_id=m.id WHERE d.status='received' AND d.run_id IS NOT NULL").fetchall()
         for row in rows:
-            if row["deadline_at"] is not None and int(row["deadline_at"]) <= current:
-                con.execute("UPDATE war_deliveries SET status='timed_out',error_code='delivery_deadline_exceeded' WHERE id=?", (row["id"],))
-                if row["task_id"]:
-                    _terminal_validation_failure(
-                        con, message_id=row["message_id"], project_id=row["project_id"],
-                        delivery_id=row["id"], task_revision=int(row["task_revision"] or 1),
-                        error_code="delivery_deadline_exceeded", now=current,
-                    )
-                _audit(con, row["project_id"], "delivery_recovered_timed_out", row["id"], {"run_id": row["run_id"]})
-                results.append({"delivery_id": row["id"], "run_id": row["run_id"], "status": "timed_out"})
-                continue
+            expired = row["deadline_at"] is not None and int(row["deadline_at"]) <= current
             is_qa_delivery = bool(row["task_id"] and _qa_delivery_for_task(con, row["task_id"], row["agent_id"]))
             active_gateway = gateway if is_qa_delivery else (gateway_selector(row["execution_mode"], db_path) if gateway_selector else gateway)
             binding = _binding_for_delivery(con, row, require_delivery_binding=True)
@@ -1034,14 +1052,40 @@ def recover_received_deliveries(*, db_path: str | Path, gateway: Any, gateway_se
                     results.append({"delivery_id": row["id"], "run_id": row["run_id"], "status": "failed"})
                     continue
             try:
-                run = active_gateway.poll(run_id=row["run_id"], agent_id=row["agent_id"])
-            except TypeError:
-                run = active_gateway.poll(row["run_id"])
+                try:
+                    run = active_gateway.poll(run_id=row["run_id"], agent_id=row["agent_id"])
+                except TypeError:
+                    run = active_gateway.poll(row["run_id"])
+            except Exception as exc:
+                if row["task_id"]:
+                    from war_room_stage_recovery import mark
+                    task = con.execute("SELECT * FROM war_tasks WHERE id=?", (row["task_id"],)).fetchone()
+                    if task and task["revision"] == row["task_revision"]:
+                        mark(con, task, row["id"], "RECONCILE", "OBSERVATION_ERROR:"+type(exc).__name__, current)
+                _audit(con, row["project_id"], "observation_retry_pending", row["id"], {"error_type":type(exc).__name__,"worker_redispatched":False})
+                con.commit()
+                continue
             current_delivery = con.execute("SELECT status FROM war_deliveries WHERE id=?", (row["id"],)).fetchone()
             if not current_delivery or current_delivery["status"] != "received":
                 continue
             status = getattr(run, "status", None)
+            if row["task_id"] and status in {"received", "responded"}:
+                from war_room_stage_recovery import resolve
+                resolve(con, row["task_id"], int(row["task_revision"] or 1), row["id"], current)
             if status not in {"responded", "failed", "timed_out", "stopped"}:
+                if expired:
+                    # Collect a terminal result first. If still active, confirm the exact stop.
+                    _, stopped = stop_bound_delivery(con, row, adapter=gateway, adapter_selector=gateway_selector)
+                    if stopped.status == 'stopped':
+                        con.execute("UPDATE war_deliveries SET status='timed_out',error_code='delivery_deadline_exceeded' WHERE id=? AND status='received'", (row['id'],))
+                        _terminal_validation_failure(con, message_id=row['message_id'], project_id=row['project_id'], delivery_id=row['id'], task_revision=row['task_revision'], error_code='delivery_deadline_exceeded', now=current)
+                        _audit(con, row['project_id'], 'deadline_stop_confirmed', row['id'], {'run_id':row['run_id']})
+                    else:
+                        from war_room_stage_recovery import mark
+                        task = con.execute("SELECT * FROM war_tasks WHERE id=?", (row['task_id'],)).fetchone()
+                        if task:
+                            mark(con, task, row['id'], 'RECONCILE', 'DEADLINE_STOP_UNCONFIRMED', current)
+                    con.commit()
                 continue
             response_message_id = row["response_message_id"]
             response_body = getattr(run, "response_body", None)
@@ -1084,7 +1128,7 @@ def recover_received_deliveries(*, db_path: str | Path, gateway: Any, gateway_se
                                        ON CONFLICT(task_id,task_revision) DO UPDATE SET
                                          turn_count=turn_count+1,updated_at=excluded.updated_at""",
                                     (task["id"], int(row["task_revision"] or task["revision"] or 1), current))
-                    _after_responded_delivery(
+                    _safe_after_responded_delivery(
                         con, row=row, adapter=gateway,
                         structured_result=structured_result, now=current,
                     )
@@ -1094,8 +1138,32 @@ def recover_received_deliveries(*, db_path: str | Path, gateway: Any, gateway_se
     return results
 
 
+
+def stop_bound_delivery(con: sqlite3.Connection, row: Any, *, adapter: Any, adapter_selector: Any | None = None) -> tuple[Any, DeliveryReceipt]:
+    """Stop the exact execution through its actual lane; QA always uses direct sessions."""
+    task = con.execute("SELECT * FROM war_tasks WHERE source_message_id=?", (row['message_id'],)).fetchone()
+    is_qa = bool(task and task['reviewer_agent_id'] == row['agent_id'])
+    mode = 'LEGACY' if is_qa else (task['execution_mode'] if task else 'LEGACY')
+    db_path = con.execute('PRAGMA database_list').fetchone()[2]
+    owner = adapter if mode != 'FAST_GATEWAY' or adapter_selector is None else adapter_selector(mode, db_path)
+    try:
+        binder = getattr(owner, 'bind_delivery', None)
+        if binder:
+            key, session = row['session_key'], row['session_id']
+            if not key or not session or ':war-room-test:' not in key:
+                return owner, DeliveryReceipt(row['id'], 'failed', error_code='explicit_session_binding_missing')
+            binder(row['id'], session_key=key, session_id=session, purpose='test', disposable=True, agent_id=row['agent_id'])
+            bind_run = getattr(owner, 'bind_run', None)
+            if bind_run and row['run_id']:
+                bind_run(row['run_id'], session_key=key, session_id=session, purpose='test', disposable=True,
+                         delivery_id=row['id'], started_at=row['sent_at'], agent_id=row['agent_id'])
+        return owner, owner.stop(delivery_id=row['id'], agent_id=row['agent_id'])
+    except Exception as exc:
+        return owner, DeliveryReceipt(row['id'], 'failed', error_code='STOP_UNCONFIRMED:'+type(exc).__name__)
+
 def request_project_stop(*, db_path: str | Path, project_id: str, actor_id: str,
                          adapter: SessionAdapter, now: int | None = None,
+                         adapter_selector: Any | None = None,
                          deadline: int | None = None, delivery_ids: list[str] | None = None) -> dict[str, Any]:
     """Send explicit stop requests and preserve adapter failure as failed."""
     current = _now() if now is None else int(now)
@@ -1110,22 +1178,7 @@ def request_project_stop(*, db_path: str | Path, project_id: str, actor_id: str,
             rows = con.execute(f"SELECT * FROM war_deliveries WHERE id IN ({marks})", tuple(delivery_ids)).fetchall()
         con.execute("UPDATE war_project_control SET stop_requested_at=?,stop_deadline=?,stop_state='stop_requested',updated_at=? WHERE project_id=?", (current,stop_deadline,current,project_id))
         for row in rows:
-            binder = getattr(adapter, "bind_delivery", None)
-            run_binder = getattr(adapter, "bind_run", None)
-            if binder:
-                binding = _binding_for_delivery(con, row)
-                if not binding:
-                    receipt = DeliveryReceipt(row["id"], "failed", error_code="explicit_session_binding_missing")
-                else:
-                    try:
-                        binder(row["id"], session_key=binding["session_key"], session_id=binding["session_id"], purpose=binding["purpose"], disposable=bool(binding["disposable"]), agent_id=row["agent_id"])
-                        if run_binder and row["run_id"]:
-                            run_binder(row["run_id"], session_key=binding["session_key"], session_id=binding["session_id"], purpose=binding["purpose"], disposable=bool(binding["disposable"]), delivery_id=row["id"], started_at=row["sent_at"], agent_id=row["agent_id"])
-                        receipt = adapter.stop(delivery_id=row["id"], agent_id=row["agent_id"])
-                    except ValueError:
-                        receipt = DeliveryReceipt(row["id"], "failed", error_code="session_binding_not_disposable_test")
-            else:
-                receipt = adapter.stop(delivery_id=row["id"], agent_id=row["agent_id"])
+            _, receipt = stop_bound_delivery(con, row, adapter=adapter, adapter_selector=adapter_selector)
             status = receipt.status if receipt.status in {"stopped","failed","timed_out"} else "failed"
             con.execute("UPDATE war_deliveries SET status=?,error_code=? WHERE id=?", (status,receipt.error_code,row["id"]))
             _audit(con, project_id, "delivery_stop_"+status, row["id"], {"actor_id":actor_id,"error_code":receipt.error_code})

@@ -33,9 +33,9 @@ function statusInfo(task) {
   const pending = typeof taskDeliveryRows === "function" && task.status === "running"
     && taskDeliveryRows(task).some(row => row.status === "queued")
     && !taskDeliveryRows(task).some(row => ["sent","received"].includes(row.status));
-  const state = task.state === "system_error" ? "system_error" : pending ? "queued" : task.status;
+  const state = task.processing_issues?.length ? "processing_review" : task.state === "system_error" ? "system_error" : pending ? "queued" : task.status;
   const map = {
-    draft:["초안","muted"], awaiting_approval:["승인 대기","waiting"], approved:["실행 준비","waiting"],
+    processing_review:["단계 확인 필요","waiting"], draft:["초안","muted"], awaiting_approval:["승인 대기","waiting"], approved:["실행 준비","waiting"],
     queued:["실행 대기","waiting"], running:["작업중","running"], qa:["검수중","qa"], completed:["완료","good"],
     rework_required:["재작업 필요","bad"], system_error:["문제 발생","bad"],
     stopped:["중지","muted"], stop_unconfirmed:["중지 확인 필요","bad"],
@@ -275,11 +275,16 @@ function renderProjectSummary() {
 
 function taskDeliveryRows(task) {
   return deliveries
-    .filter(row => row.task_id === task.id || row.message_id === task.source_message_id)
+    .filter(row => (row.task_id === task.id || row.message_id === task.source_message_id)
+      && Number(row.task_revision || 1) === Number(task.revision || 1))
     .sort((a,b) => Number(b.created_at || 0) - Number(a.created_at || 0));
 }
 
 function failureDiagnosis(task) {
+  const issue = (task.processing_issues || [])[0];
+  if (issue) return {stage:issue.stage === "QA" ? "QA 처리" : issue.stage === "RECONCILE" ? "실행 상태 확인" : "결과 확인",
+    title:"업무 결과는 보존되어 있습니다.", cause:issue.code, next:issue.stage === "QA" ? "Worker 재실행 없이 QA만 재개하십시오." : "해당 단계의 오류를 확인해야 합니다. 전체 작업은 자동 재실행하지 않습니다.",
+    workerCompleted:taskDeliveryRows(task).some(row => row.response_body || row.raw_response), code:issue.code, summary:""};
   const row = taskDeliveryRows(task).find(item =>
     ["failed","timed_out"].includes(item.status) || item.run_status === "FAIL" || item.error_code || item.validation_error || item.cancel_reason
   );
@@ -324,6 +329,9 @@ function taskCard(task) {
   }
   if (task.status === "approved") {
     actions.push(`<button class="btn primary" data-rep-action onclick="runApproved('${esc(task.id)}')" ${representative() ? "" : "disabled"}>실행</button>`);
+  }
+  if (task.status === "qa" && (task.processing_issues || []).some(issue => issue.stage === "QA")) {
+    actions.push(`<button class="btn primary" onclick="resumeQA('${esc(task.id)}')" ${representative() ? "" : "disabled"}>QA만 재개</button>`);
   }
   if (["running","qa"].includes(task.status)) {
     actions.push(`<button class="btn danger" data-rep-action onclick="stopTask('${esc(task.id)}')" ${representative() ? "" : "disabled"}>중지</button>`);
@@ -447,6 +455,18 @@ async function prepareReapproval(taskId) {
     } catch (error) { toast(`재승인 준비 실패: ${error.message}`, "bad"); }
   });
 }
+async function resumeQA(taskId) {
+  await withBusy(async () => {
+    try {
+      const task = await latestTask(taskId);
+      const result = await guardedPost(`/api/war-room/tasks/${encodeURIComponent(task.id)}/resume-qa`,
+        mutationContract(task), "task_resume_qa", task.id);
+      toast(result.status === "qa_unavailable" ? "QA 연결이 아직 복구되지 않았습니다. Worker 결과는 보존됩니다." : "Worker 재실행 없이 QA를 재개했습니다.");
+      await loadProject(selectedProjectId);
+    } catch (error) { toast(`QA 재개 실패: ${error.message}`, "bad"); }
+  });
+}
+
 async function completeTask(taskId) {
   await withBusy(async () => {
     try {
