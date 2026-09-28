@@ -270,6 +270,44 @@ function renderProjectSummary() {
   $("project-summary").innerHTML = notices.map(([tone,text]) => `<div class="notice ${tone}">${esc(text)}</div>`).join("");
 }
 
+function taskDeliveryRows(task) {
+  return deliveries
+    .filter(row => row.task_id === task.id || row.message_id === task.source_message_id)
+    .sort((a,b) => Number(b.created_at || 0) - Number(a.created_at || 0));
+}
+
+function failureDiagnosis(task) {
+  const row = taskDeliveryRows(task).find(item =>
+    ["failed","timed_out"].includes(item.status) || item.run_status === "FAIL" || item.error_code || item.validation_error || item.cancel_reason
+  );
+  if (!row && task.status !== "rework_required" && task.state !== "system_error") return null;
+  const code = row?.validation_error || row?.error_code || row?.cancel_reason || "QA_REWORK_REQUIRED";
+  const workerCompleted = Boolean(row?.response_body || row?.raw_response || row?.result_summary);
+  if (String(code).includes("EVIDENCE_VALIDATION_FAILED:EVIDENCE_UNVERIFIED")) {
+    return {stage:"FastGateway 결과 검증", title:"Worker 응답은 왔지만 Evidence 검증에서 실패했습니다.", cause:"Worker가 보고한 증거 문구를 실제 실행 기록과 일치한다고 확인하지 못해 FastGateway가 결과를 거절했습니다.", next:"검증 규칙 또는 Evidence 내용을 확인한 뒤 재승인·재실행하십시오.", workerCompleted, code, summary:row?.result_summary || ""};
+  }
+  if (String(code).includes("EVIDENCE_CONTRADICTION")) {
+    return {stage:"FastGateway 결과 검증", title:"Worker 보고와 실제 실행 기록이 서로 모순됩니다.", cause:"하지 않았다고 보고한 행동이 실행 기록에서 발견됐거나 그 반대 상황입니다.", next:"Worker 원본 응답과 실행 기록을 확인한 뒤 재작업하십시오.", workerCompleted, code, summary:row?.result_summary || ""};
+  }
+  if (row?.status === "timed_out") {
+    return {stage:"Agent 실행", title:"Agent가 제한시간 안에 응답하지 못했습니다.", cause:"실행은 시작됐지만 최종 결과가 제한시간 내 도착하지 않았습니다.", next:"Agent 상태를 확인하고 재승인·재실행하거나 다른 Agent로 변경하십시오.", workerCompleted, code, summary:row?.result_summary || ""};
+  }
+  if (String(code).includes("agent_busy")) {
+    return {stage:"Agent 실행 대기", title:"Agent가 다른 작업을 처리 중입니다.", cause:"동일 Agent의 활성 작업 때문에 이번 작업이 바로 실행되지 못했습니다.", next:"기존 작업 종료를 기다리거나 다른 Agent를 선택하십시오.", workerCompleted, code, summary:row?.result_summary || ""};
+  }
+  if (task.status === "rework_required" && task.latest_qa_verdict?.verdict) {
+    return {stage:"QA 검수", title:`QA가 ${task.latest_qa_verdict.verdict} 판정을 내려 재작업이 필요합니다.`, cause:"QA 검수 결과 현재 결과를 최종 승인할 수 없습니다.", next:"결과와 Evidence를 수정한 뒤 재승인·재실행하십시오.", workerCompleted, code, summary:row?.result_summary || ""};
+  }
+  return {stage:"작업 처리", title:"작업이 정상 완료되지 않았습니다.", cause:"실행 또는 검증 단계에서 오류가 발생했습니다.", next:"아래 기술 상세를 확인한 뒤 재승인·재실행하십시오.", workerCompleted, code, summary:row?.result_summary || ""};
+}
+
+function failureBox(task) {
+  const info = failureDiagnosis(task);
+  if (!info) return "";
+  const worker = info.workerCompleted ? "Worker 응답: 수신 완료" : "Worker 응답: 완료 확인 안 됨";
+  return `<div class="failure-box"><strong>실패 원인 · ${esc(info.stage)}</strong><div class="cause">${esc(info.title)}<br>${esc(info.cause)}</div>${info.summary ? `<div class="result-summary">Worker 결과: ${esc(trim(info.summary,220))}</div>` : ""}<div class="next">${esc(worker)} · 다음 조치: ${esc(info.next)}</div><details><summary>기술 상세</summary><code>${esc(info.code)}</code></details></div>`;
+}
+
 function taskCard(task) {
   const [label,tone] = statusInfo(task);
   const qa = task.latest_qa_verdict?.verdict;
@@ -290,9 +328,10 @@ function taskCard(task) {
   if (task.status === "qa" && qa === "PASS" && Number(task.evidence_count || 0) > 0) {
     actions.push(`<button class="btn primary" data-rep-action onclick="completeTask('${esc(task.id)}')" ${representative() ? "" : "disabled"}>최종 승인</button>`);
   }
-  actions.push(`<a class="btn" href="/war-room/advanced?project_id=${encodeURIComponent(selectedProjectId)}&task_id=${encodeURIComponent(task.id)}&screen=task">상세</a>`);
+  actions.push(`<a class="btn" href="/war-room/advanced?project_id=${encodeURIComponent(selectedProjectId)}&task_id=${encodeURIComponent(task.id)}&screen=task">고급 상세</a>`);
   return `<div class="task">
     <div class="task-top"><div><div class="task-title">${esc(trim(task.scope,190))}</div><div class="task-meta">${esc(meta)}${qa ? ` · QA ${esc(qa)}` : ""}</div></div><span class="status ${tone}">${esc(label)}</span></div>
+    ${failureBox(task)}
     <div class="task-actions">${actions.join("")}</div>
   </div>`;
 }

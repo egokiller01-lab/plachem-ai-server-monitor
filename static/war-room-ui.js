@@ -272,6 +272,29 @@ document.getElementById("legacy-reviewer-form")?.addEventListener("submit", asyn
   } catch (error) { out.textContent = `검수자 지정 실패 · ${error.message}`; }
 });
 
+function humanFailureProjection(row) {
+  const code = row.validation_error || row.error_code || row.cancel_reason || "";
+  if (!code && row.run_status !== "FAIL" && !["failed","timed_out"].includes(row.status)) return "";
+  let stage = "작업 처리";
+  let cause = "실행 또는 검증 단계에서 오류가 발생했습니다.";
+  let next = "원인을 확인한 뒤 재승인·재실행하십시오.";
+  if (String(code).includes("EVIDENCE_VALIDATION_FAILED:EVIDENCE_UNVERIFIED")) {
+    stage = "FastGateway 결과 검증";
+    cause = "Worker 응답은 도착했지만 Evidence를 실제 실행 기록에서 검증하지 못해 결과가 거절됐습니다.";
+    next = "Evidence 검증 조건을 확인한 뒤 재승인·재실행하십시오.";
+  } else if (String(code).includes("EVIDENCE_CONTRADICTION")) {
+    stage = "FastGateway 결과 검증";
+    cause = "Worker 보고 내용과 실제 실행 기록이 서로 모순됩니다.";
+    next = "Worker 원본 응답과 실행 기록을 비교해 재작업하십시오.";
+  } else if (row.status === "timed_out") {
+    stage = "Agent 실행";
+    cause = "Agent가 제한시간 안에 최종 응답을 반환하지 못했습니다.";
+    next = "Agent 상태를 확인하고 재실행하거나 담당 Agent를 변경하십시오.";
+  }
+  const worker = row.response_body || row.raw_response || row.result_summary ? "Worker 응답 수신 완료" : "Worker 응답 완료 확인 안 됨";
+  return `<div class="error-detail"><strong>사람이 읽는 실패 원인</strong><br><b>${esc(stage)}</b> · ${esc(cause)}<br><small>${esc(worker)} · 다음 조치: ${esc(next)}</small>${code ? `<details><summary>기술 코드</summary><code>${esc(code)}</code></details>` : ""}</div>`;
+}
+
 function renderExecutionProjection(task) {
   const target = document.getElementById("task-detail");
   const rows = currentDeliveries.filter(row => row.task_id === task.id || row.message_id === task.source_message_id);
@@ -285,7 +308,7 @@ async function renderReview() {
   const task = selectedCurrentTask(); if (!task) return;
   const deliveries = currentDeliveries.filter(row => row.task_id === task.id || row.message_id === task.source_message_id);
   const parseRefs = value => { try { const parsed = typeof value === "string" ? JSON.parse(value || "null") : value; return parsed ? JSON.stringify(parsed, null, 2) : "-"; } catch (_) { return value || "-"; } };
-  document.getElementById("coder-result").innerHTML = `<p>${esc(task.scope)}</p><div class="muted">상태 ${statusChip(task.status)}</div>${deliveries.map(row => { const raw = row.response_body || row.raw_response; const normalized = row.result_json || row.rejected_result_json || row.result_summary; const failure = row.validation_error || row.error_detail; return `<article class="project"><strong>${esc(row.agent_id)} · ${esc(deliveryLabel(row.status))}</strong><small>task ${esc(task.id)} · run ${esc(row.run_id || row.core_run_id || "-")}</small>${raw ? `<details><summary>Worker 원본 응답</summary><pre>${esc(raw)}</pre></details>` : '<div class="warning">Worker 원본 응답 미보존</div>'}${normalized ? `<details><summary>${row.rejected_result_json && !row.result_json ? "거절된 정규화 결과" : "정규화 결과"}</summary><pre>${esc(parseRefs(normalized))}</pre></details>` : ""}${row.evidence_json ? `<details><summary>Evidence</summary><pre>${esc(parseRefs(row.evidence_json))}</pre></details>` : ""}${row.artifacts_json ? `<details><summary>Artifacts</summary><pre>${esc(parseRefs(row.artifacts_json))}</pre></details>` : ""}${row.error_code || failure ? `<div class="error-detail"><strong>거절·실패 사유</strong><br>${esc(row.error_code || "RESULT_VALIDATION_FAILED")}${failure ? `<br>${esc(failure)}` : ""}</div>` : ""}</article>`; }).join("") || '<div class="empty">이 작업의 실행 결과가 없습니다.</div>'}`;
+  document.getElementById("coder-result").innerHTML = `<p>${esc(task.scope)}</p><div class="muted">상태 ${statusChip(task.status)}</div>${deliveries.map(row => { const raw = row.response_body || row.raw_response; const normalized = row.result_json || row.rejected_result_json || row.result_summary; const failure = row.validation_error || row.error_detail; return `<article class="project"><strong>${esc(row.agent_id)} · ${esc(deliveryLabel(row.status))}</strong><small>task ${esc(task.id)} · run ${esc(row.run_id || row.core_run_id || "-")}</small>${humanFailureProjection(row)}${raw ? `<details><summary>Worker 원본 응답</summary><pre>${esc(raw)}</pre></details>` : '<div class="warning">Worker 원본 응답 미보존</div>'}${normalized ? `<details><summary>${row.rejected_result_json && !row.result_json ? "거절된 정규화 결과" : "정규화 결과"}</summary><pre>${esc(parseRefs(normalized))}</pre></details>` : ""}${row.evidence_json ? `<details><summary>Evidence</summary><pre>${esc(parseRefs(row.evidence_json))}</pre></details>` : ""}${row.artifacts_json ? `<details><summary>Artifacts</summary><pre>${esc(parseRefs(row.artifacts_json))}</pre></details>` : ""}${row.error_code || failure ? `<div class="error-detail"><strong>거절·실패 사유</strong><br>${esc(row.error_code || "RESULT_VALIDATION_FAILED")}${failure ? `<br>${esc(failure)}` : ""}</div>` : ""}</article>`; }).join("") || '<div class="empty">이 작업의 실행 결과가 없습니다.</div>'}`;
   document.getElementById("qa-task").value = task.id;
   try {
     const [evidence, audit] = await Promise.all([

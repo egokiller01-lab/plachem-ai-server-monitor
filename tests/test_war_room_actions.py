@@ -813,6 +813,10 @@ class WarRoomControlledApiTests(unittest.TestCase):
         self.assertIn(".filter(row => row.execution_eligible && row.enabled", javascript)
         self.assertNotIn("row.participating && row.execution_eligible", javascript)
         self.assertIn("선택 시 프로젝트 참여", javascript)
+        self.assertIn("failureDiagnosis", javascript)
+        self.assertIn("Worker 응답은 왔지만 Evidence 검증에서 실패했습니다.", javascript)
+        self.assertIn("기술 상세", javascript)
+        self.assertIn("war-room-simple.js?v=20260928-human-failure-1", html)
         self.assertIn('credentials:"same-origin"', javascript)
         self.assertNotIn("X-War-Room-Token", html + javascript)
 
