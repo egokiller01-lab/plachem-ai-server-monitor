@@ -87,9 +87,11 @@ class FastGatewayCorePollRegressionTests(unittest.TestCase):
         profile = RuntimeModelProfile("test-model", RuntimeClass.CLOUD, "TEST", 300.0, 0, None, {"consecutive_threshold": 3}, "MANUAL", "NONE", 0)
         engine = CoreEngine(RunRegistry(path, clock=clock), AgentRegistry({"worker": registration}), ModelRegistry({"test-model": profile}), BoundedTimeoutAdapter(), clock=clock)
         engine.dispatch(agent_id="worker", message="observe", timeout_seconds=1, core_run_id="bounded-jsonl", watchdog_managed=True)
+        lifecycle_line_count = len(path.read_text(encoding="utf-8").splitlines())
+        self.assertEqual(2, lifecycle_line_count)  # append-only QUEUED and RUNNING transitions
         for _ in range(5):
             engine.wait("bounded-jsonl", timeout_seconds=1)
-        self.assertEqual(1, len(path.read_text(encoding="utf-8").splitlines()))
+        self.assertEqual(lifecycle_line_count, len(path.read_text(encoding="utf-8").splitlines()))
 
 
 if __name__ == "__main__":
