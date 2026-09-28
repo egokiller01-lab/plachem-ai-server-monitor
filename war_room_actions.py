@@ -2464,6 +2464,7 @@ def get_task(task_id: str) -> dict[str, Any]:
         execution_contract = public_contract(con, task_id)
         from war_room_stage_recovery import issues
         processing_issues = issues(con, task_id, row["revision"])
+        revalidation_candidate = _result_revalidation_candidate(con, row)
     item = {
         **dict(row),
         "execution_contract": execution_contract,
