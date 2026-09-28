@@ -235,6 +235,30 @@ class CoreEngineTests(unittest.TestCase):
         }, "history": {"messages": [{"role": "user", "content": "text only"}]}}
         self.assertEqual(CoreRunStatus.PASS, production_result_validator()(payload).status)
 
+    def test_negative_deploy_evidence_is_not_misread_as_positive_claim(self):
+        payload = {"status": "ok", "result": {
+            "status": "completed", "summary": "SIMPLE_UI_TEST_PASS",
+            "evidence": [{"type": "instruction_receipt",
+                          "detail": "forbidden 항목(merge/push/deploy) 중 아무것도 실행하지 않았다."}],
+            "artifacts": [], "scope": {"compliant": True, "violations": []},
+        }, "history": {"messages": [{"role": "user", "content": "text only"}]}}
+        self.assertEqual(CoreRunStatus.PASS, production_result_validator()(payload).status)
+
+    def test_negative_deploy_evidence_contradicts_observed_deploy(self):
+        payload = {"status": "ok", "result": {
+            "status": "completed", "summary": "done",
+            "evidence": [{"type": "verification", "detail": "deploy 실행하지 않았다"}],
+            "artifacts": [], "scope": {"compliant": True, "violations": []},
+        }, "history": {"messages": [
+            {"role": "user", "content": "deploy"},
+            {"role": "assistant", "content": [
+                {"type": "toolCall", "name": "exec", "arguments": {"command": "wrangler deploy"}},
+            ]},
+        ]}}
+        decision = production_result_validator()(payload)
+        self.assertEqual(CoreRunStatus.FAIL, decision.status)
+        self.assertEqual("EVIDENCE_VALIDATION_FAILED:EVIDENCE_CONTRADICTION", decision.reason)
+
     def test_observed_tool_action_allows_matching_evidence(self):
         payload = {"status": "ok", "result": {
             "status": "completed", "summary": "done",

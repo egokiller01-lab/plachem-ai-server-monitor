@@ -525,7 +525,7 @@ def production_result_validator() -> CompositeResultValidator:
         "memory": re.compile(r"(?i)(\b(?:no|without|zero)\s+memory\b|메모리.{0,12}(?:없|않|미사용))"),
         "db": re.compile(r"(?i)(\b(?:no|without|zero)\s+(?:db|database|sql)\b|(?:DB|데이터베이스).{0,12}(?:없|않|미사용))"),
         "git": re.compile(r"(?i)(\b(?:no|without|zero)\s+git\b|Git.{0,12}(?:없|않|미사용))"),
-        "deploy": re.compile(r"(?i)(\b(?:no|without|zero)\s+deploy(?:ment)?\b|배포.{0,12}(?:없|않|미실행))"),
+        "deploy": re.compile(r"(?i)(\b(?:no|without|zero)\s+deploy(?:ment)?\b|\bdeploy(?:ed|ment|ing)?\b.{0,40}(?:not|never|없|않|안|미실행|실행하지)|배포.{0,20}(?:없|않|안|미실행|실행하지))"),
     }
 
     def observed_actions(envelope: Mapping[str, Any], result: Mapping[str, Any]) -> dict[str, bool]:
@@ -647,11 +647,14 @@ def production_result_validator() -> CompositeResultValidator:
         for item in items:
             claim = f"{item.get('type', '')} {item.get('detail', '')}"
             for action, pattern in claim_patterns.items():
+                denial_pattern = denial_patterns.get(action)
+                denial = denial_pattern.search(claim) if denial_pattern is not None else None
+                if denial:
+                    if observed[action]:
+                        return "EVIDENCE_CONTRADICTION"
+                    continue
                 if pattern.search(claim) and not observed[action]:
                     return "EVIDENCE_UNVERIFIED"
-            for action, pattern in denial_patterns.items():
-                if pattern.search(claim) and observed[action]:
-                    return "EVIDENCE_CONTRADICTION"
         return None
 
     def artifacts(result: Mapping[str, Any], _envelope: Mapping[str, Any]) -> str | None:
