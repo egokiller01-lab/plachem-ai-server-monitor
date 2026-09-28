@@ -31,6 +31,11 @@ class BoundedTimeoutAdapter:
         return self.submit(core_run_id, {"agentId": "worker", "idempotencyKey": core_run_id})
 
 
+class TerminalTimeoutAdapter(BoundedTimeoutAdapter):
+    def wait(self, core_run_id, *, timeout_seconds):
+        return AdapterOutcome(CoreRunStatus.TIMEOUT, "OPENCLAW_TERMINAL_TIMEOUT")
+
+
 def make_engine(runtime_class, clock, max_runtime=300.0):
     registration = AgentRegistration("worker", True, ("test",), "test-model", ("test-model",), ("TEST",))
     profile = RuntimeModelProfile("test-model", runtime_class, "TEST", max_runtime, 0, None, {"consecutive_threshold": 3}, "MANUAL", "NONE", 0)
@@ -61,6 +66,30 @@ class FastGatewayCorePollRegressionTests(unittest.TestCase):
         # cannot derive a model-specific cancellation.
         self.assertEqual("RUNNING", observed["status"])
         self.assertEqual([], engine.adapter.cancelled)
+
+    def test_terminal_openclaw_timeout_finishes_watchdog_run_once(self):
+        clock = Clock()
+        registration = AgentRegistration("worker", True, ("test",), "test-model", ("test-model",), ("TEST",))
+        profile = RuntimeModelProfile("test-model", RuntimeClass.CLOUD, "TEST", 300.0, 0, None, {"consecutive_threshold": 3}, "MANUAL", "NONE", 0)
+        adapter = TerminalTimeoutAdapter()
+        engine = CoreEngine(RunRegistry(Path(tempfile.mktemp()), clock=clock), AgentRegistry({"worker": registration}), ModelRegistry({"test-model": profile}), adapter, clock=clock)
+        record = engine.dispatch(agent_id="worker", message="terminal", timeout_seconds=1, core_run_id="terminal-timeout", watchdog_managed=True)
+        first = engine.wait(record["core_run_id"], timeout_seconds=1)
+        second = engine.wait(record["core_run_id"], timeout_seconds=1)
+        self.assertEqual("TIMEOUT", first["status"])
+        self.assertEqual(first, second)
+        self.assertEqual([], adapter.cancelled)
+
+    def test_repeated_observation_does_not_append_runtime_only_jsonl_snapshots(self):
+        clock = Clock()
+        path = Path(tempfile.mktemp())
+        registration = AgentRegistration("worker", True, ("test",), "test-model", ("test-model",), ("TEST",))
+        profile = RuntimeModelProfile("test-model", RuntimeClass.CLOUD, "TEST", 300.0, 0, None, {"consecutive_threshold": 3}, "MANUAL", "NONE", 0)
+        engine = CoreEngine(RunRegistry(path, clock=clock), AgentRegistry({"worker": registration}), ModelRegistry({"test-model": profile}), BoundedTimeoutAdapter(), clock=clock)
+        engine.dispatch(agent_id="worker", message="observe", timeout_seconds=1, core_run_id="bounded-jsonl", watchdog_managed=True)
+        for _ in range(5):
+            engine.wait("bounded-jsonl", timeout_seconds=1)
+        self.assertEqual(1, len(path.read_text(encoding="utf-8").splitlines()))
 
 
 if __name__ == "__main__":

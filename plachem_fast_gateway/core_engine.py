@@ -401,6 +401,7 @@ class RunRegistry:
             record = self.get(core_run_id)
             if record is None:
                 raise ValueError(f"UNKNOWN_CORE_RUN:{core_run_id}")
+            before = copy.deepcopy(record)
             if runtime_seconds is not None:
                 record["runtime_seconds"] = round(max(0.0, float(runtime_seconds)), 3)
             if retry_count is not None:
@@ -431,7 +432,10 @@ class RunRegistry:
             if cancel_reason is not None:
                 record["cancel_reason"] = cancel_reason
             record["updated_at"] = self._clock().astimezone(timezone.utc).isoformat()
-            self._append(record)
+            changed = {key: value for key, value in record.items() if before.get(key) != value}
+            changed.pop("updated_at", None)
+            if changed:
+                self._append(record)
             return copy.deepcopy(record)
 
     def get(self, core_run_id: str) -> dict[str, Any] | None:
@@ -1298,15 +1302,16 @@ class CoreEngine:
                 # underlying OpenClaw run may still be alive.  Best-effort
                 # abort it on the adapter's independent connection before
                 # recording TIMEOUT, so no worker is left orphaned.
-            try:
-                self.adapter.cancel(core_run_id)
-            except (AdapterError, TimeoutError):
-                self.registry.update_policy(
-                    core_run_id,
-                    event_code="TIMEOUT_ABORT_FAILED",
-                    cancel_reason="TIMEOUT_ABORT_FAILED",
-                    policy_status="GUARDED",
-                )
+            if outcome.reason != "OPENCLAW_TERMINAL_TIMEOUT":
+                try:
+                    self.adapter.cancel(core_run_id)
+                except (AdapterError, TimeoutError):
+                    self.registry.update_policy(
+                        core_run_id,
+                        event_code="TIMEOUT_ABORT_FAILED",
+                        cancel_reason="TIMEOUT_ABORT_FAILED",
+                        policy_status="GUARDED",
+                    )
             self._clear_runtime_deadline(core_run_id)
             return self.registry.transition(core_run_id, CoreRunStatus.TIMEOUT, outcome=outcome)
         if outcome.result is not None and isinstance(outcome.result.get("progress_checkpoint"), Mapping):

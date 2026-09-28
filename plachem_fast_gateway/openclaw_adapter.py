@@ -1402,9 +1402,13 @@ class OpenClawAdapter:
             self._set_status(binding, CoreRunStatus.RUNNING)
             return AdapterOutcome(CoreRunStatus.RUNNING, "RUN_STILL_ACTIVE")
         if observed == "timeout":
-            # agent.wait timed out; the agent run itself is still active.  Do
-            # not poison the persisted run binding with a terminal state—the
-            # Core owns the absolute Runtime Policy deadline.
+            # agent.wait may have timed out its bounded observation window, or
+            # may be reporting a run that has already become terminal.  The
+            # latter must not remain RUNNING forever under the watchdog.
+            session_active = self._session_run_is_active(binding)
+            if session_active is False:
+                self._set_status(binding, CoreRunStatus.TIMEOUT)
+                return AdapterOutcome(CoreRunStatus.TIMEOUT, "OPENCLAW_TERMINAL_TIMEOUT")
             return AdapterOutcome(CoreRunStatus.TIMEOUT, "OPENCLAW_TIMEOUT")
         if observed == "error":
             error = str(response.get("error") or "")
@@ -1509,6 +1513,27 @@ class OpenClawAdapter:
         self.validation_state.put(core_run_id, "outcome", saved)
         self._set_status(binding, decision.status)
         return outcome
+
+    def _session_run_is_active(self, binding: RunBinding) -> bool | None:
+        """Read exact-session lifecycle metadata after an agent.wait timeout."""
+        try:
+            history = self.rpc.request_fresh(
+                "chat.history", {"sessionKey": binding.session_key, "limit": 1}, timeout=15.0,
+            )
+        except Exception:
+            return None
+        info = history.get("sessionInfo")
+        if not isinstance(info, Mapping):
+            return None
+        active = info.get("hasActiveRun")
+        active_ids = info.get("activeRunIds")
+        if active is True:
+            return True
+        if isinstance(active_ids, list):
+            return binding.openclaw_run_id in active_ids
+        if active is False:
+            return False
+        return None
 
     def revalidate_result(self, core_run_id: str) -> AdapterOutcome:
         """Validate the identical saved response without dispatch or terminal rewrite."""

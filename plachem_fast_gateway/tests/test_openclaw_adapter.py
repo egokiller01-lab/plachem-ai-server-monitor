@@ -333,6 +333,32 @@ class OpenClawAdapterTests(unittest.TestCase):
         self.assertEqual(CoreRunStatus.TIMEOUT, decision.status)
         self.assertEqual(CoreRunStatus.RUNNING, adapter.bindings.get("core-run-1").status)
 
+    def test_timeout_with_active_session_is_observation_only(self):
+        handlers = {
+            "agent": accepted,
+            "agent.wait": {"status": "timeout"},
+            "chat.history": {"messages": [], "sessionInfo": {"hasActiveRun": True, "activeRunIds": ["openclaw-run-1"]}},
+        }
+        adapter, _ = self.adapter(handlers)
+        adapter.submit("core-run-1", self.payload())
+        decision = adapter.wait("core-run-1", timeout_seconds=0.01)
+        self.assertEqual("OPENCLAW_TIMEOUT", decision.reason)
+        self.assertEqual(CoreRunStatus.RUNNING, adapter.bindings.get("core-run-1").status)
+
+    def test_timeout_with_terminal_session_is_terminal_and_binding_is_preserved(self):
+        handlers = {
+            "agent": accepted,
+            "agent.wait": {"status": "timeout"},
+            "chat.history": {"messages": [], "sessionInfo": {"hasActiveRun": False, "activeRunIds": []}},
+        }
+        adapter, _ = self.adapter(handlers)
+        original = adapter.submit("core-run-1", self.payload())
+        decision = adapter.wait("core-run-1", timeout_seconds=0.01)
+        self.assertEqual("OPENCLAW_TERMINAL_TIMEOUT", decision.reason)
+        self.assertEqual(CoreRunStatus.TIMEOUT, decision.status)
+        self.assertEqual(CoreRunStatus.TIMEOUT, adapter.bindings.get("core-run-1").status)
+        self.assertEqual(original.openclaw_run_id, adapter.bindings.get("core-run-1").openclaw_run_id)
+
     def test_wait_uses_private_rpc_operation(self):
         handlers = {"agent": accepted, "agent.wait": {"status": "pending"}}
         adapter, _ = self.adapter(handlers)
