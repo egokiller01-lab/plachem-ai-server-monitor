@@ -953,6 +953,92 @@ def _execution_error(exc: ValueError) -> HTTPException:
 RESULT_REVALIDATOR_VERSION = "war-room-result-revalidator-v1"
 
 
+def _result_revalidation_candidate(con: sqlite3.Connection, task: sqlite3.Row) -> dict[str, Any] | None:
+    """Return a bound, recoverable RESULT failure without changing any row."""
+    if task["status"] not in {"running", "qa", "rework_required"}:
+        return None
+    from war_room_stage_recovery import issues, recoverable_stage
+    task_revision = int(task["revision"])
+    issue_rows = issues(con, task["id"], task_revision)
+    issue = next((row for row in reversed(issue_rows) if row["stage"] == "RESULT"), None)
+    # Legacy rework_required rows predate stage-local issue records.
+    if task["status"] != "rework_required" and issue is None:
+        return None
+    run = con.execute(
+        """SELECT * FROM war_execution_runs
+           WHERE war_task_id=? AND war_project_id=? AND lower(run_status)='fail'
+           ORDER BY updated_at DESC,core_run_id DESC LIMIT 1""",
+        (task["id"], task["project_id"]),
+    ).fetchone()
+    if not run or not run["core_run_id"] or not run["openclaw_run_id"] or not run["session_key"]:
+        return None
+    if run["cancel_reason"] or str(run["run_status"]).lower() in {"cancelled", "stopped"}:
+        return None
+    if issue is not None and recoverable_stage(str(issue["code"]), qa=False) != "RESULT":
+        return None
+    approval = con.execute(
+        """SELECT * FROM war_approvals
+           WHERE task_id=? AND decision='approved' AND revoked_at IS NULL
+           ORDER BY created_at DESC LIMIT 1""", (task["id"],),
+    ).fetchone()
+    agents = sorted(row[0] for row in con.execute(
+        "SELECT agent_id FROM war_task_agents WHERE task_id=? ORDER BY agent_id", (task["id"],)
+    ).fetchall())
+    expected_scope = hashlib.sha256(task["scope"].encode()).hexdigest()
+    expected_targets = hashlib.sha256(json.dumps(agents).encode()).hexdigest()
+    if (not approval or approval["scope_hash"] != expected_scope
+            or approval["document_version"] != task["document_version"]
+            or approval["assignee_agent_id"] != task["assignee_agent_id"]
+            or approval["target_set_hash"] not in {"", expected_targets}
+            or (approval["expires_at"] is not None and int(approval["expires_at"]) <= _now())):
+        return None
+    delivery = con.execute(
+        """SELECT task_revision FROM war_deliveries
+           WHERE message_id=? AND run_id=? ORDER BY created_at DESC LIMIT 1""",
+        (task["source_message_id"], run["core_run_id"]),
+    ).fetchone()
+    source_revision = int(delivery["task_revision"]) if delivery else task_revision
+    if con.execute(
+        """SELECT 1 FROM war_result_revalidation_history
+           WHERE task_id=? AND task_revision=? AND core_run_id=? AND outcome='PASS' LIMIT 1""",
+        (task["id"], task_revision, run["core_run_id"]),
+    ).fetchone():
+        return None
+    return {"run": run, "issue": issue, "source_revision": source_revision}
+
+
+def _link_revalidation_evidence(con: sqlite3.Connection, task: sqlite3.Row,
+                                source_revision: int, core_run_id: str, now: int) -> int:
+    """Copy immutable original evidence into this QA cycle; never rewrite it."""
+    scope_hash = hashlib.sha256(task["scope"].encode()).hexdigest()
+    copied = 0
+    rows = con.execute(
+        "SELECT * FROM war_evidence WHERE task_id=? AND task_revision=? ORDER BY created_at,id",
+        (task["id"], source_revision),
+    ).fetchall()
+    for row in rows:
+        contract_id = row["contract_evidence_id"]
+        if contract_id and con.execute(
+            """SELECT 1 FROM war_evidence WHERE task_id=? AND task_revision=? AND qa_cycle=?
+               AND contract_evidence_id=? LIMIT 1""",
+            (task["id"], task["revision"], task["qa_cycle"], contract_id),
+        ).fetchone():
+            continue
+        con.execute(
+            """INSERT INTO war_evidence
+               (id,task_id,evidence_type,uri,summary,sha256,task_revision,scope_hash,
+                document_version,qa_cycle,run_id,source_command,expected_contains,immutable,
+                contract_evidence_id,created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (str(uuid.uuid4()), task["id"], row["evidence_type"], row["uri"],
+             "Reused immutable evidence from original RESULT", row["sha256"], task["revision"],
+             scope_hash, task["document_version"], task["qa_cycle"], core_run_id,
+             row["source_command"], row["expected_contains"], row["immutable"], contract_id, now),
+        )
+        copied += 1
+    return copied
+
+
 @router.get("/projects/{project_id}/execution-candidates")
 def execution_candidates(project_id: str, request: Request, required_capabilities: str | None = None,
                          x_war_room_actor: str | None = Header(default=None),
@@ -1023,10 +1109,11 @@ async def revalidate_task_result(task_id: str, request: Request,
     if not isinstance(core_run_id, str) or not core_run_id.strip():
         raise HTTPException(422, "core_run_id is required")
     with _connect_rw() as con:
+        con.execute("BEGIN IMMEDIATE")
         task = con.execute("SELECT * FROM war_tasks WHERE id=?", (task_id,)).fetchone()
         if not task:
             raise HTTPException(404, "Task not found")
-        actor = _actor(con, x_war_room_actor, "execute", task["project_id"], x_war_token, request)
+        actor = _actor(con, x_war_room_actor, "execute", task["project_id"], x_war_room_token, request)
         _require_representative(actor)
         scope = f"POST:/tasks/{task_id}/revalidate-result"
         previous = _idem(con, actor, idempotency_key, scope, body)
@@ -1037,17 +1124,10 @@ async def revalidate_task_result(task_id: str, request: Request,
                                 action="task_revalidate_result", target_id=task_id)
         _require_mutable_project(con, task["project_id"])
         _require_not_stopped(con, task["project_id"])
-        if task["status"] != "rework_required":
-            raise HTTPException(409, "result revalidation requires a rework task")
-        run = con.execute(
-            """SELECT * FROM war_execution_runs
-               WHERE war_task_id=? AND core_run_id=? AND lower(run_status)='fail'""",
-            (task_id, core_run_id.strip()),
-        ).fetchone()
+        candidate = _result_revalidation_candidate(con, task)
+        run = candidate["run"] if candidate and candidate["run"]["core_run_id"] == core_run_id.strip() else None
         if not run:
             raise HTTPException(409, "RESULT_REVALIDATION_RUN_MISMATCH")
-        if not run["openclaw_run_id"] or not run["session_key"]:
-            raise HTTPException(409, "RESULT_SNAPSHOT_IDENTITY_MISSING")
         calls = con.execute(
             "SELECT call_count FROM war_task_calls WHERE task_id=? AND task_revision=?",
             (task_id, int(task["revision"])),
@@ -1072,9 +1152,44 @@ async def revalidate_task_result(task_id: str, request: Request,
             (history_id, task_id, int(task["revision"]), core_run_id.strip(), run["openclaw_run_id"],
              run["session_key"], RESULT_REVALIDATOR_VERSION, reason, history_outcome, run["run_status"],
              original_response, dispatch_count, now))
+        linked_evidence = 0
+        qa_delivery_queued = False
         if valid_pass:
-            con.execute("UPDATE war_tasks SET status='qa',qa_cycle=qa_cycle+1,updated_at=? WHERE id=? AND status='rework_required'",
-                         (now, task_id))
+            next_cycle = int(task["qa_cycle"]) if task["status"] == "qa" else int(task["qa_cycle"]) + 1
+            con.execute("UPDATE war_tasks SET status='qa',qa_cycle=?,updated_at=? WHERE id=? AND status IN ('running','qa','rework_required')",
+                         (next_cycle, now, task_id))
+            task = con.execute("SELECT * FROM war_tasks WHERE id=?", (task_id,)).fetchone()
+            # The saved RESULT is the recovery source. Any still-queued worker
+            # delivery for that revision must be terminalized before the QA
+            # queue is exposed, otherwise the normal worker loop could replay
+            # the original instruction.
+            cancelled = con.execute(
+                """UPDATE war_deliveries
+                   SET status='failed',error_code='result_revalidation_worker_bypassed',
+                       error_class='system_error',last_error_at=?
+                   WHERE message_id=? AND task_revision=? AND agent_id<>?
+                     AND status='queued'""",
+                (now, task["source_message_id"], int(task["revision"]), task["reviewer_agent_id"]),
+            ).rowcount
+            if cancelled:
+                _audit(con, task["project_id"], actor, "result_revalidation_worker_bypassed",
+                       "task", task_id, {"delivery_count": cancelled}, str(uuid.uuid4()))
+            linked_evidence = _link_revalidation_evidence(
+                con, task, candidate["source_revision"], core_run_id.strip(), now,
+            )
+            from war_room_worker import _queue_auto_qa_delivery
+            adapter = _adapter_for_mode(task["execution_mode"], str(war_room._db_path()))
+            qa_delivery_queued = _queue_auto_qa_delivery(
+                con, task_id=task_id, message_id=task["source_message_id"],
+                execution_mode=task["execution_mode"], adapter=adapter, now=now,
+            )
+            if not qa_delivery_queued:
+                raise HTTPException(409, "QA_DELIVERY_UNAVAILABLE")
+            con.execute(
+                """UPDATE war_processing_issues SET state='RESOLVED',updated_at=?
+                   WHERE task_id=? AND task_revision=? AND stage='RESULT' AND state='OPEN'""",
+                (now, task_id, int(task["revision"])),
+            )
         result = {
             "mode": "controlled", "task_id": task_id,
             "status": "qa" if valid_pass else "revalidation_rejected",
@@ -1083,6 +1198,8 @@ async def revalidate_task_result(task_id: str, request: Request,
             "history_id": history_id, "core_run_id": core_run_id.strip(),
             "original_run_status": run["run_status"], "dispatch_count": dispatch_count,
             "task_revision": int(task["revision"]), "worker_redispatched": False,
+            "qa_delivery_queued": qa_delivery_queued,
+            "linked_evidence_count": linked_evidence,
         }
         _audit(con, task["project_id"], actor, "result_revalidated", "task", task_id,
                {"history_id": history_id, "core_run_id": core_run_id.strip(), "outcome": history_outcome,
@@ -2296,8 +2413,8 @@ def list_tasks(project_id: str, status: str | None = None, assignee_agent_id: st
         for row in rows:
             evidence_count = con.execute("SELECT COUNT(*) FROM war_evidence WHERE task_id=?", (row["id"],)).fetchone()[0]
             verdict = con.execute("SELECT verdict,qa_principal,created_at FROM war_qa_verdicts WHERE task_id=? ORDER BY created_at DESC,id DESC LIMIT 1", (row["id"],)).fetchone()
-            failed_run = con.execute("SELECT core_run_id,run_status,raw_response,result_summary FROM war_execution_runs WHERE war_task_id=? AND lower(run_status)='fail' ORDER BY updated_at DESC,core_run_id DESC LIMIT 1", (row["id"],)).fetchone()
-            revalidation = ({"eligible": True, "core_run_id": failed_run["core_run_id"], "run_status": failed_run["run_status"], "original_response": failed_run["raw_response"] or failed_run["result_summary"]} if row["status"] == "rework_required" and failed_run else None)
+            revalidation_candidate = _result_revalidation_candidate(con, row)
+            revalidation = ({"eligible": True, "core_run_id": revalidation_candidate["run"]["core_run_id"], "run_status": revalidation_candidate["run"]["run_status"], "original_response": revalidation_candidate["run"]["raw_response"] or revalidation_candidate["run"]["result_summary"]} if revalidation_candidate else None)
             reviews[row["id"]] = {"evidence_count": evidence_count, "latest_qa_verdict": dict(verdict) if verdict else None, "execution_contract": public_contract(con, row["id"]), "processing_issues": issues(con, row["id"], row["revision"]), "revalidation": revalidation}
         delivery_map = {row["id"]: con.execute("SELECT status,error_class,retry_count,attempt_count,max_attempts FROM war_deliveries WHERE message_id=?", (row["source_message_id"],)).fetchall() if row["source_message_id"] else [] for row in rows}
     items = []
@@ -2347,7 +2464,6 @@ def get_task(task_id: str) -> dict[str, Any]:
         execution_contract = public_contract(con, task_id)
         from war_room_stage_recovery import issues
         processing_issues = issues(con, task_id, row["revision"])
-        failed_run = con.execute("SELECT core_run_id,run_status,raw_response,result_summary FROM war_execution_runs WHERE war_task_id=? AND lower(run_status)='fail' ORDER BY updated_at DESC,core_run_id DESC LIMIT 1", (task_id,)).fetchone()
     item = {
         **dict(row),
         "execution_contract": execution_contract,
@@ -2355,7 +2471,7 @@ def get_task(task_id: str) -> dict[str, Any]:
         "agent_ids": agent_ids,
         "evidence_count": evidence_count,
         "latest_qa_verdict": dict(verdict) if verdict else None,
-        "revalidation": ({"eligible": True, "core_run_id": failed_run["core_run_id"], "run_status": failed_run["run_status"], "original_response": failed_run["raw_response"] or failed_run["result_summary"]} if row["status"] == "rework_required" and failed_run else None),
+        "revalidation": ({"eligible": True, "core_run_id": revalidation_candidate["run"]["core_run_id"], "run_status": revalidation_candidate["run"]["run_status"], "original_response": revalidation_candidate["run"]["raw_response"] or revalidation_candidate["run"]["result_summary"]} if revalidation_candidate else None),
     }
     system_errors = sum(1 for delivery in deliveries if _delivery_state(delivery) == "system_error")
     item.update({"system_error_count": system_errors, "state": "system_error" if system_errors else row["status"]})

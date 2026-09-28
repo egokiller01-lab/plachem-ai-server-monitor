@@ -39,7 +39,11 @@ STATIC_DIR = BASE_DIR / "static"
 
 app = FastAPI(title="PLACHEM AI Server Monitor")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-app.mount("/vocal-coach", StaticFiles(directory=STATIC_DIR / "vocal-coach", html=True), name="vocal-coach")
+VOCAL_COACH_DIR = STATIC_DIR / "vocal-coach"
+# Generated vocal-coach assets are optional deployment artifacts. A fresh
+# source checkout must remain importable without an untracked runtime bundle.
+if VOCAL_COACH_DIR.is_dir():
+    app.mount("/vocal-coach", StaticFiles(directory=VOCAL_COACH_DIR, html=True), name="vocal-coach")
 app.include_router(war_room_router)
 app.include_router(war_room_actions_router)
 app.include_router(jev_task_router)

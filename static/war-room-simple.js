@@ -12,6 +12,7 @@ let selectedProjectId = null;
 let showAllDocuments = false;
 let busy = false;
 let generation = 0;
+const WAR_ROOM_SIMPLE_ASSET_VERSION = "20260928-result-revalidation-v1";
 
 const $ = id => document.getElementById(id);
 const esc = value => String(value ?? "").replace(/[&<>"']/g, ch => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]));
@@ -339,7 +340,7 @@ function taskCard(task) {
   if (["rework_required","stopped","stop_unconfirmed"].includes(task.status) && can("manage")) {
     actions.push(`<button class="btn" onclick="prepareReapproval('${esc(task.id)}')">재승인 준비</button>`);
   }
-  if (task.status === "rework_required" && task.revalidation?.eligible) {
+  if (["running", "qa", "rework_required"].includes(task.status) && task.revalidation?.eligible) {
     actions.push(`<button class="btn primary" onclick="revalidateResult('${esc(task.id)}')" ${representative() ? "" : "disabled"}>결과만 재검증</button>`);
   }
   if (task.status === "qa" && qa === "PASS" && Number(task.evidence_count || 0) > 0) {
@@ -473,7 +474,7 @@ async function revalidateResult(taskId) {
   await withBusy(async () => {
     try {
       const task = await latestTask(taskId);
-      if (task.status !== "rework_required" || !task.revalidation?.eligible) throw new Error("재검증 대상 결과가 없습니다.");
+      if (!["running", "qa", "rework_required"].includes(task.status) || !task.revalidation?.eligible) throw new Error("재검증 대상 결과가 없습니다.");
       const result = await guardedPost(
         `/api/war-room/tasks/${encodeURIComponent(task.id)}/revalidate-result`,
         {...mutationContract(task), core_run_id:task.revalidation.core_run_id},
