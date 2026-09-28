@@ -72,6 +72,9 @@ class _HarnessEngineProxy:
     def wait(self, core_run_id: str, *, timeout_seconds: float) -> dict[str, Any]:
         return self._harness.wait(core_run_id, timeout_seconds=timeout_seconds)
 
+    def resume_observation(self, core_run_id: str) -> dict[str, Any]:
+        return self._harness.resume_observation(core_run_id)
+
     def cancel(self, core_run_id: str) -> dict[str, Any]:
         return self._harness.cancel(core_run_id)
 
@@ -94,6 +97,7 @@ class PersistentExecutionHarness:
         self._controllers: dict[str, ActiveRunController] = {}
         self._observers: set[threading.Thread] = set()
         self._closed = False
+        self._restored_runs: set[str] = set()
         self._watchdog_jobs: set[str] = set()
         self._watchdog_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="gateway-judgment")
         self._cancel_intents: set[str] = set()
@@ -135,6 +139,8 @@ class PersistentExecutionHarness:
         if status != "FAIL":
             return  # PASS / BLOCKED / TIMEOUT / CANCELLED: no recovery
         core_run_id = str(record.get("core_run_id") or "")
+        if core_run_id in self._restored_runs:
+            return  # Restart restores observation, never a fresh recovery execution.
         if str(record.get("escalation_reason") or "") == "WATCHDOG_REQUEUE_REQUIRED":
             return
         # A recovery child run reaching terminal state is the end of the
@@ -264,6 +270,20 @@ class PersistentExecutionHarness:
                 watchdog = self._session_watchdog
                 if watchdog is not None:
                     self._schedule_watchdog(core_run_id, watchdog)
+        return record
+
+    def resume_observation(self, core_run_id: str) -> dict[str, Any]:
+        """Reconnect observation only; never submit, reset or reauthorize a worker."""
+        record = self.core_engine.status(core_run_id)
+        if record.get("status") != "RUNNING":
+            return record
+        bindings = getattr(self.core_engine.adapter, "bindings", None)
+        if bindings is None or bindings.get(core_run_id) is None:
+            return record
+        with self._lock:
+            if not self._closed and core_run_id not in self._controllers:
+                self._restored_runs.add(core_run_id)
+                self._start_observer(self._controller(core_run_id))
         return record
 
     def dispatch(self, **kwargs: Any) -> dict[str, Any]:
@@ -473,4 +493,24 @@ def get_persistent_harness(*, run_path: str | Path | None = None,
                 # disabled; no alternate auth or secret path is invented.
                 pass
         _HARNESSES[key] = harness
+        # Restart restoration is additive.  A core engine that does not expose
+        # an active-run registry, or whose registry read fails, must still
+        # yield a usable harness.  Restoration never dispatches; it only
+        # reattaches result observers to bindings that are already RUNNING.
+        registry = getattr(harness.core_engine, "registry", None)
+        list_active = getattr(registry, "active", None)
+        if callable(list_active):
+            try:
+                active_records = list(list_active())
+            except Exception:
+                _LOG.exception("Could not enumerate active runs for observation restore")
+                active_records = []
+            for record in active_records:
+                core_run_id = record.get("core_run_id")
+                if not core_run_id:
+                    continue
+                try:
+                    harness.resume_observation(core_run_id)
+                except Exception:
+                    _LOG.exception("Could not restore result observation for %s", core_run_id)
         return harness

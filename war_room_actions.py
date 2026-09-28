@@ -139,13 +139,24 @@ CREATE TABLE IF NOT EXISTS war_execution_units (
  agent_id TEXT NOT NULL, depends_on_execution_ids TEXT NOT NULL DEFAULT '[]',
  core_run_id TEXT, created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS war_result_revalidation_history (
+ id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES war_tasks(id),
+ task_revision INTEGER NOT NULL, core_run_id TEXT NOT NULL,
+ openclaw_run_id TEXT, session_key TEXT, validator_version TEXT NOT NULL,
+ reason TEXT NOT NULL, outcome TEXT NOT NULL, original_run_status TEXT NOT NULL,
+ original_response TEXT, dispatch_count INTEGER NOT NULL, requested_at INTEGER NOT NULL,
+ UNIQUE(task_id, task_revision, core_run_id, requested_at)
+);
 CREATE INDEX IF NOT EXISTS idx_war_execution_units_task ON war_execution_units(war_project_id,war_task_id);
+CREATE INDEX IF NOT EXISTS idx_war_result_revalidation_task ON war_result_revalidation_history(task_id, task_revision, requested_at DESC);
 CREATE INDEX IF NOT EXISTS idx_war_tasks_project_status ON war_tasks(project_id, status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_war_audit_project_created ON war_audit_events(project_id, created_at DESC, id DESC);
 CREATE TRIGGER IF NOT EXISTS war_audit_no_update BEFORE UPDATE ON war_audit_events BEGIN SELECT RAISE(ABORT, 'audit events are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS war_audit_no_delete BEFORE DELETE ON war_audit_events BEGIN SELECT RAISE(ABORT, 'audit events are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS war_evidence_no_update BEFORE UPDATE ON war_evidence BEGIN SELECT RAISE(ABORT, 'evidence is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS war_evidence_no_delete BEFORE DELETE ON war_evidence BEGIN SELECT RAISE(ABORT, 'evidence is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS war_result_revalidation_no_update BEFORE UPDATE ON war_result_revalidation_history BEGIN SELECT RAISE(ABORT, 'result revalidation history is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS war_result_revalidation_no_delete BEFORE DELETE ON war_result_revalidation_history BEGIN SELECT RAISE(ABORT, 'result revalidation history is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS war_instruction_no_update BEFORE UPDATE ON war_messages
 WHEN OLD.message_type = 'instruction' BEGIN SELECT RAISE(ABORT, 'instruction messages are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS war_instruction_no_delete BEFORE DELETE ON war_messages
@@ -410,6 +421,16 @@ def provision_action_schema(path: str | None = None) -> str:
     target = path or str(war_room._db_path())
     with _transaction_connection(target) as con:
         con.executescript(SCHEMA)
+        con.execute("""CREATE TABLE IF NOT EXISTS war_result_revalidation_history (
+            id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES war_tasks(id),
+            task_revision INTEGER NOT NULL, core_run_id TEXT NOT NULL,
+            openclaw_run_id TEXT, session_key TEXT, validator_version TEXT NOT NULL,
+            reason TEXT NOT NULL, outcome TEXT NOT NULL, original_run_status TEXT NOT NULL,
+            original_response TEXT, dispatch_count INTEGER NOT NULL, requested_at INTEGER NOT NULL,
+            UNIQUE(task_id, task_revision, core_run_id, requested_at))""")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_war_result_revalidation_task ON war_result_revalidation_history(task_id, task_revision, requested_at DESC)")
+        con.execute("""CREATE TRIGGER IF NOT EXISTS war_result_revalidation_no_update BEFORE UPDATE ON war_result_revalidation_history BEGIN SELECT RAISE(ABORT, 'result revalidation history is append-only'); END""")
+        con.execute("""CREATE TRIGGER IF NOT EXISTS war_result_revalidation_no_delete BEFORE DELETE ON war_result_revalidation_history BEGIN SELECT RAISE(ABORT, 'result revalidation history is append-only'); END""")
         provision_document_schema(con)
         participant_columns = {row[1] for row in con.execute("PRAGMA table_info(war_participants)")}
         if "active" not in participant_columns:
@@ -735,6 +756,7 @@ _FRESH_CONTEXT_ACTIONS = {
     "project_resume": "project",
     "task_stop": "task",
     "task_resume_qa": "task",
+    "task_revalidate_result": "task",
     "task_approve_execute": "task",
     "task_supersede": "task",
     "representative_completion": "task",
@@ -928,6 +950,9 @@ def _execution_error(exc: ValueError) -> HTTPException:
     return HTTPException(409, str(exc))
 
 
+RESULT_REVALIDATOR_VERSION = "war-room-result-revalidator-v1"
+
+
 @router.get("/projects/{project_id}/execution-candidates")
 def execution_candidates(project_id: str, request: Request, required_capabilities: str | None = None,
                          x_war_room_actor: str | None = Header(default=None),
@@ -985,6 +1010,86 @@ def list_executions(project_id: str, task_id: str, request: Request,
             raise HTTPException(404, "task not found for project")
     return {"project_id": project_id, "task_id": task_id,
             "executions": _execution_orchestrator().list_executions(war_project_id=project_id, war_task_id=task_id)}
+
+
+@router.post("/tasks/{task_id}/revalidate-result")
+async def revalidate_task_result(task_id: str, request: Request,
+                                 x_war_room_actor: str | None = Header(default=None),
+                                 x_war_room_token: str | None = Header(default=None),
+                                 idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
+    """Revalidate one persisted FAIL snapshot without dispatching a worker."""
+    body = await _body(request)
+    core_run_id = body.get("core_run_id")
+    if not isinstance(core_run_id, str) or not core_run_id.strip():
+        raise HTTPException(422, "core_run_id is required")
+    with _connect_rw() as con:
+        task = con.execute("SELECT * FROM war_tasks WHERE id=?", (task_id,)).fetchone()
+        if not task:
+            raise HTTPException(404, "Task not found")
+        actor = _actor(con, x_war_room_actor, "execute", task["project_id"], x_war_token, request)
+        _require_representative(actor)
+        scope = f"POST:/tasks/{task_id}/revalidate-result"
+        previous = _idem(con, actor, idempotency_key, scope, body)
+        if previous:
+            return previous
+        _validate_mutation_contract(body, task)
+        _require_fresh_context(con, body, actor=actor, project_id=task["project_id"],
+                                action="task_revalidate_result", target_id=task_id)
+        _require_mutable_project(con, task["project_id"])
+        _require_not_stopped(con, task["project_id"])
+        if task["status"] != "rework_required":
+            raise HTTPException(409, "result revalidation requires a rework task")
+        run = con.execute(
+            """SELECT * FROM war_execution_runs
+               WHERE war_task_id=? AND core_run_id=? AND lower(run_status)='fail'""",
+            (task_id, core_run_id.strip()),
+        ).fetchone()
+        if not run:
+            raise HTTPException(409, "RESULT_REVALIDATION_RUN_MISMATCH")
+        if not run["openclaw_run_id"] or not run["session_key"]:
+            raise HTTPException(409, "RESULT_SNAPSHOT_IDENTITY_MISSING")
+        calls = con.execute(
+            "SELECT call_count FROM war_task_calls WHERE task_id=? AND task_revision=?",
+            (task_id, int(task["revision"])),
+        ).fetchone()
+        dispatch_count = int(calls[0]) if calls else 0
+        original_response = run["raw_response"] or run["result_summary"]
+        adapter = _adapter_for_mode(task["execution_mode"], war_room._db_path())
+        try:
+            outcome = adapter.revalidate_result(core_run_id.strip())
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(409, str(exc) or "RESULT_SNAPSHOT_INVALID") from exc
+        status = getattr(getattr(outcome, "status", None), "value", getattr(outcome, "status", "FAIL"))
+        reason = str(getattr(outcome, "reason", "RESULT_REVALIDATION_FAILED") or "RESULT_REVALIDATION_FAILED")
+        valid_pass = str(status).upper() == "PASS" and not reason.endswith("_VALIDATION_ERROR") and "_VALIDATION_FAILED:" not in reason
+        now = _now()
+        history_id = str(uuid.uuid4())
+        history_outcome = "PASS" if valid_pass else "FAIL"
+        con.execute("""INSERT INTO war_result_revalidation_history
+            (id,task_id,task_revision,core_run_id,openclaw_run_id,session_key,validator_version,
+             reason,outcome,original_run_status,original_response,dispatch_count,requested_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (history_id, task_id, int(task["revision"]), core_run_id.strip(), run["openclaw_run_id"],
+             run["session_key"], RESULT_REVALIDATOR_VERSION, reason, history_outcome, run["run_status"],
+             original_response, dispatch_count, now))
+        if valid_pass:
+            con.execute("UPDATE war_tasks SET status='qa',qa_cycle=qa_cycle+1,updated_at=? WHERE id=? AND status='rework_required'",
+                         (now, task_id))
+        result = {
+            "mode": "controlled", "task_id": task_id,
+            "status": "qa" if valid_pass else "revalidation_rejected",
+            "outcome": history_outcome, "reason": reason,
+            "validator_version": RESULT_REVALIDATOR_VERSION,
+            "history_id": history_id, "core_run_id": core_run_id.strip(),
+            "original_run_status": run["run_status"], "dispatch_count": dispatch_count,
+            "task_revision": int(task["revision"]), "worker_redispatched": False,
+        }
+        _audit(con, task["project_id"], actor, "result_revalidated", "task", task_id,
+               {"history_id": history_id, "core_run_id": core_run_id.strip(), "outcome": history_outcome,
+                "reason": reason, "worker_redispatched": False}, str(uuid.uuid4()))
+        _save_idem(con, actor, idempotency_key, scope, body, result)
+        con.commit()
+        return result
 
 
 @router.post("/executions/{execution_id}/dispatch")
@@ -2191,7 +2296,9 @@ def list_tasks(project_id: str, status: str | None = None, assignee_agent_id: st
         for row in rows:
             evidence_count = con.execute("SELECT COUNT(*) FROM war_evidence WHERE task_id=?", (row["id"],)).fetchone()[0]
             verdict = con.execute("SELECT verdict,qa_principal,created_at FROM war_qa_verdicts WHERE task_id=? ORDER BY created_at DESC,id DESC LIMIT 1", (row["id"],)).fetchone()
-            reviews[row["id"]] = {"evidence_count": evidence_count, "latest_qa_verdict": dict(verdict) if verdict else None, "execution_contract": public_contract(con, row["id"]), "processing_issues": issues(con, row["id"], row["revision"])}
+            failed_run = con.execute("SELECT core_run_id,run_status,raw_response,result_summary FROM war_execution_runs WHERE war_task_id=? AND lower(run_status)='fail' ORDER BY updated_at DESC,core_run_id DESC LIMIT 1", (row["id"],)).fetchone()
+            revalidation = ({"eligible": True, "core_run_id": failed_run["core_run_id"], "run_status": failed_run["run_status"], "original_response": failed_run["raw_response"] or failed_run["result_summary"]} if row["status"] == "rework_required" and failed_run else None)
+            reviews[row["id"]] = {"evidence_count": evidence_count, "latest_qa_verdict": dict(verdict) if verdict else None, "execution_contract": public_contract(con, row["id"]), "processing_issues": issues(con, row["id"], row["revision"]), "revalidation": revalidation}
         delivery_map = {row["id"]: con.execute("SELECT status,error_class,retry_count,attempt_count,max_attempts FROM war_deliveries WHERE message_id=?", (row["source_message_id"],)).fetchall() if row["source_message_id"] else [] for row in rows}
     items = []
     for row in rows:
@@ -2240,6 +2347,7 @@ def get_task(task_id: str) -> dict[str, Any]:
         execution_contract = public_contract(con, task_id)
         from war_room_stage_recovery import issues
         processing_issues = issues(con, task_id, row["revision"])
+        failed_run = con.execute("SELECT core_run_id,run_status,raw_response,result_summary FROM war_execution_runs WHERE war_task_id=? AND lower(run_status)='fail' ORDER BY updated_at DESC,core_run_id DESC LIMIT 1", (task_id,)).fetchone()
     item = {
         **dict(row),
         "execution_contract": execution_contract,
@@ -2247,6 +2355,7 @@ def get_task(task_id: str) -> dict[str, Any]:
         "agent_ids": agent_ids,
         "evidence_count": evidence_count,
         "latest_qa_verdict": dict(verdict) if verdict else None,
+        "revalidation": ({"eligible": True, "core_run_id": failed_run["core_run_id"], "run_status": failed_run["run_status"], "original_response": failed_run["raw_response"] or failed_run["result_summary"]} if row["status"] == "rework_required" and failed_run else None),
     }
     system_errors = sum(1 for delivery in deliveries if _delivery_state(delivery) == "system_error")
     item.update({"system_error_count": system_errors, "state": "system_error" if system_errors else row["status"]})

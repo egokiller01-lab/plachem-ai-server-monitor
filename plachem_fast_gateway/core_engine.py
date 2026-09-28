@@ -458,6 +458,11 @@ class RunRegistry:
                 latest[run_id] = record
         return [copy.deepcopy(item) for item in reversed(list(latest.values()))][:limit]
 
+    def active(self) -> list[dict[str, Any]]:
+        """Enumerate active runs independently of the UI's 200-row display limit."""
+        latest = {record["core_run_id"]: record for record in self._records() if isinstance(record.get("core_run_id"), str)}
+        return [copy.deepcopy(r) for r in latest.values() if r.get("status") == CoreRunStatus.RUNNING.value]
+
     def _records(self) -> list[dict[str, Any]]:
         if not self.path.is_file():
             return []

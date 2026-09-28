@@ -151,6 +151,11 @@ def test_qa_only_resume_preserves_worker_result_revision_and_dispatch_count(prod
     item,_=prepare_profiled(client,root)
     reviewer=RepairableReviewer(root,failure)
     runtime=WarRoomRuntime(adapter=reviewer)
+    # Match production composition: the API and queue worker share one runtime.
+    # Keep the failure injection, final PASS and no-worker-redispatch assertions.
+    import war_room_runtime as runtime_module
+    monkeypatch.setattr(runtime_module, '_RUNTIME', runtime)
+    assert actions._adapter() is reviewer
     database=root/'war-room.sqlite3'
     def state():
         with sqlite3.connect(database) as con:

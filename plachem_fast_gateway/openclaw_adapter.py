@@ -1110,6 +1110,8 @@ class OpenClawAdapter:
         self.history_limit = history_limit
         self._output_observer: Callable[[RunBinding, str], None] | None = None
         self._trusted_validation_contexts: dict[str, dict[str, Any]] = {}
+        from .validation_state import ValidationStateStore
+        self.validation_state = ValidationStateStore(getattr(self.bindings, "path", None))
 
     def set_output_observer(self, observer: Callable[[RunBinding, str], None] | None) -> None:
         """Attach the Core-owned observation hook; it has no lifecycle authority."""
@@ -1213,6 +1215,7 @@ class OpenClawAdapter:
         task_contract = contract_from_message(str(params["message"]))
         if task_contract:
             self._trusted_validation_contexts[core_run_id]["war_room_task_profile"] = task_contract["task_profile"]
+        self.validation_state.put(core_run_id, "context", self._trusted_validation_contexts[core_run_id])
         agent_id = str(params["agentId"])
         requested_session = params.get("sessionKey")
         session_key = requested_session or f"agent:{agent_id}:fast-gateway-{core_run_id}"
@@ -1379,6 +1382,10 @@ class OpenClawAdapter:
             CoreRunStatus.TIMEOUT,
             CoreRunStatus.CANCELLED,
         }:
+            saved = self.validation_state.get(core_run_id, "outcome")
+            if saved is not None and saved.get("status") == binding.status.value:
+                saved["status"] = CoreRunStatus(saved["status"])
+                return AdapterOutcome(**saved)
             return AdapterOutcome(binding.status, binding.status.value)
         response = self.rpc.request_fresh(
             "agent.wait",
@@ -1432,10 +1439,12 @@ class OpenClawAdapter:
         }
         validation_payload: Mapping[str, Any] = {
             **control_payload,
-            **self._trusted_validation_contexts.get(core_run_id, {}),
+            **(self.validation_state.get(core_run_id, "context") or self._trusted_validation_contexts.get(core_run_id, {})),
             "history": history,
         }
         raw_response = self._terminal_assistant_text(history)
+        if raw_response:
+            self.validation_state.put(core_run_id, "result_input", {"binding": {"core_run_id": binding.core_run_id, "openclaw_run_id": binding.openclaw_run_id, "session_key": binding.session_key}, "envelope": dict(validation_payload)})
         decision = self.result_validator(validation_payload)
         original_decision = decision
         rejected_candidate = decision.result
@@ -1480,13 +1489,12 @@ class OpenClawAdapter:
                 recovery_rejection = "RECOVERY_UNAVAILABLE"
             if decision is original_decision and not recovery_rejection:
                 recovery_rejection = "RECOVERY_VALIDATION_FAILED"
-        self._set_status(binding, decision.status)
         validation_rejected = (
             decision.reason == "MISSING_RESULT"
             or "_VALIDATION_FAILED:" in decision.reason
             or decision.reason.endswith("_VALIDATION_ERROR")
         )
-        return AdapterOutcome(
+        outcome = AdapterOutcome(
             status=decision.status,
             reason=decision.reason,
             result=None if validation_rejected else decision.result,
@@ -1496,6 +1504,25 @@ class OpenClawAdapter:
             raw_response=raw_response,
             rejected_result=rejected_candidate if validation_rejected else None,
         )
+        saved = asdict(outcome)
+        saved["status"] = outcome.status.value
+        self.validation_state.put(core_run_id, "outcome", saved)
+        self._set_status(binding, decision.status)
+        return outcome
+
+    def revalidate_result(self, core_run_id: str) -> AdapterOutcome:
+        """Validate the identical saved response without dispatch or terminal rewrite."""
+        binding = self._require_binding(core_run_id)
+        snapshot = self.validation_state.get(core_run_id, "result_input")
+        if snapshot is None:
+            raise ValueError("RESULT_SNAPSHOT_UNAVAILABLE")
+        identity = {"core_run_id": binding.core_run_id, "openclaw_run_id": binding.openclaw_run_id, "session_key": binding.session_key}
+        if snapshot.get("binding") != identity:
+            raise ValueError("RESULT_SNAPSHOT_IDENTITY_MISMATCH")
+        envelope = snapshot["envelope"]
+        decision = self.result_validator(envelope)
+        return AdapterOutcome(status=decision.status, reason=decision.reason, result=decision.result,
+                              raw_response=self._terminal_assistant_text(envelope.get("history", {})))
 
     @staticmethod
     def _terminal_assistant_text(history: Mapping[str, Any]) -> str | None:

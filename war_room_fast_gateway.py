@@ -110,6 +110,9 @@ class FastGatewayWarRoomAdapter:
         # Polling is a read-only projection. The persistent harness observer is
         # solely responsible for collecting and reconciling terminal results.
         record = self.engine.status(core_id)
+        resume = getattr(self.engine, "resume_observation", None)
+        if record.get("status") == "RUNNING" and callable(resume):
+            record = resume(core_id)
         status = str(record.get("status") or "")
         if status == CoreRunStatus.RUNNING.value:
             return DeliveryReceipt(run_id, "received", run_id=run_id)
@@ -217,6 +220,13 @@ class FastGatewayWarRoomAdapter:
             "cancel_reason": record.get("cancel_reason") or record.get("reason"),
             "escalation_required": int(bool(record.get("escalation_required"))),
         }
+
+    def revalidate_result(self, core_run_id: str) -> Any:
+        """Revalidate the immutable saved result for one existing Core run."""
+        validator = getattr(self.engine.adapter, "revalidate_result", None)
+        if not callable(validator):
+            raise ValueError("RESULT_REVALIDATION_UNAVAILABLE")
+        return validator(core_run_id)
 
 
 class GatewayControlRPC:

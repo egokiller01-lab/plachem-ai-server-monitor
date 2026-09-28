@@ -339,6 +339,9 @@ function taskCard(task) {
   if (["rework_required","stopped","stop_unconfirmed"].includes(task.status) && can("manage")) {
     actions.push(`<button class="btn" onclick="prepareReapproval('${esc(task.id)}')">재승인 준비</button>`);
   }
+  if (task.status === "rework_required" && task.revalidation?.eligible) {
+    actions.push(`<button class="btn primary" onclick="revalidateResult('${esc(task.id)}')" ${representative() ? "" : "disabled"}>결과만 재검증</button>`);
+  }
   if (task.status === "qa" && qa === "PASS" && Number(task.evidence_count || 0) > 0) {
     actions.push(`<button class="btn primary" data-rep-action onclick="completeTask('${esc(task.id)}')" ${representative() ? "" : "disabled"}>최종 승인</button>`);
   }
@@ -464,6 +467,21 @@ async function resumeQA(taskId) {
       toast(result.status === "qa_unavailable" ? "QA 연결이 아직 복구되지 않았습니다. Worker 결과는 보존됩니다." : "Worker 재실행 없이 QA를 재개했습니다.");
       await loadProject(selectedProjectId);
     } catch (error) { toast(`QA 재개 실패: ${error.message}`, "bad"); }
+  });
+}
+async function revalidateResult(taskId) {
+  await withBusy(async () => {
+    try {
+      const task = await latestTask(taskId);
+      if (task.status !== "rework_required" || !task.revalidation?.eligible) throw new Error("재검증 대상 결과가 없습니다.");
+      const result = await guardedPost(
+        `/api/war-room/tasks/${encodeURIComponent(task.id)}/revalidate-result`,
+        {...mutationContract(task), core_run_id:task.revalidation.core_run_id},
+        "task_revalidate_result", task.id
+      );
+      toast(result.outcome === "PASS" ? "결과만 재검증하여 QA 단계로 이동했습니다." : "결과 재검증이 통과하지 못했습니다.", result.outcome === "PASS" ? "good" : "bad");
+      await loadProject(selectedProjectId);
+    } catch (error) { toast(`결과 재검증 실패: ${error.message}`, "bad"); }
   });
 }
 
