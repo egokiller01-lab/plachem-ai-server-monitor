@@ -803,6 +803,31 @@ def _project_state_fingerprint(con: sqlite3.Connection, project_id: str) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
+def _mutation_state_fingerprint(con: sqlite3.Connection, project_id: str,
+                                action: str, target_id: str) -> str:
+    """Task actions depend on the target, not unrelated workers' audit traffic."""
+    if _FRESH_CONTEXT_ACTIONS.get(action) != "task":
+        return _project_state_fingerprint(con, project_id)
+    task = con.execute("SELECT * FROM war_tasks WHERE id=? AND project_id=?",
+                       (target_id, project_id)).fetchone()
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    queries = {
+        "task": ("SELECT * FROM war_tasks WHERE id=?", (target_id,)),
+        "project": ("SELECT * FROM war_projects WHERE id=?", (project_id,)),
+        "control": ("SELECT * FROM war_project_control WHERE project_id=?", (project_id,)),
+        "agents": ("SELECT * FROM war_task_agents WHERE task_id=? ORDER BY agent_id", (target_id,)),
+        "grounding": ("SELECT * FROM war_grounding_packets WHERE task_id=?", (target_id,)),
+        "approvals": ("SELECT * FROM war_approvals WHERE task_id=? ORDER BY id", (target_id,)),
+        "deliveries": ("SELECT * FROM war_deliveries WHERE message_id=? AND task_revision=? ORDER BY id", (task["source_message_id"], task["revision"])),
+        "evidence": ("SELECT * FROM war_evidence WHERE task_id=? AND task_revision=? AND qa_cycle=? ORDER BY id", (target_id, task["revision"], task["qa_cycle"])),
+        "verdicts": ("SELECT * FROM war_qa_verdicts WHERE task_id=? AND task_revision=? AND qa_cycle=? ORDER BY id", (target_id, task["revision"], task["qa_cycle"])),
+    }
+    payload = {name: [list(row) for row in con.execute(sql, params)]
+               for name, (sql, params) in queries.items()}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
 def _encode_fresh_context(payload: dict[str, Any]) -> str:
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     encoded = base64.urlsafe_b64encode(raw).decode().rstrip("=")
@@ -857,7 +882,7 @@ def _require_fresh_context(
         or now - payload["iat"] > _FRESH_CONTEXT_TTL_SECONDS + 5
     ):
         raise HTTPException(409, "STALE_CONTEXT")
-    current = _project_state_fingerprint(con, project_id)
+    current = _mutation_state_fingerprint(con, project_id, action, target_id)
     if not hmac.compare_digest(str(payload.get("state_version") or ""), current):
         raise HTTPException(409, "STALE_CONTEXT")
 
@@ -1908,7 +1933,7 @@ def mutation_context(
             "project_id": project_id,
             "action": action,
             "target_id": effective_target,
-            "state_version": _project_state_fingerprint(con, project_id),
+            "state_version": _mutation_state_fingerprint(con, project_id, action, effective_target),
             "iat": now,
             "exp": now + _FRESH_CONTEXT_TTL_SECONDS,
         }

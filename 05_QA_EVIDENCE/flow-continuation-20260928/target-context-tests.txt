@@ -1,0 +1,32 @@
+.......                                                                  [100%]
+=============================== warnings summary ===============================
+tests/test_war_room_target_context.py::test_unrelated_worker_does_not_invalidate_target_approval
+  /home/plachem-sever/codex-workspaces/cha-secretary/warroom-flow-completion-20260928/app.py:53: DeprecationWarning: 
+          on_event is deprecated, use lifespan event handlers instead.
+  
+          Read more about it in the
+          [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+          
+    @app.on_event("startup")
+
+tests/test_war_room_target_context.py::test_unrelated_worker_does_not_invalidate_target_approval
+tests/test_war_room_target_context.py::test_unrelated_worker_does_not_invalidate_target_approval
+  /home/plachem-sever/.local/lib/python3.12/site-packages/fastapi/applications.py:4495: DeprecationWarning: 
+          on_event is deprecated, use lifespan event handlers instead.
+  
+          Read more about it in the
+          [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+          
+    return self.router.on_event(event_type)
+
+tests/test_war_room_target_context.py::test_unrelated_worker_does_not_invalidate_target_approval
+  /home/plachem-sever/codex-workspaces/cha-secretary/warroom-flow-completion-20260928/app.py:64: DeprecationWarning: 
+          on_event is deprecated, use lifespan event handlers instead.
+  
+          Read more about it in the
+          [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+          
+    @app.on_event("shutdown")
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+7 passed, 4 warnings in 2.74s

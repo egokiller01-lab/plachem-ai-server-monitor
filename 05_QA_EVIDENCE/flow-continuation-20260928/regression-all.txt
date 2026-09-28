@@ -1,0 +1,144 @@
+........................................................................ [ 20%]
+................................................................... [ 39%]
+...FF................................................................... [ 60%]
+........................................................................ [ 81%]
+..................................................................       [100%]
+=================================== FAILURES ===================================
+_ test_qa_only_resume_preserves_worker_result_revision_and_dispatch_count[provision] _
+
+production = (PosixPath('/tmp/pytest-of-plachem-sever/pytest-230/test_qa_only_resume_preserves_0'), <starlette.testclient.TestClien...ring.Transport object at 0x770db0f85490>, <plachem_fast_gateway.auth_broker.SQLiteAuthBroker object at 0x770db0ae3aa0>)
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x770db0f87d70>
+failure = 'provision'
+
+    @pytest.mark.parametrize('failure',['provision','format'])
+    def test_qa_only_resume_preserves_worker_result_revision_and_dispatch_count(production,monkeypatch,failure):
+        root,client,_,_=production
+        monkeypatch.setenv('PLACHEM_WAR_ROOM_AUTO_QA','1')
+        monkeypatch.setenv('PLACHEM_WAR_ROOM_QA_SIGNING_SECRET','isolated-test-secret')
+        rpc=WorkerRPC('SIMPLE_UI_TEST_PASS')
+        def factory(*args,**kwargs):
+            adapter=OpenClawAdapter(*args,**kwargs);adapter.rpc=rpc;return adapter
+        monkeypatch.setattr(service,'OpenClawAdapter',factory)
+        item,_=prepare_profiled(client,root)
+        reviewer=RepairableReviewer(root,failure)
+        runtime=WarRoomRuntime(adapter=reviewer)
+        database=root/'war-room.sqlite3'
+        def state():
+            with sqlite3.connect(database) as con:
+                con.row_factory=sqlite3.Row
+                return dict(con.execute('SELECT * FROM war_tasks WHERE id=?',(item['task_id'],)).fetchone()),con.execute("SELECT COUNT(*) FROM war_processing_issues WHERE task_id=? AND state='OPEN'",(item['task_id'],)).fetchone()[0]
+        try:
+            for _ in range(100):
+                runtime.tick(db_path=database);task,count=state()
+                if count: break
+                time.sleep(.02)
+            assert count and task['status']=='qa' and task['revision']==1
+            assert len(rpc.submitted)==1
+            rep={'X-Authenticated-Principal':'human-representative','X-War-Room-Proxy-Secret':'fixture-proxy-secret','Idempotency-Key':'qa-only-repair'}
+            context=client.get('/api/war-room/projects/plachem-agent-war-room/mutation-context',headers=rep,params={'action':'task_resume_qa','target_id':item['task_id']})
+            assert context.status_code==200,context.text
+            body={'context_token':context.json()['context_token'],'contract_version':1,'project_id':'plachem-agent-war-room','task_id':item['task_id'],'task_revision':1}
+            response=client.post(f"/api/war-room/tasks/{item['task_id']}/resume-qa",headers=rep,json=body)
+            assert response.status_code==200,response.text
+            assert response.json()['worker_redispatched'] is False
+            replay=client.post(f"/api/war-room/tasks/{item['task_id']}/resume-qa",headers=rep,json=body)
+            assert replay.status_code==200 and replay.json()==response.json()
+            for _ in range(100):
+                runtime.tick(db_path=database)
+                with sqlite3.connect(database) as con:
+                    verdict=con.execute('SELECT verdict FROM war_qa_verdicts WHERE task_id=?',(item['task_id'],)).fetchone()
+                if verdict: break
+                time.sleep(.02)
+>           assert verdict==('PASS',)
+E           AssertionError: assert None == ('PASS',)
+
+tests/test_war_room_flow_completion.py:181: AssertionError
+_ test_qa_only_resume_preserves_worker_result_revision_and_dispatch_count[format] _
+
+production = (PosixPath('/tmp/pytest-of-plachem-sever/pytest-230/test_qa_only_resume_preserves_1'), <starlette.testclient.TestClien...ring.Transport object at 0x770db0bdee10>, <plachem_fast_gateway.auth_broker.SQLiteAuthBroker object at 0x770db0bdfce0>)
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x770db0bdc350>
+failure = 'format'
+
+    @pytest.mark.parametrize('failure',['provision','format'])
+    def test_qa_only_resume_preserves_worker_result_revision_and_dispatch_count(production,monkeypatch,failure):
+        root,client,_,_=production
+        monkeypatch.setenv('PLACHEM_WAR_ROOM_AUTO_QA','1')
+        monkeypatch.setenv('PLACHEM_WAR_ROOM_QA_SIGNING_SECRET','isolated-test-secret')
+        rpc=WorkerRPC('SIMPLE_UI_TEST_PASS')
+        def factory(*args,**kwargs):
+            adapter=OpenClawAdapter(*args,**kwargs);adapter.rpc=rpc;return adapter
+        monkeypatch.setattr(service,'OpenClawAdapter',factory)
+        item,_=prepare_profiled(client,root)
+        reviewer=RepairableReviewer(root,failure)
+        runtime=WarRoomRuntime(adapter=reviewer)
+        database=root/'war-room.sqlite3'
+        def state():
+            with sqlite3.connect(database) as con:
+                con.row_factory=sqlite3.Row
+                return dict(con.execute('SELECT * FROM war_tasks WHERE id=?',(item['task_id'],)).fetchone()),con.execute("SELECT COUNT(*) FROM war_processing_issues WHERE task_id=? AND state='OPEN'",(item['task_id'],)).fetchone()[0]
+        try:
+            for _ in range(100):
+                runtime.tick(db_path=database);task,count=state()
+                if count: break
+                time.sleep(.02)
+            assert count and task['status']=='qa' and task['revision']==1
+            assert len(rpc.submitted)==1
+            rep={'X-Authenticated-Principal':'human-representative','X-War-Room-Proxy-Secret':'fixture-proxy-secret','Idempotency-Key':'qa-only-repair'}
+            context=client.get('/api/war-room/projects/plachem-agent-war-room/mutation-context',headers=rep,params={'action':'task_resume_qa','target_id':item['task_id']})
+            assert context.status_code==200,context.text
+            body={'context_token':context.json()['context_token'],'contract_version':1,'project_id':'plachem-agent-war-room','task_id':item['task_id'],'task_revision':1}
+            response=client.post(f"/api/war-room/tasks/{item['task_id']}/resume-qa",headers=rep,json=body)
+            assert response.status_code==200,response.text
+            assert response.json()['worker_redispatched'] is False
+            replay=client.post(f"/api/war-room/tasks/{item['task_id']}/resume-qa",headers=rep,json=body)
+            assert replay.status_code==200 and replay.json()==response.json()
+            for _ in range(100):
+                runtime.tick(db_path=database)
+                with sqlite3.connect(database) as con:
+                    verdict=con.execute('SELECT verdict FROM war_qa_verdicts WHERE task_id=?',(item['task_id'],)).fetchone()
+                if verdict: break
+                time.sleep(.02)
+>           assert verdict==('PASS',)
+E           AssertionError: assert None == ('PASS',)
+
+tests/test_war_room_flow_completion.py:181: AssertionError
+=============================== warnings summary ===============================
+app.py:53
+  /home/plachem-sever/codex-workspaces/cha-secretary/warroom-flow-completion-20260928/app.py:53: DeprecationWarning: 
+          on_event is deprecated, use lifespan event handlers instead.
+  
+          Read more about it in the
+          [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+          
+    @app.on_event("startup")
+
+../../../.local/lib/python3.12/site-packages/fastapi/applications.py:4495
+../../../.local/lib/python3.12/site-packages/fastapi/applications.py:4495
+  /home/plachem-sever/.local/lib/python3.12/site-packages/fastapi/applications.py:4495: DeprecationWarning: 
+          on_event is deprecated, use lifespan event handlers instead.
+  
+          Read more about it in the
+          [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+          
+    return self.router.on_event(event_type)
+
+app.py:64
+  /home/plachem-sever/codex-workspaces/cha-secretary/warroom-flow-completion-20260928/app.py:64: DeprecationWarning: 
+          on_event is deprecated, use lifespan event handlers instead.
+  
+          Read more about it in the
+          [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+          
+    @app.on_event("shutdown")
+
+tests/test_war_room_actions.py::WarRoomControlledApiTests::test_operating_fix_human_representative_and_legacy_reviewer_assignment
+tests/test_war_room_representative_mapping.py::WarRoomRepresentativeMappingTests::test_forged_session_cookie_cannot_elevate
+tests/test_war_room_representative_mapping.py::WarRoomRepresentativeMappingTests::test_trusted_signed_session_cookie_maps_and_approves
+  /home/plachem-sever/.local/lib/python3.12/site-packages/starlette/testclient.py:484: DeprecationWarning: Setting per-request cookies=<...> is being deprecated, because the expected behaviour on cookie persistence is ambiguous. Set cookies directly on the client instance instead.
+    return super().request(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/test_war_room_flow_completion.py::test_qa_only_resume_preserves_worker_result_revision_and_dispatch_count[provision]
+FAILED tests/test_war_room_flow_completion.py::test_qa_only_resume_preserves_worker_result_revision_and_dispatch_count[format]
+2 failed, 347 passed, 7 warnings, 5 subtests passed in 109.56s (0:01:49)
