@@ -1060,6 +1060,11 @@ def _normalize_required_evidence(values: Any) -> list[dict[str, Any]]:
 
 def _grounding_packet(body: dict[str, Any], project_id: str, document_version: str) -> dict[str, Any]:
     supplied = body.get("grounding") if isinstance(body.get("grounding"), dict) else {}
+    from war_room_task_contract import profile_grounding
+    try:
+        supplied = profile_grounding(body, supplied)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
     worktree = str(supplied.get("worktree") or os.environ.get("PLACHEM_WAR_ROOM_WORKTREE") or Path.cwd())
     verification_scope = str(supplied.get("verification_scope") or "TASK_RUN").strip().upper()
     if verification_scope not in {"TASK_RUN", "PROJECT_WINDOW"}:
@@ -1076,6 +1081,9 @@ def _grounding_packet(body: dict[str, Any], project_id: str, document_version: s
         "verification_scope": verification_scope,
         "session_integrity_required": any("existing work sessions" in value.lower() for value in supplied.get("forbidden", []) if isinstance(value, str)),
     }
+    for key in ("contract_version", "task_profile", "worker_timeout_seconds", "qa_timeout_seconds", "session_integrity_required"):
+        if key in supplied:
+            packet[key] = supplied[key]
     # Approved result-document paths are server-supplied task contract data:
     # the prepare request is the only source. Worker responses never
     # contribute to this list; the immutable grounding packet is the trust
@@ -1124,7 +1132,7 @@ def _grounded_instruction(instruction: str, packet: dict[str, Any], execution_mo
             "The final response must be raw JSON only: its first character must be { and its last character must be }. Do not use Markdown, code fences, backticks, or any prose before or after the JSON object. Use evidence and artifacts only for actually verified work. Artifacts are outputs newly produced by this run; for a read-only task, put inspected existing paths in evidence and return an empty artifacts array. Do not add fields outside this contract.\n"
             "[IMMUTABLE_GROUNDING_PACKET]\n" + json.dumps(packet, ensure_ascii=False, sort_keys=True) +
             "\n[ORIGINAL_INSTRUCTION_CONTEXT]\n" + instruction.strip() +
-            "\nReturn the Fast Gateway JSON object above; treat the original instruction only as context."
+            "\nFollow the original instruction as the task. Use the envelope only for approved constraints and final response formatting."
         )
     return "[STRUCTURED_RESULT]\nFINAL RESPONSE CONTRACT (highest priority): return only one JSON object with exactly: " + (
         '{"confirmed_worktree":"...","confirmed_revision":"...","verdict":"PASS|FAIL|REWORK",'
@@ -1777,6 +1785,11 @@ def _representative_completion_checks(con: sqlite3.Connection, task: sqlite3.Row
         missing.append(qa_error)
     if integrity_required and not integrity_ok:
         missing.append("SESSION_INTEGRITY")
+    from war_room_task_contract import profiled
+    if packet_error is None and profiled(packet):
+        evidence_error = _qa_evidence_validation(con, task, packet)
+        if evidence_error:
+            missing.append(evidence_error)
     return {"binding": binding, "missing": missing}
 
 
@@ -2141,11 +2154,12 @@ def list_tasks(project_id: str, status: str | None = None, assignee_agent_id: st
             FROM war_tasks t LEFT JOIN war_messages m ON m.id=t.source_message_id
             WHERE t.project_id=? ORDER BY t.updated_at DESC""", (project_id,)).fetchall()
         agents={row["id"]:[item[0] for item in con.execute("SELECT agent_id FROM war_task_agents WHERE task_id=? ORDER BY agent_id",(row["id"],)).fetchall()] for row in rows}
+        from war_room_task_contract import public_contract
         reviews = {}
         for row in rows:
             evidence_count = con.execute("SELECT COUNT(*) FROM war_evidence WHERE task_id=?", (row["id"],)).fetchone()[0]
             verdict = con.execute("SELECT verdict,qa_principal,created_at FROM war_qa_verdicts WHERE task_id=? ORDER BY created_at DESC,id DESC LIMIT 1", (row["id"],)).fetchone()
-            reviews[row["id"]] = {"evidence_count": evidence_count, "latest_qa_verdict": dict(verdict) if verdict else None}
+            reviews[row["id"]] = {"evidence_count": evidence_count, "latest_qa_verdict": dict(verdict) if verdict else None, "execution_contract": public_contract(con, row["id"])}
         delivery_map = {row["id"]: con.execute("SELECT status,error_class,retry_count,attempt_count,max_attempts FROM war_deliveries WHERE message_id=?", (row["source_message_id"],)).fetchall() if row["source_message_id"] else [] for row in rows}
     items = []
     for row in rows:
@@ -2190,8 +2204,11 @@ def get_task(task_id: str) -> dict[str, Any]:
             "SELECT status,error_class,retry_count,attempt_count,max_attempts FROM war_deliveries WHERE message_id=?",
             (row["source_message_id"],),
         ).fetchall() if row["source_message_id"] else []
+        from war_room_task_contract import public_contract
+        execution_contract = public_contract(con, task_id)
     item = {
         **dict(row),
+        "execution_contract": execution_contract,
         "agent_ids": agent_ids,
         "evidence_count": evidence_count,
         "latest_qa_verdict": dict(verdict) if verdict else None,
@@ -3080,6 +3097,11 @@ def _qa_evidence_validation(con: sqlite3.Connection, task: sqlite3.Row, packet: 
         return "QA_CONTRACT_ERROR"
     if legacy:
         return None
+    from war_room_task_contract import profiled, verify_receipt
+    if profiled(packet):
+        if required_ids != ["execution_receipt"] or len(selected) != 1:
+            return "QA_CONTRACT_ERROR"
+        return verify_receipt(con, task, selected[0])
     for row in selected:
         expected = next(item for item in required if item["id"] == contract_id(row))
         if (str(row["evidence_type"] or "") != expected["evidence_type"]

@@ -26,6 +26,7 @@ class TaskRuntimeClass(StrEnum):
     STANDARD = "STANDARD"
     LONG_CODING = "LONG_CODING"
     HEAVY_VALIDATION = "HEAVY_VALIDATION"
+    WAR_ROOM = "WAR_ROOM"
 
 
 class PolicyResolutionError(ValueError):
@@ -76,6 +77,7 @@ def task_runtime_profile(task_class: TaskRuntimeClass | str) -> RuntimeModelProf
         TaskRuntimeClass.STANDARD: 300.0,
         TaskRuntimeClass.LONG_CODING: 600.0,
         TaskRuntimeClass.HEAVY_VALIDATION: 900.0,
+        TaskRuntimeClass.WAR_ROOM: 3600.0,
     }
     maximum = runtimes[selected]
     reserve = min(60.0, maximum / 5.0)

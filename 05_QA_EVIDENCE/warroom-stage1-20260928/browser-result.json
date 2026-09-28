@@ -1,0 +1,22 @@
+{
+  "data_source": "/home/plachem-sever/codex-workspaces/cha-secretary/warroom-stage1-20260928/05_QA_EVIDENCE/warroom-stage1-20260928/live-state-1790591092/result.json",
+  "real_browser": "Chrome",
+  "mutations_performed": false,
+  "desktop": {
+    "http": 200,
+    "screenshot": "/home/plachem-sever/codex-workspaces/cha-secretary/warroom-stage1-20260928/05_QA_EVIDENCE/warroom-stage1-20260928/isolated-ui-desktop.png",
+    "task_profile": "ACKNOWLEDGEMENT",
+    "overflow": false,
+    "qa_pass_visible": true,
+    "final_approval_button_count": 2
+  },
+  "mobile": {
+    "http": 200,
+    "screenshot": "/home/plachem-sever/codex-workspaces/cha-secretary/warroom-stage1-20260928/05_QA_EVIDENCE/warroom-stage1-20260928/isolated-ui-mobile.png",
+    "task_profile": "ACKNOWLEDGEMENT",
+    "overflow": false,
+    "qa_pass_visible": true,
+    "final_approval_button_count": 2
+  },
+  "page_errors": []
+}

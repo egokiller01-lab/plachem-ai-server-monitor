@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -631,7 +632,9 @@ def production_result_validator() -> CompositeResultValidator:
 
     def evidence(result: Mapping[str, Any], envelope: Mapping[str, Any]) -> str | None:
         items = result.get("evidence")
-        if not isinstance(items, list) or not items:
+        if not isinstance(items, list):
+            return "INVALID_EVIDENCE"
+        if not items and envelope.get("war_room_task_profile") not in {"ACKNOWLEDGEMENT", "READ_ONLY", "CODE_CHANGE"}:
             return "MISSING_EVIDENCE"
         if not all(isinstance(item, Mapping) and isinstance(item.get("type"), str) for item in items):
             return "INVALID_EVIDENCE"
@@ -644,6 +647,19 @@ def production_result_validator() -> CompositeResultValidator:
                 if reason:
                     return reason
         observed = observed_actions(envelope, result)
+        profile = envelope.get("war_room_task_profile")
+        if profile in {"ACKNOWLEDGEMENT", "READ_ONLY", "CODE_CHANGE"}:
+            history = envelope.get("history")
+            messages = history.get("messages") if isinstance(history, Mapping) else None
+            if not isinstance(messages, list) or not any(
+                isinstance(m, Mapping) and m.get("role") == "user" for m in messages
+            ):
+                return "EVIDENCE_TRACE_UNAVAILABLE"
+            if profile == "ACKNOWLEDGEMENT" and observed["tool"]:
+                return "ACKNOWLEDGEMENT_TOOL_USE"
+            # The bounded transcript proves execution. Narrative claims go to
+            # independent QA, not a keyword gate that confuses negation/read/write.
+            return None
         for item in items:
             claim = f"{item.get('type', '')} {item.get('detail', '')}"
             for action, pattern in claim_patterns.items():
@@ -685,6 +701,9 @@ def production_result_validator() -> CompositeResultValidator:
             read_only = any(marker in user_text for marker in (
                 "read-only", "read only", "읽기 전용", "조회만", "변경하지",
             ))
+            profile = envelope.get("war_room_task_profile")
+            if profile in {"ACKNOWLEDGEMENT", "READ_ONLY", "CODE_CHANGE"}:
+                read_only = profile in {"ACKNOWLEDGEMENT", "READ_ONLY"}
             if read_only:
                 artifacts = result.get("artifacts")
                 # approved_paths is the existing server-supplied designation

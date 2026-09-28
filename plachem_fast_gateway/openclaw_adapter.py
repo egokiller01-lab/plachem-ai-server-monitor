@@ -1209,6 +1209,10 @@ class OpenClawAdapter:
         self._trusted_validation_contexts[core_run_id] = {
             "approved_paths": list(approved_paths),
         }
+        from war_room_task_contract import contract_from_message
+        task_contract = contract_from_message(str(params["message"]))
+        if task_contract:
+            self._trusted_validation_contexts[core_run_id]["war_room_task_profile"] = task_contract["task_profile"]
         agent_id = str(params["agentId"])
         requested_session = params.get("sessionKey")
         session_key = requested_session or f"agent:{agent_id}:fast-gateway-{core_run_id}"

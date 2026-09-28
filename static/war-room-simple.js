@@ -30,10 +30,13 @@ const post = (url, body = {}, method = "POST") => requestJson(url, {
 });
 
 function statusInfo(task) {
-  const state = task.state === "system_error" ? "system_error" : task.status;
+  const pending = typeof taskDeliveryRows === "function" && task.status === "running"
+    && taskDeliveryRows(task).some(row => row.status === "queued")
+    && !taskDeliveryRows(task).some(row => ["sent","received"].includes(row.status));
+  const state = task.state === "system_error" ? "system_error" : pending ? "queued" : task.status;
   const map = {
     draft:["초안","muted"], awaiting_approval:["승인 대기","waiting"], approved:["실행 준비","waiting"],
-    running:["작업중","running"], qa:["검수중","qa"], completed:["완료","good"],
+    queued:["실행 대기","waiting"], running:["작업중","running"], qa:["검수중","qa"], completed:["완료","good"],
     rework_required:["재작업 필요","bad"], system_error:["문제 발생","bad"],
     stopped:["중지","muted"], stop_unconfirmed:["중지 확인 필요","bad"],
   };
@@ -311,6 +314,9 @@ function failureBox(task) {
 function taskCard(task) {
   const [label,tone] = statusInfo(task);
   const qa = task.latest_qa_verdict?.verdict;
+  const contract = task.execution_contract || {};
+  const profileName = ({ACKNOWLEDGEMENT:"수신·연결 시험", READ_ONLY:"조회·분석", CODE_CHANGE:"코드 수정"})[contract.task_profile];
+  const contractText = profileName ? `${profileName} · Worker ${Math.floor(contract.worker_timeout_seconds/60)}분 · QA ${Math.floor(contract.qa_timeout_seconds/60)}분` : "기존 작업 조건";
   const meta = [task.assignee_agent_id && `담당 ${task.assignee_agent_id}`, task.reviewer_agent_id && `QA ${task.reviewer_agent_id}`, `수정 ${fmtTime(task.updated_at)}`].filter(Boolean).join(" · ");
   const actions = [];
   if (task.status === "awaiting_approval") {
@@ -331,6 +337,8 @@ function taskCard(task) {
   actions.push(`<a class="btn" href="/war-room/advanced?project_id=${encodeURIComponent(selectedProjectId)}&task_id=${encodeURIComponent(task.id)}&screen=task">고급 상세</a>`);
   return `<div class="task">
     <div class="task-top"><div><div class="task-title">${esc(trim(task.scope,190))}</div><div class="task-meta">${esc(meta)}${qa ? ` · QA ${esc(qa)}` : ""}</div></div><span class="status ${tone}">${esc(label)}</span></div>
+    <div class="task-meta">${esc(contractText)}</div>
+    ${contract.completion_conditions?.length ? `<div class="task-meta">완료 조건: ${esc(contract.completion_conditions.join(" / "))}</div>` : ""}
     ${failureBox(task)}
     <div class="task-actions">${actions.join("")}</div>
   </div>`;
@@ -397,7 +405,7 @@ async function approveAndRun(taskId) {
       if (task.status !== "awaiting_approval") throw new Error("이미 상태가 변경되었습니다.");
       await guardedPost(
         `/api/war-room/tasks/${encodeURIComponent(task.id)}/approve-execute`,
-        {...mutationContract(task), expires_at:Math.floor(Date.now()/1000)+1800},
+        {...mutationContract(task), expires_at:Math.floor(Date.now()/1000)+3600},
         "task_approve_execute", task.id
       );
       toast("대표 승인 후 작업 실행을 시작했습니다.", "good");
@@ -432,7 +440,7 @@ async function prepareReapproval(taskId) {
       const task = await latestTask(taskId);
       if (!["rework_required","stopped","stop_unconfirmed"].includes(task.status)) throw new Error("재승인 준비 대상 상태가 아닙니다.");
       await post(`/api/war-room/tasks/${encodeURIComponent(task.id)}/transition`, {
-        ...mutationContract(task), status:"awaiting_approval", deadline_at:Math.floor(Date.now()/1000)+1800
+        ...mutationContract(task), status:"awaiting_approval", deadline_at:Math.floor(Date.now()/1000)+9000
       });
       toast("재승인 준비가 끝났습니다. 대표 승인 후 다시 실행할 수 있습니다.", "good");
       await loadProject(selectedProjectId);
@@ -467,7 +475,8 @@ $("task-form").addEventListener("submit", async event => {
       const result = await post(`/api/war-room/projects/${encodeURIComponent(selectedProjectId)}/prepare`, {
         instruction, scope:instruction, assignee_agent_id:assignee, reviewer_agent_id:reviewer,
         agent_ids:[assignee], execution_mode:"FAST_GATEWAY",
-        deadline_at:Math.floor(Date.now()/1000)+1800,
+        task_profile:$("task-profile").value,
+        deadline_at:Math.floor(Date.now()/1000)+9000,
         document_version:baseline?.version || project?.manyfast_version || "unknown",
       });
       $("instruction").value = "";

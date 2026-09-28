@@ -1,0 +1,42 @@
+........................................................................ [ 21%]
+................................................................... [ 41%]
+........................................................................ [ 62%]
+........................................................................ [ 84%]
+....................................................                     [100%]
+=============================== warnings summary ===============================
+app.py:53
+  /home/plachem-sever/codex-workspaces/cha-secretary/warroom-stage1-20260928/app.py:53: DeprecationWarning: 
+          on_event is deprecated, use lifespan event handlers instead.
+  
+          Read more about it in the
+          [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+          
+    @app.on_event("startup")
+
+../../../.local/lib/python3.12/site-packages/fastapi/applications.py:4495
+../../../.local/lib/python3.12/site-packages/fastapi/applications.py:4495
+  /home/plachem-sever/.local/lib/python3.12/site-packages/fastapi/applications.py:4495: DeprecationWarning: 
+          on_event is deprecated, use lifespan event handlers instead.
+  
+          Read more about it in the
+          [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+          
+    return self.router.on_event(event_type)
+
+app.py:64
+  /home/plachem-sever/codex-workspaces/cha-secretary/warroom-stage1-20260928/app.py:64: DeprecationWarning: 
+          on_event is deprecated, use lifespan event handlers instead.
+  
+          Read more about it in the
+          [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+          
+    @app.on_event("shutdown")
+
+tests/test_war_room_actions.py::WarRoomControlledApiTests::test_operating_fix_human_representative_and_legacy_reviewer_assignment
+tests/test_war_room_representative_mapping.py::WarRoomRepresentativeMappingTests::test_forged_session_cookie_cannot_elevate
+tests/test_war_room_representative_mapping.py::WarRoomRepresentativeMappingTests::test_trusted_signed_session_cookie_maps_and_approves
+  /home/plachem-sever/.local/lib/python3.12/site-packages/starlette/testclient.py:484: DeprecationWarning: Setting per-request cookies=<...> is being deprecated, because the expected behaviour on cookie persistence is ambiguous. Set cookies directly on the client instance instead.
+    return super().request(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+335 passed, 7 warnings, 5 subtests passed in 101.80s (0:01:41)

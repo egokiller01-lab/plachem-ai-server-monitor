@@ -73,7 +73,7 @@ class FastGatewayWarRoomAdapter:
         record = self.engine.dispatch(
             agent_id=self._agent(agent_id), message=body, timeout_seconds=300.0,
             core_run_id=self.core_id(delivery_id), idempotency_key=delivery_id,
-            watchdog_managed=True,
+            watchdog_managed=True, task_runtime_class="WAR_ROOM",
             **dispatch_kwargs,
         )
         binding = record.get("openclaw_binding") or {}

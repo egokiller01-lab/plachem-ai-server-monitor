@@ -140,7 +140,7 @@ def _structured_result(con: sqlite3.Connection, message_id: str, agent_id: str, 
     return result, None
 
 
-def _fast_gateway_result(body: str) -> tuple[dict[str, Any] | None, str | None]:
+def _fast_gateway_result(body: str, *, allow_response_evidence: bool = False) -> tuple[dict[str, Any] | None, str | None]:
     """Parse only a Core-validated Fast Gateway terminal result for QA bridging."""
     try:
         value = json.loads(body.strip())
@@ -163,7 +163,7 @@ def _fast_gateway_result(body: str) -> tuple[dict[str, Any] | None, str | None]:
         if not isinstance(path, str) or not path.startswith("/"):
             return None, "fast_gateway_result_artifact_invalid"
         artifact_paths.append(path)
-    if not artifact_paths:
+    if not artifact_paths and not allow_response_evidence:
         return None, "fast_gateway_result_artifact_missing"
     return {
         "verdict": "PASS",
@@ -269,7 +269,8 @@ def _qa_review_instruction(con: sqlite3.Connection, task_id: str, message_id: st
     for row in workers:
         result, error = _structured_result(con, message_id, row["agent_id"], row["body"] or "")
         if (error or not result) and str(task["execution_mode"] or "") == "FAST_GATEWAY":
-            result, error = _fast_gateway_result(row["body"] or "")
+            from war_room_task_contract import profiled
+            result, error = _fast_gateway_result(row["body"] or "", allow_response_evidence=profiled(packet))
         if error or not result:
             summaries.append({"agent": row["agent_id"], "error": error or "missing_result"})
             continue
@@ -280,6 +281,9 @@ def _qa_review_instruction(con: sqlite3.Connection, task_id: str, message_id: st
             "run_id": row["run_id"],
         })
         evidence.extend(v for v in result.get("evidence", []) if isinstance(v, str) and v.startswith("/"))
+    from war_room_task_contract import profiled, receipt_paths
+    if profiled(packet):
+        evidence.extend(receipt_paths(con, task))
     unique_evidence = list(dict.fromkeys(evidence))[:20]
     return (
         "[AUTO_QA_REVIEW]\n"
@@ -311,6 +315,10 @@ def _capture_required_evidence(
         return
     from war_room_actions import _normalize_required_evidence
     packet = json.loads(packet_row[0])
+    from war_room_task_contract import profiled, capture_receipt
+    if profiled(packet):
+        capture_receipt(con, task, now)
+        return
     required = _normalize_required_evidence(packet.get("required_evidence", ["test", "artifact"]))
     workers = con.execute(
         """SELECT d.agent_id,d.run_id,rm.body
@@ -325,7 +333,8 @@ def _capture_required_evidence(
     for row in workers:
         result, error = _structured_result(con, message_id, row["agent_id"], row["body"] or "")
         if (error or not result) and str(task["execution_mode"] or "") == "FAST_GATEWAY":
-            result, error = _fast_gateway_result(row["body"] or "")
+            from war_room_task_contract import profiled
+            result, error = _fast_gateway_result(row["body"] or "", allow_response_evidence=profiled(packet))
         if error or not result:
             continue
         for uri in result.get("evidence", []):
@@ -459,6 +468,12 @@ def _queue_auto_qa_delivery(
         con.execute("UPDATE war_tasks SET status='rework_required',revision=revision+1,updated_at=? WHERE id=?", (now, task_id))
         _audit(con, task["project_id"], "qa_auto_blocked", task_id, {"reason": reason})
         return False
+    packet_row = con.execute("SELECT packet_json FROM war_grounding_packets WHERE task_id=?", (task_id,)).fetchone()
+    packet = json.loads(packet_row[0]) if packet_row else {}
+    from war_room_task_contract import profiled, QA_SECONDS
+    qa_deadline = task["deadline_at"]
+    if profiled(packet):
+        qa_deadline = min(int(qa_deadline or now + QA_SECONDS), now + QA_SECONDS)
     delivery_id = str(uuid.uuid4())
     correlation = str(uuid.uuid4())
     con.execute(
@@ -467,7 +482,7 @@ def _queue_auto_qa_delivery(
             session_key,session_id)
            VALUES (?,?,?,?, 'queued',0,?,?,?,?,?)""",
         (
-            delivery_id, message_id, reviewer, int(task["revision"]), task["deadline_at"], now, correlation,
+            delivery_id, message_id, reviewer, int(task["revision"]), qa_deadline, now, correlation,
             qa_binding["session_key"], qa_binding["session_id"],
         ),
     )

@@ -88,6 +88,8 @@ class PersistentExecutionHarness:
         self.core_engine = core_engine
         self.engine = _HarnessEngineProxy(self)
         self._controllers: dict[str, ActiveRunController] = {}
+        self._observers: set[threading.Thread] = set()
+        self._closed = False
         self._cancel_intents: set[str] = set()
         self._lock = threading.RLock()
         self._terminal_completion_subscriber: Any | None = None
@@ -173,7 +175,7 @@ class PersistentExecutionHarness:
             self._controller(core_run_id).cancel_requested = True
 
     def _start_observer(self, controller: ActiveRunController) -> None:
-        if controller.observer_started or controller.released:
+        if self._closed or controller.observer_started or controller.released:
             return
         controller.observer_started = True
 
@@ -204,15 +206,23 @@ class PersistentExecutionHarness:
             finally:
                 with self._lock:
                     self._cancel_intents.discard(controller.core_run_id)
+                    self._observers.discard(threading.current_thread())
 
         controller.observer = threading.Thread(
             target=observe,
             name=f"fast-gateway-observer-{controller.core_run_id}",
             daemon=True,
         )
+        self._observers.add(controller.observer)
         controller.observer.start()
 
     def _record(self, record: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            if self._closed:
+                return record
+            return self._record_active(record)
+
+    def _record_active(self, record: dict[str, Any]) -> dict[str, Any]:
         core_run_id = record.get("core_run_id")
         if isinstance(core_run_id, str) and core_run_id:
             status = str(record.get("status") or "")
@@ -271,13 +281,21 @@ class PersistentExecutionHarness:
 
     def close(self) -> None:
         with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._terminal_completion_subscriber = None
+            observers = tuple(self._observers)
             for controller in self._controllers.values():
                 controller.release()
             self._controllers.clear()
             self._cancel_intents.clear()
-            close = getattr(self.core_engine.adapter, "close", None)
-            if callable(close):
-                close()
+        close = getattr(self.core_engine.adapter, "close", None)
+        if callable(close):
+            close()
+        for observer in observers:
+            if observer is not threading.current_thread():
+                observer.join(timeout=5.0)
 
 
 _HARNESSES: dict[tuple[str, str], PersistentExecutionHarness] = {}
