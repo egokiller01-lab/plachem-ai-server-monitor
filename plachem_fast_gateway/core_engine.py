@@ -7,6 +7,9 @@ The OpenClaw adapter owns only its verified transport/session contract.
 from __future__ import annotations
 
 import copy
+from contextlib import contextmanager
+from functools import wraps
+import fcntl
 import hashlib
 import hmac
 import json
@@ -44,6 +47,24 @@ from .runtime_policy import (
 )
 from .loop_detector import RunScope, RunScopedLoopDetector
 from .auth_broker import AuthBrokerError, SQLiteAuthBroker, execution_auth_scope
+
+
+class RunRegistryCorruptionError(ValueError):
+    """A registry line is not a complete, valid JSON record."""
+
+    def __init__(self, code: str, line_number: int, records: list[dict[str, Any]]) -> None:
+        super().__init__(f"{code}:line={line_number}")
+        self.code = code
+        self.line_number = line_number
+        self.records = records
+
+
+def _exclusive_registry_mutation(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._registry_lock(exclusive=True):
+            return method(self, *args, **kwargs)
+    return wrapped
 
 
 _TERMINAL = {
@@ -180,7 +201,26 @@ class RunRegistry:
         self.auth_broker = auth_broker
         self._run_id_factory = run_id_factory or (lambda: f"core-{uuid.uuid4().hex}")
         self._lock = threading.RLock()
+        self._file_lock_state = threading.local()
 
+    @contextmanager
+    def _registry_lock(self, *, exclusive: bool):
+        depth = getattr(self._file_lock_state, "depth", 0)
+        if depth:
+            yield
+            return
+        lock_path = self.path.with_name(self.path.name + ".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+b") as lock_handle:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+            self._file_lock_state.depth = 1
+            try:
+                yield
+            finally:
+                self._file_lock_state.depth = 0
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+    @_exclusive_registry_mutation
     def create(
         self,
         *,
@@ -264,6 +304,7 @@ class RunRegistry:
             self._append(record)
             return copy.deepcopy(record), True
 
+    @_exclusive_registry_mutation
     def transition(
         self,
         core_run_id: str,
@@ -314,6 +355,7 @@ class RunRegistry:
             self._append(record)
             return copy.deepcopy(record)
 
+    @_exclusive_registry_mutation
     def reconcile_abort_observation(self, core_run_id: str) -> dict[str, Any]:
         """Atomically reconcile only the confirmed abort observation failure."""
         with self._lock:
@@ -332,6 +374,7 @@ class RunRegistry:
             self._append(record)
             return copy.deepcopy(record)
 
+    @_exclusive_registry_mutation
     def update_goal_state(
         self,
         core_run_id: str,
@@ -383,6 +426,7 @@ class RunRegistry:
             self._append(record)
             return copy.deepcopy(record)
 
+    @_exclusive_registry_mutation
     def update_policy(
         self,
         core_run_id: str,
@@ -439,54 +483,74 @@ class RunRegistry:
             return copy.deepcopy(record)
 
     def get(self, core_run_id: str) -> dict[str, Any] | None:
-        latest = None
-        for record in self._records():
-            if record.get("core_run_id") == core_run_id:
-                latest = record
-        return copy.deepcopy(latest) if latest is not None else None
+        with self._registry_lock(exclusive=False):
+            latest = None
+            for record in self._records():
+                if record.get("core_run_id") == core_run_id:
+                    latest = record
+            return copy.deepcopy(latest) if latest is not None else None
 
     def get_by_idempotency(self, key: str) -> dict[str, Any] | None:
-        latest = None
-        for record in self._records():
-            if record.get("idempotency_key") == key:
-                latest = record
-        return copy.deepcopy(latest) if latest is not None else None
+        with self._registry_lock(exclusive=False):
+            latest = None
+            for record in self._records():
+                if record.get("idempotency_key") == key:
+                    latest = record
+            return copy.deepcopy(latest) if latest is not None else None
 
     def recent(self, limit: int = 50) -> list[dict[str, Any]]:
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200:
             raise ValueError("INVALID_LIMIT")
-        latest: dict[str, dict[str, Any]] = {}
-        for record in self._records():
-            run_id = record.get("core_run_id")
-            if isinstance(run_id, str):
-                latest[run_id] = record
-        return [copy.deepcopy(item) for item in reversed(list(latest.values()))][:limit]
+        with self._registry_lock(exclusive=False):
+            latest: dict[str, dict[str, Any]] = {}
+            for record in self._records():
+                run_id = record.get("core_run_id")
+                if isinstance(run_id, str):
+                    latest[run_id] = record
+            return [copy.deepcopy(item) for item in reversed(list(latest.values()))][:limit]
 
     def active(self) -> list[dict[str, Any]]:
         """Enumerate active runs independently of the UI's 200-row display limit."""
-        latest = {record["core_run_id"]: record for record in self._records() if isinstance(record.get("core_run_id"), str)}
-        return [copy.deepcopy(r) for r in latest.values() if r.get("status") == CoreRunStatus.RUNNING.value]
+        with self._registry_lock(exclusive=False):
+            latest = {record["core_run_id"]: record for record in self._records() if isinstance(record.get("core_run_id"), str)}
+            return [copy.deepcopy(r) for r in latest.values() if r.get("status") == CoreRunStatus.RUNNING.value]
 
     def _records(self) -> list[dict[str, Any]]:
-        if not self.path.is_file():
-            return []
-        records = []
-        for line_number, line in enumerate(self.path.read_text(encoding="utf-8").splitlines(), 1):
-            if not line.strip():
-                continue
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"MALFORMED_RUN_REGISTRY:line={line_number}") from exc
-            if not isinstance(value, dict):
-                raise ValueError(f"MALFORMED_RUN_REGISTRY:line={line_number}")
-            records.append(value)
-        return records
+        with self._registry_lock(exclusive=False):
+            if not self.path.is_file():
+                return []
+            records = []
+            raw_lines = self.path.read_text(encoding="utf-8").splitlines(keepends=True)
+            for line_number, raw_line in enumerate(raw_lines, 1):
+                line = raw_line.rstrip("\r\n")
+                if not line.strip():
+                    continue
+                try:
+                    value = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    code = (
+                        "TRUNCATED_RUN_REGISTRY_TAIL"
+                        if line_number == len(raw_lines) and not raw_line.endswith(("\n", "\r"))
+                        else "MALFORMED_RUN_REGISTRY"
+                    )
+                    raise RunRegistryCorruptionError(code, line_number, records) from exc
+                if not isinstance(value, dict):
+                    raise RunRegistryCorruptionError("MALFORMED_RUN_REGISTRY", line_number, records)
+                records.append(value)
+            return records
 
     def _append(self, record: Mapping[str, Any]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8", newline="\n") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
+        with self._registry_lock(exclusive=True):
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            payload = (json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+            descriptor = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+            try:
+                view = memoryview(payload)
+                while view:
+                    view = view[os.write(descriptor, view):]
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
 
 
 def _read_only_has_symlink_component(path: Path) -> bool:
