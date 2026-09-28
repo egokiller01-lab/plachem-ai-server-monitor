@@ -5,6 +5,7 @@ let tasks = [];
 let board = [];
 let documents = [];
 let candidates = [];
+let participants = [];
 let baseline = null;
 let deliveries = [];
 let selectedProjectId = null;
@@ -114,16 +115,17 @@ async function loadProject(projectId) {
   const current = ++generation;
   const base = `/api/war-room/projects/${encodeURIComponent(projectId)}`;
   try {
-    const [detail, accessData, taskData, candidateData, boardData, documentData, baselineData, deliveryData] = await Promise.all([
+    const [detail, accessData, taskData, candidateData, participantData, boardData, documentData, baselineData, deliveryData] = await Promise.all([
       get(base), get(`${base}/access`), get(`${base}/tasks`), get(`${base}/agent-candidates`),
-      get(`${base}/process-board`), get(`${base}/documents`), get(`${base}/manyfast-baseline`),
-      get(`${base}/deliveries`),
+      get(`${base}/participants`), get(`${base}/process-board`), get(`${base}/documents`),
+      get(`${base}/manyfast-baseline`), get(`${base}/deliveries`),
     ]);
     if (current !== generation || projectId !== selectedProjectId) return;
     project = detail.project;
     access = accessData;
     tasks = taskData.items || [];
     candidates = candidateData.items || [];
+    participants = participantData.items || [];
     board = boardData.items || [];
     documents = documentData.items || [];
     baseline = baselineData;
@@ -187,17 +189,26 @@ function renderHeader() {
   history.replaceState(null, "", url);
 }
 
+function participantFor(agentId) {
+  return participants.find(row => row.principal_type === "agent" && row.principal_id === agentId);
+}
 function eligibleAssignees() {
-  const preferred = ["ERPmanager","ERPcoder","researcher","processdata","processsupport","secretary","main"];
+  const preferred = ["ERPmanager","ERPcoder","researcher","processdata","processsupport","secretary","qwentest","producer","cliper","main"];
   return candidates
-    .filter(row => row.participating && row.execution_eligible && !(row.capabilities || []).includes("qa"))
+    .filter(row => row.execution_eligible && row.enabled && !(row.capabilities || []).includes("qa"))
     .sort((a,b) => {
       const ai = preferred.indexOf(a.agent_id), bi = preferred.indexOf(b.agent_id);
       return (ai < 0 ? 99 : ai) - (bi < 0 ? 99 : bi) || a.agent_id.localeCompare(b.agent_id);
     });
 }
 function eligibleReviewers() {
-  return candidates.filter(row => row.participating && row.enabled && (row.capabilities || []).includes("qa"));
+  return candidates.filter(row => row.enabled && (row.capabilities || []).includes("qa"));
+}
+function agentOptionLabel(row) {
+  const participant = participantFor(row.agent_id);
+  if (!participant) return `${row.agent_id} · 선택 시 프로젝트 참여`;
+  if (!participant.active) return `${row.agent_id} · 선택 시 참여 재활성화`;
+  return row.agent_id;
 }
 function setOptions(select, rows, preferredId, emptyText) {
   if (!rows.length) {
@@ -207,7 +218,7 @@ function setOptions(select, rows, preferredId, emptyText) {
   }
   select.disabled = false;
   const previous = select.value;
-  select.innerHTML = rows.map(row => `<option value="${esc(row.agent_id)}">${esc(row.agent_id)}</option>`).join("");
+  select.innerHTML = rows.map(row => `<option value="${esc(row.agent_id)}">${esc(agentOptionLabel(row))}</option>`).join("");
   if (rows.some(row => row.agent_id === previous)) select.value = previous;
   else if (rows.some(row => row.agent_id === preferredId)) select.value = preferredId;
 }
@@ -223,9 +234,27 @@ function renderComposer() {
   $("instruction").disabled = !allowed;
   if (archived) $("composer-note").textContent = "보관된 프로젝트는 읽기 전용입니다.";
   else if (!can("manage")) $("composer-note").textContent = "이 프로젝트에서는 작업을 만들 권한이 없습니다.";
-  else if (!reviewers.length) $("composer-note").textContent = "프로젝트에 참여 중인 QA Agent가 없습니다. 고급 관리에서 QA 참여자를 추가해야 합니다.";
-  else if (!assignees.length) $("composer-note").textContent = "프로젝트에 실행 가능한 담당 Agent가 없습니다. 고급 관리에서 참여자를 확인하십시오.";
-  else $("composer-note").textContent = "작업 준비만으로 Agent가 실행되지는 않습니다. 아래 승인 대기 카드에서 대표 승인 후 실행됩니다.";
+  else if (!reviewers.length) $("composer-note").textContent = "사용 가능한 QA Agent가 없습니다. 고급 관리에서 Agent 등록 상태를 확인하십시오.";
+  else if (!assignees.length) $("composer-note").textContent = "서버에 실행 가능한 담당 Agent가 없습니다. Agent 등록 상태를 확인하십시오.";
+  else $("composer-note").textContent = "서버의 전체 가용 Agent를 선택할 수 있습니다. 프로젝트 미참여 Agent는 작업 준비 시 자동으로 참여 등록됩니다.";
+}
+
+async function ensureProjectParticipant(agentId, role) {
+  const current = participantFor(agentId);
+  const base = `/api/war-room/projects/${encodeURIComponent(selectedProjectId)}/participants`;
+  if (!current) {
+    await post(base, {principal_id:agentId, role});
+    return "added";
+  }
+  if (role === "qa" && (current.role !== "qa" || !current.active)) {
+    await post(`${base}/${encodeURIComponent(agentId)}`, {role:"qa", active:true}, "PATCH");
+    return "updated";
+  }
+  if (!current.active) {
+    await post(`${base}/${encodeURIComponent(agentId)}`, {active:true}, "PATCH");
+    return "reactivated";
+  }
+  return "unchanged";
 }
 
 function renderProjectSummary() {
@@ -393,6 +422,9 @@ $("task-form").addEventListener("submit", async event => {
       const assignee = $("assignee").value;
       const reviewer = $("reviewer").value;
       if (!instruction || !assignee || !reviewer) throw new Error("작업 내용, 담당 Agent, QA Agent를 확인하십시오.");
+      if (assignee === reviewer) throw new Error("담당 Agent와 QA Agent는 서로 달라야 합니다.");
+      const assigneeJoin = await ensureProjectParticipant(assignee, "developer");
+      const reviewerJoin = await ensureProjectParticipant(reviewer, "qa");
       const result = await post(`/api/war-room/projects/${encodeURIComponent(selectedProjectId)}/prepare`, {
         instruction, scope:instruction, assignee_agent_id:assignee, reviewer_agent_id:reviewer,
         agent_ids:[assignee], execution_mode:"FAST_GATEWAY",
@@ -400,7 +432,8 @@ $("task-form").addEventListener("submit", async event => {
         document_version:baseline?.version || project?.manyfast_version || "unknown",
       });
       $("instruction").value = "";
-      toast(`작업 준비 완료 · ${result.task_id.slice(0,8)} · 아직 실행 전입니다.`, "good");
+      const joined = [assigneeJoin, reviewerJoin].some(value => value !== "unchanged");
+      toast(`작업 준비 완료 · ${result.task_id.slice(0,8)} · 아직 실행 전입니다.${joined ? " 선택한 Agent의 프로젝트 참여도 자동 반영했습니다." : ""}`, "good");
       await loadProject(selectedProjectId);
     } catch (error) { toast(`작업 준비 실패: ${error.message}`, "bad"); }
   });

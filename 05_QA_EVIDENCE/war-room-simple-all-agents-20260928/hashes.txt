@@ -1,0 +1,2 @@
+2a168fdca422f16411fd37c3d3e8bea16557c459587e015646f80127b0eda702  static/war-room-simple.js
+83b201ebf7a6d81a6af68448ac2523a0149e0244f549465f8ad29c6170db801c  tests/test_war_room_actions.py

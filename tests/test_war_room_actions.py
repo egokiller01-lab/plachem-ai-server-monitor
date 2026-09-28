@@ -775,6 +775,27 @@ class WarRoomControlledApiTests(unittest.TestCase):
             self.assertEqual(200, advanced.status_code)
             self.assertIn("Process Board", advanced.text)
 
+    def test_simple_mode_available_agent_can_join_then_prepare(self) -> None:
+        root = Path(self.temp_dir.name)
+        openclaw = root / "simple-openclaw.json"
+        gateway = root / "simple-gateway.json"
+        agent_ids = ["main", "ERPcoder", "ERPmanager", "ERPqa", "FlexDev"]
+        openclaw.write_text(json.dumps({"agents":{"list":[{"id": item} for item in agent_ids]}}), encoding="utf-8")
+        gateway.write_text(json.dumps({item:{"allowed":True,"enabled":True,"capabilities":["chat"]} for item in agent_ids}), encoding="utf-8")
+        os.environ["PLACHEM_OPENCLAW_CONFIG"] = str(openclaw)
+        os.environ["PLACHEM_FAST_GATEWAY_AGENTS"] = str(gateway)
+        headers = {"X-War-Room-Actor":"main", "X-War-Room-Token":"fixture-main-token"}
+        base = "/api/war-room/projects/plachem-agent-war-room"
+        before = self.client.get(base + "/agent-candidates", headers=headers)
+        flex = next(row for row in before.json()["items"] if row["agent_id"] == "FlexDev")
+        self.assertTrue(flex["execution_eligible"])
+        self.assertFalse(flex["participating"])
+        joined = self.client.post(base + "/participants", json={"principal_id":"FlexDev","role":"developer"}, headers={**headers,"Idempotency-Key":"simple-join-flex"})
+        self.assertEqual(201, joined.status_code, joined.text)
+        prepared = self.client.post(base + "/prepare", json={"instruction":"simple join", "scope":"simple join", "assignee_agent_id":"FlexDev", "reviewer_agent_id":"ERPqa", "agent_ids":["FlexDev"], "execution_mode":"FAST_GATEWAY", "deadline_at":int(time.time())+1800, "document_version":"baseline-2026-08-23"}, headers={**headers,"Idempotency-Key":"simple-join-prepare"})
+        self.assertEqual(201, prepared.status_code, prepared.text)
+        self.assertEqual("FlexDev", prepared.json()["assignee_agent_id"])
+
     def test_simple_mode_hides_operator_details_and_reuses_controlled_api(self) -> None:
         root = Path(__file__).parents[1]
         html = (root / "static" / "war-room-simple.html").read_text(encoding="utf-8")
@@ -787,6 +808,11 @@ class WarRoomControlledApiTests(unittest.TestCase):
         self.assertIn("task_approve_execute", javascript)
         self.assertIn("task_stop", javascript)
         self.assertIn("representative_completion", javascript)
+        self.assertIn("ensureProjectParticipant", javascript)
+        self.assertIn("/participants", javascript)
+        self.assertIn(".filter(row => row.execution_eligible && row.enabled", javascript)
+        self.assertNotIn("row.participating && row.execution_eligible", javascript)
+        self.assertIn("선택 시 프로젝트 참여", javascript)
         self.assertIn('credentials:"same-origin"', javascript)
         self.assertNotIn("X-War-Room-Token", html + javascript)
 
