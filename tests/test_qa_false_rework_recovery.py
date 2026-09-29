@@ -184,16 +184,21 @@ def test_http_false_qa_rework_recovery_preserves_verdict_and_queues_only_qa(
         return client.post(f"/api/war-room/tasks/{item['task_id']}/recover-qa-rework",
                            headers={**rep, "Idempotency-Key": key}, json=body)
 
+    concurrent_keys = ["qa-recovery-a", "qa-recovery-b"]
     with ThreadPoolExecutor(max_workers=2) as pool:
-        responses = list(pool.map(submit, ["qa-recovery-a", "qa-recovery-b"]))
+        responses = list(pool.map(submit, concurrent_keys))
     successful = [response for response in responses if response.status_code == 200]
     assert len(successful) == 1, [(response.status_code, response.text) for response in responses]
     assert any(response.status_code == 409 for response in responses)
     result = successful[0].json()
     assert result["worker_redispatched"] is False and result["qa_delivery_queued"] is True
 
+    successful_key = next(
+        key for key, response in zip(concurrent_keys, responses)
+        if response.status_code == 200
+    )
     replay = client.post(f"/api/war-room/tasks/{item['task_id']}/recover-qa-rework",
-                         headers={**rep, "Idempotency-Key": "qa-recovery-a"}, json=body)
+                         headers={**rep, "Idempotency-Key": successful_key}, json=body)
     assert replay.status_code == 200
     with sqlite3.connect(database) as con:
         con.row_factory = sqlite3.Row
