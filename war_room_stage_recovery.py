@@ -119,16 +119,21 @@ def recover_false_qa_rework(
     ).fetchone()
     if not run or str(run['run_status']).lower() not in {'pass', 'completed'}:
         raise ValueError('QA_REWORK_RUN_MISMATCH')
-    if run['cancel_reason'] or not run['openclaw_run_id'] or not run['session_key']:
+    if run['cancel_reason'] or not run['openclaw_run_id']:
         raise ValueError('QA_REWORK_RUN_CANCELLED_OR_UNBOUND')
     delivery = con.execute(
         """SELECT * FROM war_deliveries
-           WHERE message_id=? AND agent_id=? AND task_revision=? AND run_id=?
+           WHERE message_id=? AND agent_id=? AND task_revision=?
+             AND run_id IN (?,?)
              AND status='responded' ORDER BY created_at DESC LIMIT 1""",
-        (task['source_message_id'], task['assignee_agent_id'], int(verdict['task_revision']), core_run_id),
+        (task['source_message_id'], task['assignee_agent_id'], int(verdict['task_revision']),
+         run['core_run_id'], run['openclaw_run_id']),
     ).fetchone()
     run_ids = {str(run['core_run_id']), str(run['openclaw_run_id'] or '')}
-    if not delivery or delivery['run_id'] not in run_ids or delivery['session_key'] != run['session_key']:
+    # Legacy delivery rows may have NULL session_key. Exact run/task/agent/revision
+    # binding above is the conservative fallback; non-NULL sessions must match.
+    if (not delivery or delivery['run_id'] not in run_ids
+            or (delivery['session_key'] is not None and delivery['session_key'] != run['session_key'])):
         raise ValueError('QA_REWORK_DELIVERY_BINDING_MISMATCH')
     qa_delivery = con.execute(
         """SELECT d.*,m.body AS response_body FROM war_deliveries d

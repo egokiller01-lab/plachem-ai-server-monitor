@@ -1061,12 +1061,28 @@ def _qa_recovery_candidate(con: sqlite3.Connection, task: sqlite3.Row) -> dict[s
             or approval["target_set_hash"] not in {"", expected_targets}):
         return None
     run = con.execute(
-        """SELECT r.core_run_id FROM war_execution_runs r JOIN war_deliveries d ON d.run_id=r.core_run_id
-           WHERE r.war_task_id=? AND d.agent_id=? AND d.task_revision=? AND d.status='responded'
-           ORDER BY r.updated_at DESC LIMIT 1""",
-        (task["id"], task["assignee_agent_id"], int(verdict["task_revision"])),
+        """SELECT r.* FROM war_execution_runs r JOIN war_deliveries d
+           ON d.run_id IN (r.core_run_id, r.openclaw_run_id)
+           WHERE r.war_task_id=? AND r.war_project_id=? AND r.agent_id=?
+             AND d.message_id=? AND d.agent_id=? AND d.task_revision=? AND d.status='responded'
+           ORDER BY r.updated_at DESC,r.core_run_id DESC LIMIT 1""",
+        (task["id"], task["project_id"], task["assignee_agent_id"], task["source_message_id"],
+         task["assignee_agent_id"], int(verdict["task_revision"])),
     ).fetchone()
-    if not run:
+    if not run or str(run["run_status"]).lower() not in {"pass", "completed"} or run["cancel_reason"]:
+        return None
+    delivery = con.execute(
+        """SELECT * FROM war_deliveries
+           WHERE message_id=? AND agent_id=? AND task_revision=?
+             AND run_id IN (?,?) AND status='responded'
+           ORDER BY created_at DESC,id DESC LIMIT 1""",
+        (task["source_message_id"], task["assignee_agent_id"], int(verdict["task_revision"]),
+         run["core_run_id"], run["openclaw_run_id"]),
+    ).fetchone()
+    # Some legacy Worker receipts have no session_key. Exact run/task/agent/revision
+    # binding is retained above; a supplied session_key must still match the run.
+    if not delivery or (delivery["session_key"] is not None
+                        and delivery["session_key"] != run["session_key"]):
         return None
     return {"eligible": True, "core_run_id": run["core_run_id"], "qa_verdict_id": verdict["id"],
             "recovery_code": "QA_FALSE_REWORK_RECEIPT_PATH"}

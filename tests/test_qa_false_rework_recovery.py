@@ -70,7 +70,8 @@ def test_http_false_qa_rework_recovery_preserves_verdict_and_queues_only_qa(
     artifact.write_text("PASS\n", encoding="utf-8")
     database = root / "war-room.sqlite3"
     now = int(time.time())
-    core_run_id = "original-worker-pass"
+    core_run_id = "war-original-worker-pass"
+    openclaw_run_id = "original-openclaw"
     with sqlite3.connect(database) as con:
         con.row_factory = sqlite3.Row
         task = con.execute("SELECT * FROM war_tasks WHERE id=?", (item["task_id"],)).fetchone()
@@ -78,12 +79,12 @@ def test_http_false_qa_rework_recovery_preserves_verdict_and_queues_only_qa(
                     (item["task_id"],))
         con.execute("""UPDATE war_deliveries SET status='responded',run_id=?,session_key=?,session_id=?,
                     response_message_id=? WHERE id=?""",
-                    (core_run_id, "agent:erpmanager:original", "original-session", item["message_id"], worker_delivery))
+                    (openclaw_run_id, None, "original-session", item["message_id"], worker_delivery))
         con.execute("""INSERT INTO war_execution_runs
             (core_run_id,war_project_id,war_task_id,agent_id,openclaw_run_id,session_key,run_status,
              result_summary,raw_response,policy_status,created_at,updated_at)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (core_run_id, "plachem-agent-war-room", item["task_id"], "ERPmanager", "original-openclaw",
+                    (core_run_id, "plachem-agent-war-room", item["task_id"], "ERPmanager", openclaw_run_id,
                      "agent:erpmanager:original", "PASS", "Worker PASS", "ORIGINAL_WORKER_RESPONSE", "accepted", now, now))
         scope_hash = hashlib.sha256(task["scope"].encode()).hexdigest()
         evidence_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
@@ -132,6 +133,12 @@ def test_http_false_qa_rework_recovery_preserves_verdict_and_queues_only_qa(
 
     adapter = RecoveryAdapter(artifact)
     monkeypatch.setattr(war_room_runtime, "_RUNTIME", war_room_runtime.WarRoomRuntime(adapter=adapter))
+    candidate = client.get(f"/api/war-room/tasks/{item['task_id']}", headers=rep)
+    assert candidate.status_code == 200, candidate.text
+    assert candidate.json()["task"]["qa_recovery"] == {
+        "eligible": True, "core_run_id": core_run_id, "qa_verdict_id": "false-qa-verdict",
+        "recovery_code": "QA_FALSE_REWORK_RECEIPT_PATH",
+    }
     context = client.get("/api/war-room/projects/plachem-agent-war-room/mutation-context", headers=rep,
                          params={"action": "task_resume_qa", "target_id": item["task_id"]})
     assert context.status_code == 200, context.text
@@ -148,6 +155,23 @@ def test_http_false_qa_rework_recovery_preserves_verdict_and_queues_only_qa(
                           headers={**rep, "Idempotency-Key": "qa-recovery-foreign"},
                           json={**body, "core_run_id": "foreign-run"})
     assert foreign.status_code == 409
+    with sqlite3.connect(database) as con:
+        con.execute("UPDATE war_deliveries SET session_key='agent:foreign:mismatch' WHERE id=?", (worker_delivery,))
+    session_mismatch = client.post(
+        f"/api/war-room/tasks/{item['task_id']}/recover-qa-rework",
+        headers={**rep, "Idempotency-Key": "qa-recovery-session-mismatch"}, json=body,
+    )
+    assert session_mismatch.status_code == 409
+    with sqlite3.connect(database) as con:
+        con.execute("UPDATE war_deliveries SET session_key=NULL WHERE id=?", (worker_delivery,))
+        con.execute("UPDATE war_deliveries SET run_id='foreign-openclaw' WHERE id=?", (worker_delivery,))
+    run_mismatch = client.post(
+        f"/api/war-room/tasks/{item['task_id']}/recover-qa-rework",
+        headers={**rep, "Idempotency-Key": "qa-recovery-run-mismatch"}, json=body,
+    )
+    assert run_mismatch.status_code == 409
+    with sqlite3.connect(database) as con:
+        con.execute("UPDATE war_deliveries SET run_id=? WHERE id=?", (openclaw_run_id, worker_delivery))
     with sqlite3.connect(database) as con:
         con.execute("UPDATE war_execution_runs SET cancel_reason='stop-cancelled' WHERE core_run_id=?", (core_run_id,))
     cancelled = client.post(f"/api/war-room/tasks/{item['task_id']}/recover-qa-rework",
