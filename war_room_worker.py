@@ -286,6 +286,16 @@ def _qa_review_instruction(con: sqlite3.Connection, task_id: str, message_id: st
     from war_room_task_contract import profiled, receipt_paths
     if profiled(packet):
         evidence.extend(receipt_paths(con, task))
+    # Stage-local QA recovery may preserve immutable Worker evidence without
+    # creating a new Worker delivery. Present those canonical paths explicitly
+    # so the reviewer does not reconstruct or guess a receipt location.
+    preserved = con.execute(
+        """SELECT uri FROM war_evidence
+           WHERE task_id=? AND task_revision=? AND qa_cycle=? AND immutable=1
+           ORDER BY created_at,id""",
+        (task_id, int(task["revision"]), int(task["qa_cycle"])),
+    ).fetchall()
+    evidence.extend(row["uri"] for row in preserved if isinstance(row["uri"], str) and row["uri"].startswith("/"))
     unique_evidence = list(dict.fromkeys(evidence))[:20]
     return (
         "[AUTO_QA_REVIEW]\n"
@@ -299,6 +309,7 @@ def _qa_review_instruction(con: sqlite3.Connection, task_id: str, message_id: st
         f"[ORIGINAL_TASK]\n{str(original['body'] if original else '')[:3000]}\n"
         f"[WORKER_RESULTS]\n{json.dumps(summaries, ensure_ascii=False)}\n"
         f"[WORKER_EVIDENCE_PATHS]\n{json.dumps(unique_evidence, ensure_ascii=False)}\n"
+        "[PATH_PRESENTATION]\nThe server-provided paths above are canonical immutable evidence paths; do not substitute or invent a receipt path.\n"
     )
 
 

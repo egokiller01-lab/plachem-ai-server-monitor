@@ -1,0 +1,16 @@
+QA false-REWORK recovery continuation evidence
+Date: 2026-09-29 Asia/Bangkok
+Worktree: /home/plachem-sever/.openclaw/agents/ERPcoder/01_ACTIVE/warroom-qa-rework-recovery-20260929
+
+Command:
+python3 -m pytest -q tests/test_qa_false_rework_recovery.py tests/test_result_only_revalidation_wiring.py tests/test_war_room_multi_fixes.py tests/test_war_room_auto_qa.py
+
+Result: 19 passed, 4 warnings
+Coverage included:
+- false receipt-path REWORK recovery: one new QA cycle, zero Worker redispatch, original verdict/evidence preserved
+- normal substantive REWORK rejection: HTTP 409
+- expired approval rejection: HTTP 409
+- target_set_hash mismatch rejection: HTTP 409
+- concurrent/idempotent recovery: one success, one conflict, replay stable
+
+Warnings: existing FastAPI on_event deprecation warnings only.

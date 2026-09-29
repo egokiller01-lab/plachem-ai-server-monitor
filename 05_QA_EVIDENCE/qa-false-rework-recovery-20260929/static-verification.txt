@@ -1,0 +1,8 @@
+QA false-REWORK recovery static verification
+Date: 2026-09-29 Asia/Bangkok
+
+python3 -m py_compile war_room_actions.py war_room_stage_recovery.py war_room_worker.py: PASS
+node --check static/war-room-simple.js: PASS
+git diff --check: PASS
+
+No production DB/runtime/config/service/deploy/push action performed.

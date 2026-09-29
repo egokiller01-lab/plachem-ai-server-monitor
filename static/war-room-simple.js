@@ -343,6 +343,9 @@ function taskCard(task) {
   if (["running", "qa", "rework_required"].includes(task.status) && task.revalidation?.eligible) {
     actions.push(`<button class="btn primary" onclick="revalidateResult('${esc(task.id)}')" ${representative() ? "" : "disabled"}>결과만 재검증</button>`);
   }
+  if (task.status === "rework_required" && task.qa_recovery?.eligible) {
+    actions.push(`<button class="btn primary" onclick="recoverQARework('${esc(task.id)}')" ${representative() ? "" : "disabled"}>잘못된 QA REWORK 복구</button>`);
+  }
   if (task.status === "qa" && qa === "PASS" && Number(task.evidence_count || 0) > 0) {
     actions.push(`<button class="btn primary" data-rep-action onclick="completeTask('${esc(task.id)}')" ${representative() ? "" : "disabled"}>최종 승인</button>`);
   }
@@ -483,6 +486,24 @@ async function revalidateResult(taskId) {
       toast(result.outcome === "PASS" ? "결과만 재검증하여 QA 단계로 이동했습니다." : "결과 재검증이 통과하지 못했습니다.", result.outcome === "PASS" ? "good" : "bad");
       await loadProject(selectedProjectId);
     } catch (error) { toast(`결과 재검증 실패: ${error.message}`, "bad"); }
+  });
+}
+
+async function recoverQARework(taskId) {
+  await withBusy(async () => {
+    try {
+      const task = await latestTask(taskId);
+      const recovery = task.qa_recovery;
+      if (task.status !== "rework_required" || !recovery?.eligible) throw new Error("복구 가능한 QA REWORK가 없습니다.");
+      const result = await guardedPost(
+        `/api/war-room/tasks/${encodeURIComponent(task.id)}/recover-qa-rework`,
+        {...mutationContract(task), core_run_id:recovery.core_run_id,
+         qa_verdict_id:recovery.qa_verdict_id, recovery_code:recovery.recovery_code},
+        "task_resume_qa", task.id
+      );
+      toast(result.worker_redispatched === false && result.qa_delivery_queued ? "Worker 없이 새 QA cycle을 열었습니다." : "QA 복구 결과를 확인하세요.", "good");
+      await loadProject(selectedProjectId);
+    } catch (error) { toast(`QA REWORK 복구 실패: ${error.message}`, "bad"); }
   });
 }
 
