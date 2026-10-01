@@ -1,6 +1,7 @@
 """Focused tests for the AI Server remote SSH collector (read-only)."""
 import importlib
 import subprocess
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -128,6 +129,43 @@ class RemoteCollectorBehaviorTests(unittest.TestCase):
         self.assertEqual(second["collected_ts"], first["collected_ts"])
         self.assertIsNone(second.get("stale"))
         self.assertIsNone(second["error"])
+
+    def test_concurrent_poll_waits_for_refresh_and_never_marks_live_cache_stale(self):
+        initial = subprocess.CompletedProcess(args=[], returncode=0, stdout=full_payload(), stderr="")
+        refreshed = subprocess.CompletedProcess(args=[], returncode=0, stdout=full_payload(rx0=2000), stderr="")
+        refresh_started = threading.Event()
+        allow_refresh = threading.Event()
+        calls = 0
+
+        def controlled_safe_run(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return initial
+            refresh_started.set()
+            self.assertTrue(allow_refresh.wait(timeout=2), "refresh was not released")
+            return refreshed
+
+        results = []
+        with mock.patch.object(app, "AI_SSH_HOST", "ai-server"), \
+             mock.patch.object(app, "safe_run", side_effect=controlled_safe_run):
+            app.collect_ai_server(now=1000.0)
+            first = threading.Thread(target=lambda: results.append(app.collect_ai_server(now=1011.0)))
+            second = threading.Thread(target=lambda: results.append(app.collect_ai_server(now=1011.5)))
+            first.start()
+            self.assertTrue(refresh_started.wait(timeout=2), "refresh did not start")
+            second.start()
+            allow_refresh.set()
+            first.join(timeout=2)
+            second.join(timeout=2)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(calls, 2)
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(result["collected_ts"] == 1011 for result in results))
+        self.assertTrue(all(not result.get("stale", False) for result in results))
+        self.assertTrue(all(result.get("error") is None for result in results))
 
     def test_failure_serves_cached_sample_as_stale(self):
         completed = subprocess.CompletedProcess(args=[], returncode=0, stdout=full_payload(), stderr="")

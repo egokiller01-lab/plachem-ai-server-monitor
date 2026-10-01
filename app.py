@@ -1254,6 +1254,7 @@ AI_SERVER_GPU_FIELDS = (
     "pcie.link.width.current,pcie.link.width.max"
 )
 _ai_server_cache: dict[str, Any] = {"last_attempt_ts": 0.0, "result": None}
+_ai_server_collect_lock = threading.Lock()
 
 _AI_SERVER_REMOTE_COMMAND = (
     f"echo __GPUS__; nvidia-smi --query-gpu={AI_SERVER_GPU_FIELDS} "
@@ -1454,7 +1455,7 @@ def _ai_server_error_payload(host: str, error: str, collected_ts: int) -> dict[s
     }
 
 
-def collect_ai_server(now: float | None = None) -> dict[str, Any] | None:
+def _collect_ai_server_unlocked(now: float | None = None) -> dict[str, Any] | None:
     """Collect AI Server telemetry over read-only SSH with TTL + stale cache.
 
     Returns None when disabled.  A success caches the payload; failures return
@@ -1517,11 +1518,23 @@ def collect_ai_server(now: float | None = None) -> dict[str, Any] | None:
     return payload
 
 
+def collect_ai_server(now: float | None = None) -> dict[str, Any] | None:
+    """Serialize remote refreshes so concurrent polls never mislabel live data.
+
+    The first caller performs the SSH refresh. Other callers wait for that
+    refresh and then consume its result instead of interpreting the in-flight
+    ``last_attempt_ts`` marker as a failed/stale collection.
+    """
+    with _ai_server_collect_lock:
+        return _collect_ai_server_unlocked(now=now)
+
+
 def _ai_server_reset_for_tests() -> None:
     """Reset the process-local AI collector cache (unit tests only)."""
-    _ai_server_cache.clear()
-    _ai_server_cache["last_attempt_ts"] = 0.0
-    _ai_server_cache["result"] = None
+    with _ai_server_collect_lock:
+        _ai_server_cache.clear()
+        _ai_server_cache["last_attempt_ts"] = 0.0
+        _ai_server_cache["result"] = None
 
 
 def _gpu_slot_severity(slot: dict[str, Any]) -> str:
