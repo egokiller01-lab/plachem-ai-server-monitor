@@ -286,6 +286,18 @@ class UiAnchorTests(unittest.TestCase):
         self.assertIn('class="system-strip main-system-strip"', self.html)
         self.assertIn('class="server-columns"', self.html)
 
+    def test_gpu_cards_use_compact_summary_layout(self):
+        self.assertIn("Compact GPU summary requested by the operator", self.html)
+        self.assertRegex(
+            self.html,
+            r"body:not\(\.auth-control-open\) \.gpu-unit-card\s*\{[^}]*min-height:\s*148px",
+        )
+        self.assertRegex(
+            self.html,
+            r"body:not\(\.auth-control-open\) \.gpu-unit-metric\.fan,\s*"
+            r"body:not\(\.auth-control-open\) \.gpu-unit-pcie\s*\{\s*display:\s*none",
+        )
+
     def test_ai_system_panel_id_is_unique(self):
         self.assertEqual(self.html.count('id="ai-system-panel"'), 1)
 
