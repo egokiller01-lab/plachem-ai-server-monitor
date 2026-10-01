@@ -1239,6 +1239,291 @@ def _gpu_slot_is_fresh(gpu: dict[str, Any], collected_ts: int, now_ts: float) ->
     return (now_ts - collected_ts) <= GPU_STALE_AFTER_SECONDS
 
 
+# --- AI Server remote read-only SSH collector ---------------------------------
+# One SSH round-trip gathers GPU telemetry plus host system metrics.  The
+# remote command only reads; nothing is written or changed on ai-server.
+# Failures never fabricate values: cached telemetry ages into stale=True and
+# a never-collected host surfaces as error with null telemetry.
+AI_SSH_HOST = os.getenv("PLACHEM_AI_SSH_HOST", "ai-server")
+AI_SSH_CONNECT_TIMEOUT_SECONDS = 5
+AI_SSH_TIMEOUT_SECONDS = 8.0
+AI_SSH_MIN_INTERVAL_SECONDS = 10.0
+AI_SERVER_GPU_FIELDS = (
+    "name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,"
+    "power.limit,fan.speed,pci.bus_id,pcie.link.gen.current,pcie.link.gen.max,"
+    "pcie.link.width.current,pcie.link.width.max"
+)
+_ai_server_cache: dict[str, Any] = {"last_attempt_ts": 0.0, "result": None}
+
+_AI_SERVER_REMOTE_COMMAND = (
+    f"echo __GPUS__; nvidia-smi --query-gpu={AI_SERVER_GPU_FIELDS} "
+    "--format=csv,noheader,nounits 2>/dev/null; "
+    "echo __SYS__; "
+    "printf 'LOAD %s\\n' \"$(cut -d' ' -f1 /proc/loadavg)\"; "
+    "printf 'NPROC %s\\n' \"$(nproc)\"; "
+    "printf 'MEM %s %s\\n' \"$(awk '/MemTotal/{print $2}' /proc/meminfo)\" \"$(awk '/MemAvailable/{print $2}' /proc/meminfo)\"; "
+    "printf 'DISK %s %s %s\\n' \"$(df -kP / | awk 'NR==2{print $2, $3}')\" \"$(df -P / | awk 'NR==2{print $5}' | tr -d '%')\"; "
+    "printf 'TEMP %s\\n' \"$(cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | head -n1)\"; "
+    "printf 'UPTIME %s\\n' \"$(awk '{print int($1)}' /proc/uptime)\"; "
+    "echo __NET0__; cat /proc/net/dev; sleep 1; echo __NET1__; cat /proc/net/dev"
+)
+
+# Physical-ish primary interface for the AI Server; loopback, wireless,
+# virtual and tunnel interfaces are excluded so bps reflects the wired link.
+AI_NET_INTERFACE_PATTERN = re.compile(r"^(eth|eno|ens|enp|em)[0-9][a-z0-9f]*$")
+
+
+def _ai_netdev_snapshot(lines: list[str]) -> tuple[int, int] | None:
+    """Return (rx_bytes, tx_bytes) of the first matching wired interface."""
+    for line in lines:
+        if ":" not in line:
+            continue
+        name, _, rest = line.partition(":")
+        name = name.strip()
+        if not AI_NET_INTERFACE_PATTERN.match(name):
+            continue
+        fields = rest.split()
+        if len(fields) < 9:
+            continue
+        try:
+            return int(fields[0]), int(fields[8])
+        except ValueError:
+            continue
+    return None
+
+
+def _ai_float(token: str | None) -> float | None:
+    try:
+        value = float(str(token).strip())
+    except (TypeError, ValueError):
+        return None
+    return round(value, 1)
+
+
+def parse_ai_server_output(raw: str | None, collected_ts: int) -> dict[str, Any] | None:
+    """Parse the remote read-only payload into GPU rows + system metrics.
+
+    Returns None when the payload is unusable (caller keeps cached/error path).
+    Individual missing metrics stay null instead of getting fabricated values.
+    """
+    if not raw or not raw.strip():
+        return None
+    gpus: list[dict[str, Any]] = []
+    tokens: dict[str, str] = {}
+    section = None
+    net_sections: dict[str, list[str]] = {"net0": [], "net1": []}
+    for raw_line in raw.splitlines():
+        line = raw_line.strip()
+        if line == "__GPUS__":
+            section = "gpu"
+            continue
+        if line == "__SYS__":
+            section = "sys"
+            continue
+        if line == "__NET0__":
+            section = "net0"
+            continue
+        if line == "__NET1__":
+            section = "net1"
+            continue
+        if not line:
+            continue
+        if section in ("net0", "net1"):
+            net_sections[section].append(raw_line)
+            continue
+        if section == "gpu":
+            parts = [part.strip() for part in line.split(",")]
+            if len(parts) < 13:
+                continue
+            used = _ai_float(parts[2])
+            total = _ai_float(parts[3])
+            vram_used_gb = round(used / 1024, 1) if used is not None else None
+            vram_total_gb = round(total / 1024, 1) if total is not None else None
+            vram_pct = round(used / total * 100, 1) if used is not None and total else None
+            headroom_state, headroom_gb = _gpu_headroom_state({
+                "vram_used_gb": vram_used_gb, "vram_total_gb": vram_total_gb, "vram_usage_percent": vram_pct,
+            })
+            gpus.append({
+                "index": len(gpus),
+                "uuid": None,
+                "name": parts[0],
+                "usage_percent": _ai_float(parts[1]),
+                "vram_used_gb": vram_used_gb,
+                "vram_total_gb": vram_total_gb,
+                "vram_usage_percent": vram_pct,
+                "vram_headroom_gb": headroom_gb,
+                "vram_headroom_state": headroom_state,
+                "temperature_c": _ai_float(parts[4]),
+                "power_draw_w": _ai_float(parts[5]),
+                "power_limit_w": _ai_float(parts[6]),
+                "fan_speed_percent": _ai_float(parts[7]),
+                "pci_bus_id": parts[8] or None,
+                "pcie_gen_current": int(_ai_float(parts[9]) or 0) or None,
+                "pcie_gen_max": int(_ai_float(parts[10]) or 0) or None,
+                "pcie_width_current": int(_ai_float(parts[11]) or 0) or None,
+                "pcie_width_max": int(_ai_float(parts[12]) or 0) or None,
+                "status": "ok",
+                "source": "ssh:ai-server",
+            })
+        elif section == "sys" and " " in line:
+            key, _, value = line.partition(" ")
+            tokens[key.strip().upper()] = value.strip()
+    if section is None:
+        return None
+
+    cpu_percent: float | None = None
+    nproc = _ai_float(tokens.get("NPROC"))
+    load1 = _ai_float(tokens.get("LOAD"))
+    if nproc and load1 is not None and nproc > 0:
+        cpu_percent = round(min(100.0, load1 / nproc * 100.0), 1)
+
+    temp_c = _ai_float(tokens.get("TEMP"))
+    if temp_c is not None and temp_c > 1000:
+        temp_c = round(temp_c / 1000.0, 1)
+
+    mem_used_gb = mem_total_gb = mem_pct = disk_used_gb = disk_total_gb = disk_pct = None
+    mem_tokens = tokens.get("MEM", "").split()
+    if len(mem_tokens) == 2:
+        total_kb, avail_kb = _ai_float(mem_tokens[0]), _ai_float(mem_tokens[1])
+        if total_kb and avail_kb is not None:
+            mem_total_gb = round(total_kb / 1048576, 1)
+            mem_used_gb = round((total_kb - avail_kb) / 1048576, 1)
+            mem_pct = round((total_kb - avail_kb) / total_kb * 100, 1)
+    disk_tokens = tokens.get("DISK", "").split()
+    if len(disk_tokens) == 3:
+        pct_token = disk_tokens[2].rstrip("%")
+        total_kb, used_kb, pct_raw = _ai_float(disk_tokens[0]), _ai_float(disk_tokens[1]), _ai_float(pct_token)
+        if total_kb and used_kb is not None:
+            disk_total_gb = round(total_kb / 1048576, 1)
+            disk_used_gb = round(used_kb / 1048576, 1)
+            disk_pct = pct_raw
+
+    download_bps = upload_bps = None
+    snap0 = _ai_netdev_snapshot(net_sections["net0"])
+    snap1 = _ai_netdev_snapshot(net_sections["net1"])
+    if snap0 and snap1:
+        rx_delta = snap1[0] - snap0[0]
+        tx_delta = snap1[1] - snap0[1]
+        if rx_delta >= 0 and tx_delta >= 0:
+            # The remote command samples /proc/net/dev ~1s apart.
+            download_bps = round(float(rx_delta), 1)
+            upload_bps = round(float(tx_delta), 1)
+
+    system = {
+        "cpu_usage_percent": cpu_percent,
+        "cpu_load1": load1,
+        "cpu_cores": int(nproc) if nproc else None,
+        "cpu_temp_c": temp_c,
+        "memory_used_gb": mem_used_gb,
+        "memory_total_gb": mem_total_gb,
+        "memory_usage_percent": mem_pct,
+        "disk_used_gb": disk_used_gb,
+        "disk_total_gb": disk_total_gb,
+        "disk_usage_percent": disk_pct,
+        "download_bps": download_bps,
+        "upload_bps": upload_bps,
+        "uptime_seconds": _ai_float(tokens.get("UPTIME")),
+        "status": "ok" if gpus else "unknown",
+        "source": "ssh:ai-server",
+    }
+    return {"gpus": gpus, "system": system, "collected_ts": int(collected_ts), "error": None}
+
+
+def _ai_server_error_payload(host: str, error: str, collected_ts: int) -> dict[str, Any]:
+    return {
+        "gpus": [],
+        "system": {
+            "cpu_usage_percent": None,
+            "cpu_load1": None,
+            "cpu_cores": None,
+            "cpu_temp_c": None,
+            "memory_used_gb": None,
+            "memory_total_gb": None,
+            "memory_usage_percent": None,
+            "disk_used_gb": None,
+            "disk_total_gb": None,
+            "disk_usage_percent": None,
+            "download_bps": None,
+            "upload_bps": None,
+            "uptime_seconds": None,
+            "status": "error",
+            "source": "ssh:ai-server",
+        },
+        "collected_ts": int(collected_ts),
+        "error": error[:200],
+    }
+
+
+def collect_ai_server(now: float | None = None) -> dict[str, Any] | None:
+    """Collect AI Server telemetry over read-only SSH with TTL + stale cache.
+
+    Returns None when disabled.  A success caches the payload; failures return
+    the cached payload flagged stale=True, or an error payload (all telemetry
+    null) when no successful collection has ever happened.
+    """
+    host = (AI_SSH_HOST or "").strip()
+    if not host:
+        return None
+    now_ts = time.time() if now is None else float(now)
+    cache = _ai_server_cache
+    cached = cache.get("result")
+    if cached and now_ts - float(cached.get("collected_ts", 0)) < AI_SSH_MIN_INTERVAL_SECONDS:
+        return dict(cached)
+    if cache.get("last_attempt_ts") and now_ts - float(cache["last_attempt_ts"]) < AI_SSH_MIN_INTERVAL_SECONDS:
+        if cached:
+            stale = dict(cached)
+            stale["stale"] = True
+            return stale
+        return dict(cache.get("error_payload") or {})
+    cache["last_attempt_ts"] = now_ts
+    result: dict[str, Any] | None = None
+    error: str | None = None
+    if shutil.which("ssh"):
+        proc = safe_run(
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                f"ConnectTimeout={AI_SSH_CONNECT_TIMEOUT_SECONDS}",
+                "-o",
+                "StrictHostKeyChecking=yes",
+                "--",
+                host,
+                _AI_SERVER_REMOTE_COMMAND,
+            ],
+            timeout=AI_SSH_TIMEOUT_SECONDS,
+        )
+        if proc is None:
+            error = "ssh_timeout"
+        elif proc.returncode != 0:
+            error = f"ssh_exit_{proc.returncode}"
+        else:
+            result = parse_ai_server_output(proc.stdout, int(now_ts))
+            if result is None:
+                error = "parse_failure"
+    else:
+        error = "ssh_client_missing"
+    if result is not None:
+        cache["result"] = result
+        return dict(result)
+    if cached:
+        stale = dict(cached)
+        stale["stale"] = True
+        stale["error"] = error
+        return stale
+    payload = _ai_server_error_payload(host, error or "collect_failed", int(now_ts))
+    cache["error_payload"] = payload
+    return payload
+
+
+def _ai_server_reset_for_tests() -> None:
+    """Reset the process-local AI collector cache (unit tests only)."""
+    _ai_server_cache.clear()
+    _ai_server_cache["last_attempt_ts"] = 0.0
+    _ai_server_cache["result"] = None
+
+
 def _gpu_slot_severity(slot: dict[str, Any]) -> str:
     """Worst-severity feed for the overall banner.
 
@@ -1255,18 +1540,41 @@ def _gpu_slot_severity(slot: dict[str, Any]) -> str:
     return "ok"
 
 
-def build_dashboard_servers(gpus: list[dict[str, Any]] | None, now: float | None = None) -> dict[str, Any]:
+def build_dashboard_servers(
+    gpus: list[dict[str, Any]] | None,
+    now: float | None = None,
+    ai_gpus: list[dict[str, Any]] | None = None,
+    ai_system: dict[str, Any] | None = None,
+    ai_error: str | None = None,
+    ai_collected_ts: int | None = None,
+) -> dict[str, Any]:
     """Planned 2+4 slot dashboard across Main and AI servers.
 
-    Only GPUs actually detected by the collector carry telemetry; every other
+    Main slots fill from the local collector; AI slots fill from the read-only
+    SSH collector.  Only actually detected GPUs carry telemetry; every other
     planned slot is an offline/install_pending placeholder with null values.
     """
     now_ts = time.time() if now is None else float(now)
     collected_ts = int(now_ts)
-    pool = [dict(item) for item in (gpus or []) if isinstance(item, dict)]
+    main_pool = [dict(item) for item in (gpus or []) if isinstance(item, dict)]
+    ai_explicit = ai_gpus is not None
+    ai_pool = [dict(item) for item in (ai_gpus or []) if isinstance(item, dict)]
+    if ai_collected_ts:
+        # Cached remote payloads keep their original collection time so the
+        # 60s stale boundary is measured against the real SSH sample.
+        for item in ai_pool:
+            item.setdefault("collected_ts", int(ai_collected_ts))
     servers: list[dict[str, Any]] = []
-    cursor = 0
+    # Legacy 679a5ce contract: when no AI pool is supplied, detected GPUs fill
+    # Main then AI sequentially.  With ai_gpus provided, the pools are separate.
+    shared_cursor = 0
     for plan in GPU_SERVER_PLAN:
+        if plan["id"] == "ai" and ai_explicit:
+            pool = ai_pool
+            cursor = 0
+        else:
+            pool = main_pool
+            cursor = shared_cursor
         planned = int(plan["planned_slots"])
         slots: list[dict[str, Any]] = []
         for slot_no in range(1, planned + 1):
@@ -1298,11 +1606,13 @@ def build_dashboard_servers(gpus: list[dict[str, Any]] | None, now: float | None
                 slots.append(slot)
             else:
                 slots.append(_gpu_placeholder_slot(plan, slot_no, collected_ts))
+        if not (plan["id"] == "ai" and ai_explicit):
+            shared_cursor = cursor
         detected_slots = [item for item in slots if item.get("detected")]
         power_total_target = None
         if plan.get("power_target_slot_w") is not None:
             power_total_target = int(plan["power_target_slot_w"]) * planned
-        servers.append({
+        server_payload = {
             "id": plan["id"],
             "label": plan["label"],
             "model": plan["model"],
@@ -1312,7 +1622,14 @@ def build_dashboard_servers(gpus: list[dict[str, Any]] | None, now: float | None
             "power_target_slot_w": plan.get("power_target_slot_w"),
             "power_target_total_w": power_total_target,
             "slots": slots,
-        })
+        }
+        if plan["id"] == "ai":
+            system_payload = dict(ai_system) if isinstance(ai_system, dict) else None
+            if system_payload is not None and (ai_error or (system_payload.get("stale"))):
+                system_payload["stale"] = True
+            server_payload["system"] = system_payload
+            server_payload["collect_error"] = ai_error
+        servers.append(server_payload)
     severity_priority = {"ok": 0, "warning": 1, "error": 2}
     all_slots = [slot for server in servers for slot in server["slots"]]
     worst = "ok"
@@ -1322,6 +1639,17 @@ def build_dashboard_servers(gpus: list[dict[str, Any]] | None, now: float | None
         if severity_priority[severity] > severity_priority[worst]:
             worst = severity
             worst_slot = slot
+    if ai_error or (ai_system or {}).get("stale"):
+        # Remote collection failure: cached values may only be shown flagged
+        # stale, never silently as fresh telemetry.
+        for slot in servers:
+            if slot["id"] != "ai":
+                continue
+            for item in slot["slots"]:
+                if item.get("detected"):
+                    item["stale"] = True
+        if severity_priority["warning"] > severity_priority[worst]:
+            worst = "warning"
     return {
         "collected_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(collected_ts)),
         "collected_ts": collected_ts,
@@ -2704,8 +3032,36 @@ def api_status() -> dict[str, Any]:
     gpu_headroom_gb = gpu_summary["headroom_gb"]
     gpu_temp_c = gpu_summary["temperature_c"]
 
+    ai_data: dict[str, Any] | None = None
     try:
-        dashboard_servers = build_dashboard_servers(gpus)
+        ai_data = collect_ai_server()
+    except Exception as exc:
+        ai_data = _ai_server_error_payload(AI_SSH_HOST or "ai-server", _sanitize_error(exc), int(time.time()))
+    ai_gpus = (ai_data or {}).get("gpus") or []
+    ai_system = (ai_data or {}).get("system")
+    ai_error = (ai_data or {}).get("error")
+    ai_collected_ts = (ai_data or {}).get("collected_ts")
+    if isinstance(ai_system, dict):
+        try:
+            ai_age = max(0, int(time.time() - int(ai_collected_ts or time.time())))
+        except (TypeError, ValueError):
+            ai_age = 0
+        ai_system = {
+            **ai_system,
+            "collected_ts": ai_collected_ts,
+            "age_seconds": ai_age,
+            "stale_after_seconds": GPU_STALE_AFTER_SECONDS,
+            "stale": bool((ai_data or {}).get("stale")) or bool(ai_error),
+        }
+
+    try:
+        dashboard_servers = build_dashboard_servers(
+            gpus,
+            ai_gpus=ai_gpus,
+            ai_system=ai_system,
+            ai_error=ai_error,
+            ai_collected_ts=ai_collected_ts,
+        )
     except Exception as exc:
         dashboard_servers = {
             "collected_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

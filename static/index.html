@@ -661,7 +661,20 @@
     .gpu-badge-install { color: var(--amber); background: rgba(255,178,28,.14); border: 1px solid rgba(255,178,28,.42); }
     .gpu-badge-stale { color: #a78bfa; background: rgba(167,139,250,.14); border: 1px solid rgba(167,139,250,.45); }
     .gpu-unit-card.gpu-slot-offline { opacity: .72; border-style: dashed; }
-    @media (max-width: 620px) { .ai-gpu-grid { grid-template-columns: 1fr; } }
+    .ai-system-panel { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; margin-top: 12px; padding: 12px 14px; border: 1px solid rgba(34,211,238,.28); border-radius: 14px; background: rgba(13,24,41,.55); }
+    .ai-system-panel.ai-system-stale { border-color: rgba(167,139,250,.5); }
+    .ai-system-panel.ai-system-error { border-color: rgba(255,92,113,.55); }
+    .ai-system-head { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; color: var(--muted); font-size: 9px; letter-spacing: .12em; text-transform: uppercase; }
+    .ai-system-head .ai-system-state { font-weight: 800; }
+    .ai-system-gauge { min-width: 0; }
+    .ai-system-gauge span { display: block; color: var(--muted); font-size: 8px; text-transform: uppercase; letter-spacing: .1em; }
+    .ai-system-gauge strong { display: block; margin-top: 3px; font-size: 13px; color: var(--text); white-space: nowrap; }
+    .ai-system-bar { margin-top: 6px; height: 4px; border-radius: 999px; background: rgba(148,163,184,.16); overflow: hidden; }
+    .ai-system-bar i { display: block; height: 100%; width: 0; border-radius: 999px; background: linear-gradient(90deg, #22d3ee, #63ef66); }
+    .ai-system-gauge.temp strong { color: var(--amber); }
+    .ai-system-gauge.net strong { color: #22d3ee; }
+    @media (max-width: 900px) { .ai-system-panel { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+    @media (max-width: 620px) { .ai-gpu-grid { grid-template-columns: 1fr; } .ai-system-panel { grid-template-columns: 1fr 1fr; } }
 
     .agent-grid .erpmanager-card { margin-top: 0; }
     .secretary-card { padding: 14px 16px; border-color: rgba(167,139,250,.42); box-shadow: 0 0 0 1px rgba(167,139,250,.20), 0 0 28px rgba(167,139,250,.10), var(--shadow); }
@@ -1369,6 +1382,7 @@
         <span class="gpu-server-meta" id="gpu-server-ai-meta">--</span>
       </div>
       <div class="gpu-grid ai-gpu-grid gpu-server-grid" id="ai-gpu-grid"></div>
+      <div class="ai-system-panel" id="ai-system-panel" hidden></div>
     </section>
 
     <section class="codex-grid">
@@ -1599,6 +1613,42 @@
         index,
         `GPU ${index}`
       );
+    }
+
+    function renderAiSystemPanel(server) {
+      const panel = document.getElementById("ai-system-panel");
+      if (!panel) return;
+      const system = server && server.system ? server.system : null;
+      const errored = !system || system.status === "error";
+      const stale = Boolean((system && system.stale) || (server && server.collect_error));
+      panel.hidden = false;
+      panel.className = `ai-system-panel${errored ? " ai-system-error" : stale ? " ai-system-stale" : ""}`;
+      const stateLabel = errored ? "COLLECT ERROR" : stale ? "STALE" : "LIVE · ssh ai-server";
+      const gauge = (label, value, barPercent, cls) => `
+        <div class="ai-system-gauge ${cls || ""}"><span>${label}</span><strong>${value}</strong>${
+          barPercent === null ? "" : `<div class="ai-system-bar"><i style="width:${Math.max(0, Math.min(100, barPercent))}%"></i></div>`
+        }</div>`;
+      const pctVal = (v) => (Number.isFinite(v) ? `${Math.round(v)}%` : "--");
+      const tempVal = (v) => (Number.isFinite(v) ? `${v}\u00b0C` : "--");
+      // Contract: missing AI telemetry renders as "--", never a substitute
+      // string.  formatBps() yields "Unknown" for null (used by the Main KPI
+      // tiles), so the AI panel keeps its own dash formatter.
+      const bpsVal = (v) => (Number.isFinite(v) ? formatBps(v) : "--");
+      const netVal = (down, up) => (
+        Number.isFinite(down) || Number.isFinite(up)
+          ? `${bpsVal(down)} / ${bpsVal(up)}`
+          : "--"
+      );
+      const cpuP = system ? system.cpu_usage_percent : null;
+      const memP = system ? system.memory_usage_percent : null;
+      const diskP = system ? system.disk_usage_percent : null;
+      panel.innerHTML = `
+        <div class="ai-system-head"><span>AI Server System</span><span class="ai-system-state">${escapeHtml(stateLabel)}</span></div>
+        ${gauge("CPU", `${pctVal(cpuP)}${system && Number.isFinite(system.cpu_load1) ? ` \u00b7 load ${system.cpu_load1}` : ""}`, cpuP)}
+        ${gauge("RAM", system && (Number.isFinite(system.memory_used_gb) || Number.isFinite(system.memory_total_gb)) ? `${formatGpuValue(system.memory_used_gb)} / ${formatGpuValue(system.memory_total_gb)} GB \u00b7 ${pctVal(memP)}` : "--", memP)}
+        ${gauge("Network \u2193 / \u2191", system ? netVal(system.download_bps, system.upload_bps) : "--", null, "net")}
+        ${gauge("Disk", system && (Number.isFinite(system.disk_used_gb) || Number.isFinite(system.disk_total_gb)) ? `${formatGpuValue(system.disk_used_gb)} / ${formatGpuValue(system.disk_total_gb)} GB \u00b7 ${pctVal(diskP)}` : "--", diskP)}
+        ${gauge("CPU Temp", tempVal(system ? system.cpu_temp_c : null), null, "temp")}`;
     }
 
     function renderGpuServerSection(server, gridId) {
@@ -1987,6 +2037,7 @@
           const aiServer = serverPlan.servers.find((item) => item.id === "ai") || null;
           renderGpuServerSection(mainServer, "gpu-grid");
           renderGpuServerSection(aiServer, "ai-gpu-grid");
+          renderAiSystemPanel(aiServer);
           setOverall(gpuOverallState(data.overall, serverPlan));
         } else {
           const gpuGrid = document.getElementById("gpu-grid");
