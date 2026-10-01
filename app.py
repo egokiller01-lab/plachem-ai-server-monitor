@@ -1253,8 +1253,18 @@ AI_SERVER_GPU_FIELDS = (
     "power.limit,fan.speed,pci.bus_id,pcie.link.gen.current,pcie.link.gen.max,"
     "pcie.link.width.current,pcie.link.width.max"
 )
-_ai_server_cache: dict[str, Any] = {"last_attempt_ts": 0.0, "result": None}
-_ai_server_collect_lock = threading.Lock()
+_ai_server_cache: dict[str, Any] = {
+    "last_attempt_ts": 0.0,
+    "last_failure_ts": 0.0,
+    "result": None,
+}
+# Single-flight guard: only one thread performs the SSH refresh at a time.
+# Without it, requests arriving while a refresh is in flight used to label a
+# perfectly valid cached sample stale=True (2026-10-01 production regression).
+_ai_server_lock = threading.Lock()
+_ai_server_updating = False
+_ai_server_done_event = threading.Event()
+_ai_server_done_event.set()
 
 _AI_SERVER_REMOTE_COMMAND = (
     f"echo __GPUS__; nvidia-smi --query-gpu={AI_SERVER_GPU_FIELDS} "
@@ -1455,13 +1465,41 @@ def _ai_server_error_payload(host: str, error: str, collected_ts: int) -> dict[s
     }
 
 
-def _collect_ai_server_unlocked(now: float | None = None) -> dict[str, Any] | None:
+def _ai_server_inflight_response(
+    cached: dict[str, Any] | None,
+    cache: dict[str, Any],
+    host: str,
+    now_ts: float,
+) -> dict[str, Any]:
+    """Response while another thread is refreshing over SSH.
+
+    A cached sample inside the stale boundary is valid telemetry, so it is
+    served as-is without a stale flag; only genuine age past the boundary is
+    reported stale.  With no sample yet, the caller waits briefly for the
+    in-flight outcome instead of flashing a bogus error panel.
+    """
+    if cached:
+        payload = dict(cached)
+        if now_ts - float(cached.get("collected_ts", 0)) > GPU_STALE_AFTER_SECONDS:
+            payload["stale"] = True
+            payload["stale_reason"] = "cache_age"  # genuine age past 60s boundary
+        return payload
+    _ai_server_done_event.wait(timeout=AI_SSH_TIMEOUT_SECONDS + 1.0)
+    settled = cache.get("result") or cache.get("error_payload")
+    if settled:
+        return dict(settled)
+    return _ai_server_error_payload(host, "collect_in_progress", int(now_ts))
+
+
+def collect_ai_server(now: float | None = None) -> dict[str, Any] | None:
     """Collect AI Server telemetry over read-only SSH with TTL + stale cache.
 
-    Returns None when disabled.  A success caches the payload; failures return
-    the cached payload flagged stale=True, or an error payload (all telemetry
-    null) when no successful collection has ever happened.
+    Returns None when disabled.  A success caches the payload; only a *real*
+    collection failure (or cached data genuinely past GPU_STALE_AFTER_SECONDS)
+    marks the sample stale.  Refreshes are single-flight: concurrent callers
+    never label a valid cache stale and never stack up SSH round-trips.
     """
+    global _ai_server_updating
     host = (AI_SSH_HOST or "").strip()
     if not host:
         return None
@@ -1470,71 +1508,94 @@ def _collect_ai_server_unlocked(now: float | None = None) -> dict[str, Any] | No
     cached = cache.get("result")
     if cached and now_ts - float(cached.get("collected_ts", 0)) < AI_SSH_MIN_INTERVAL_SECONDS:
         return dict(cached)
-    if cache.get("last_attempt_ts") and now_ts - float(cache["last_attempt_ts"]) < AI_SSH_MIN_INTERVAL_SECONDS:
+
+    claim = False
+    updating = False
+    with _ai_server_lock:
+        if _ai_server_updating:
+            updating = True
+        elif cache.get("last_failure_ts") and now_ts - float(cache["last_failure_ts"]) < AI_SSH_MIN_INTERVAL_SECONDS:
+            # Backoff after a *real* failure inside the min interval: cached
+            # values may only be shown flagged stale, never silently fresh.
+            # Successes must NOT fall through here (2026-10-01 defect: a
+            # successful refresh set last_attempt_ts, so the next caller at
+            # age≈10s was told "collect_failed" on perfectly valid data).
+            if cached:
+                stale = dict(cached)
+                stale["stale"] = True
+                stale["error"] = str(cache.get("last_error") or "collect_failed")
+                return stale
+            return dict(cache.get("error_payload") or _ai_server_error_payload(host, "collect_failed", int(now_ts)))
+        else:
+            _ai_server_updating = True
+            _ai_server_done_event.clear()
+            cache["last_attempt_ts"] = now_ts
+            claim = True
+
+    if not claim:
+        return _ai_server_inflight_response(cached, cache, host, now_ts)
+
+    result: dict[str, Any] | None = None
+    error: str | None = None
+    try:
+        if shutil.which("ssh"):
+            proc = safe_run(
+                [
+                    "ssh",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    f"ConnectTimeout={AI_SSH_CONNECT_TIMEOUT_SECONDS}",
+                    "-o",
+                    "StrictHostKeyChecking=yes",
+                    "--",
+                    host,
+                    _AI_SERVER_REMOTE_COMMAND,
+                ],
+                timeout=AI_SSH_TIMEOUT_SECONDS,
+            )
+            if proc is None:
+                error = "ssh_timeout"
+            elif proc.returncode != 0:
+                error = f"ssh_exit_{proc.returncode}"
+            else:
+                result = parse_ai_server_output(proc.stdout, int(now_ts))
+                if result is None:
+                    error = "parse_failure"
+        else:
+            error = "ssh_client_missing"
+        if result is not None:
+            cache["result"] = result
+            cache["last_failure_ts"] = 0.0
+            cache.pop("error_payload", None)
+            cache.pop("last_error", None)
+            return dict(result)
+        cache["last_error"] = error or "collect_failed"
+        cache["last_failure_ts"] = now_ts
         if cached:
             stale = dict(cached)
             stale["stale"] = True
+            stale["error"] = error
             return stale
-        return dict(cache.get("error_payload") or {})
-    cache["last_attempt_ts"] = now_ts
-    result: dict[str, Any] | None = None
-    error: str | None = None
-    if shutil.which("ssh"):
-        proc = safe_run(
-            [
-                "ssh",
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                f"ConnectTimeout={AI_SSH_CONNECT_TIMEOUT_SECONDS}",
-                "-o",
-                "StrictHostKeyChecking=yes",
-                "--",
-                host,
-                _AI_SERVER_REMOTE_COMMAND,
-            ],
-            timeout=AI_SSH_TIMEOUT_SECONDS,
-        )
-        if proc is None:
-            error = "ssh_timeout"
-        elif proc.returncode != 0:
-            error = f"ssh_exit_{proc.returncode}"
-        else:
-            result = parse_ai_server_output(proc.stdout, int(now_ts))
-            if result is None:
-                error = "parse_failure"
-    else:
-        error = "ssh_client_missing"
-    if result is not None:
-        cache["result"] = result
-        return dict(result)
-    if cached:
-        stale = dict(cached)
-        stale["stale"] = True
-        stale["error"] = error
-        return stale
-    payload = _ai_server_error_payload(host, error or "collect_failed", int(now_ts))
-    cache["error_payload"] = payload
-    return payload
-
-
-def collect_ai_server(now: float | None = None) -> dict[str, Any] | None:
-    """Serialize remote refreshes so concurrent polls never mislabel live data.
-
-    The first caller performs the SSH refresh. Other callers wait for that
-    refresh and then consume its result instead of interpreting the in-flight
-    ``last_attempt_ts`` marker as a failed/stale collection.
-    """
-    with _ai_server_collect_lock:
-        return _collect_ai_server_unlocked(now=now)
+        payload = _ai_server_error_payload(host, error or "collect_failed", int(now_ts))
+        cache["error_payload"] = payload
+        return payload
+    finally:
+        with _ai_server_lock:
+            _ai_server_updating = False
+        _ai_server_done_event.set()
 
 
 def _ai_server_reset_for_tests() -> None:
-    """Reset the process-local AI collector cache (unit tests only)."""
-    with _ai_server_collect_lock:
-        _ai_server_cache.clear()
-        _ai_server_cache["last_attempt_ts"] = 0.0
-        _ai_server_cache["result"] = None
+    """Reset the process-local AI collector cache + single-flight guard (tests)."""
+    global _ai_server_updating
+    _ai_server_cache.clear()
+    _ai_server_cache["last_attempt_ts"] = 0.0
+    _ai_server_cache["last_failure_ts"] = 0.0
+    _ai_server_cache["result"] = None
+    with _ai_server_lock:
+        _ai_server_updating = False
+    _ai_server_done_event.set()
 
 
 def _gpu_slot_severity(slot: dict[str, Any]) -> str:

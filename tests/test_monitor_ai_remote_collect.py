@@ -2,6 +2,7 @@
 import importlib
 import subprocess
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -15,6 +16,11 @@ FAKE_SMI_BLOCK = "\n".join(
         "NVIDIA GeForce RTX 3090, 0, 24041, 24576, 54, 32.50, 320.00, 0, 00000000:22:00.0, 1, 3, 8, 16",
         "NVIDIA GeForce RTX 3090, 0, 24041, 24576, 53, 32.40, 320.00, 0, 00000000:4D:00.0, 1, 3, 8, 16",
     ]
+)
+
+GPU_LINE = (
+    "NVIDIA GeForce RTX 3090, 0, 20000, 24576, 50, 100.0, 320.00, 0, "
+    "00000000:01:00.0, 3, 3, 16, 16"
 )
 
 NET_HEADER = " Inter-|   Receive                                                |  Transmit\n face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed"
@@ -130,43 +136,6 @@ class RemoteCollectorBehaviorTests(unittest.TestCase):
         self.assertIsNone(second.get("stale"))
         self.assertIsNone(second["error"])
 
-    def test_concurrent_poll_waits_for_refresh_and_never_marks_live_cache_stale(self):
-        initial = subprocess.CompletedProcess(args=[], returncode=0, stdout=full_payload(), stderr="")
-        refreshed = subprocess.CompletedProcess(args=[], returncode=0, stdout=full_payload(rx0=2000), stderr="")
-        refresh_started = threading.Event()
-        allow_refresh = threading.Event()
-        calls = 0
-
-        def controlled_safe_run(*_args, **_kwargs):
-            nonlocal calls
-            calls += 1
-            if calls == 1:
-                return initial
-            refresh_started.set()
-            self.assertTrue(allow_refresh.wait(timeout=2), "refresh was not released")
-            return refreshed
-
-        results = []
-        with mock.patch.object(app, "AI_SSH_HOST", "ai-server"), \
-             mock.patch.object(app, "safe_run", side_effect=controlled_safe_run):
-            app.collect_ai_server(now=1000.0)
-            first = threading.Thread(target=lambda: results.append(app.collect_ai_server(now=1011.0)))
-            second = threading.Thread(target=lambda: results.append(app.collect_ai_server(now=1011.5)))
-            first.start()
-            self.assertTrue(refresh_started.wait(timeout=2), "refresh did not start")
-            second.start()
-            allow_refresh.set()
-            first.join(timeout=2)
-            second.join(timeout=2)
-
-        self.assertFalse(first.is_alive())
-        self.assertFalse(second.is_alive())
-        self.assertEqual(calls, 2)
-        self.assertEqual(len(results), 2)
-        self.assertTrue(all(result["collected_ts"] == 1011 for result in results))
-        self.assertTrue(all(not result.get("stale", False) for result in results))
-        self.assertTrue(all(result.get("error") is None for result in results))
-
     def test_failure_serves_cached_sample_as_stale(self):
         completed = subprocess.CompletedProcess(args=[], returncode=0, stdout=full_payload(), stderr="")
         with mock.patch.object(app, "AI_SSH_HOST", "ai-server"), \
@@ -266,6 +235,178 @@ class PlanIntegrationTests(unittest.TestCase):
         self.assertEqual(fresh["severity"], "ok")
         self.assertTrue(stale_servers["ai"]["slots"][0]["stale"])
         self.assertEqual(stale["severity"], "warning")
+
+
+class SingleFlightConcurrencyTests(unittest.TestCase):
+    """2026-10-01 production regression (3c5dffb): while an SSH refresh is in
+    flight, concurrent callers must NOT label a valid cached sample stale."""
+
+    def setUp(self):
+        app._ai_server_reset_for_tests()
+
+    def _payload(self, gpu_line=GPU_LINE):
+        return (
+            f"__GPUS__\n{gpu_line}\n__SYS__\n"
+            "LOAD 1.0\nNPROC 8\nMEM 65536000 32768000\n"
+            "DISK 1000000000 500000000 50%\nTEMP 45000\nUPTIME 100\n"
+            "__NET0__\nx\n__NET1__\ny\n"
+        )
+
+    def test_concurrent_request_during_refresh_is_not_marked_stale(self):
+        started = threading.Event()
+        release = threading.Event()
+        state = {"ssh_calls": 0}
+
+        def slow_run(args, **kwargs):
+            # The seed collection (call #1) returns at once; the refresh
+            # (call #2) blocks so we can observe concurrent arrivals.
+            state["ssh_calls"] += 1
+            if state["ssh_calls"] > 1:
+                started.set()
+                release.wait(5.0)
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout=self._payload(), stderr=""
+            )
+
+        with mock.patch.object(app, "AI_SSH_HOST", "ai-server"), \
+             mock.patch.object(app.subprocess, "run", side_effect=slow_run):
+            app.collect_ai_server(now=1000.0)  # seed a valid sample
+            self.assertEqual(app._ai_server_cache["result"]["collected_ts"], 1000)
+
+            outcome = {}
+
+            def refresher():
+                outcome["A"] = app.collect_ai_server(now=1011.0)
+
+            worker = threading.Thread(target=refresher)
+            worker.start()
+            self.assertTrue(started.wait(5.0), "refresh never started SSH")
+            calls_before = state["ssh_calls"]  # seed + the one in-flight refresh
+            time.sleep(0.1)  # SSH round-trip in flight; cache age 11s (< 60s)
+            outcome["B"] = app.collect_ai_server(now=1011.3)
+            calls_after = state["ssh_calls"]
+            release.set()
+            worker.join(timeout=10.0)
+
+        concurrent = outcome["B"]
+        self.assertIsNone(concurrent.get("stale"), "valid cache must not be stale")
+        self.assertIsNone(concurrent.get("error"))
+        self.assertEqual(len(concurrent["gpus"]), 1)
+        # The in-flight refresh keeps its own fresh sample.
+        self.assertEqual(outcome["A"]["collected_ts"], 1011)
+        self.assertIsNone(outcome["A"].get("stale"))
+        # Single-flight: the concurrent caller added no SSH round-trip at all
+        # (only the seed collection and the one in-flight refresh ever ran).
+        self.assertEqual(calls_after, calls_before, "concurrent callers must not stack SSH")
+        self.assertEqual(calls_before, 2, "expected exactly seed + one refresh")
+
+    def test_first_call_with_no_cache_waits_for_inflight_outcome(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_run(args, **kwargs):
+            started.set()
+            release.wait(3.0)
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout=self._payload(), stderr=""
+            )
+
+        with mock.patch.object(app, "AI_SSH_HOST", "ai-server"), \
+             mock.patch.object(app.subprocess, "run", side_effect=slow_run):
+            outcome = {}
+            worker = threading.Thread(
+                target=lambda: outcome.update(A=app.collect_ai_server(now=1000.0))
+            )
+            worker.start()
+            self.assertTrue(started.wait(5.0))
+            time.sleep(0.1)
+            outcome["B"] = app.collect_ai_server(now=1000.2)
+            release.set()
+            worker.join(timeout=10.0)
+
+        # No bogus error panel for the caller that arrived mid first-collection.
+        self.assertEqual(outcome["B"].get("error"), None)
+        self.assertEqual(len(outcome["B"]["gpus"]), 1)
+
+    def test_success_does_not_trigger_backoff_for_next_caller(self):
+        # 2026-10-01 defect #2: after a successful refresh, the *next* caller
+        # (no refresh in flight, cache age ≈ TTL) must run its own collection
+        # and return fresh data — not the stale "collect_failed" backoff path.
+        calls = []
+
+        def ok_run(args, **kwargs):
+            calls.append(1)
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout=self._payload(), stderr=""
+            )
+
+        with mock.patch.object(app, "AI_SSH_HOST", "ai-server"), \
+             mock.patch.object(app.subprocess, "run", side_effect=ok_run):
+            app.collect_ai_server(now=1000.0)              # seed
+            first = app.collect_ai_server(now=1010.0)      # refresh succeeds
+            self.assertIsNone(first.get("stale"))
+            self.assertIsNone(first.get("error"))
+            self.assertEqual(first["collected_ts"], 1010)
+            follow = app.collect_ai_server(now=1010.2)     # cache fresh again
+            self.assertIsNone(follow.get("stale"))
+            self.assertIsNone(follow.get("error"))          # no bogus collect_failed
+            later = app.collect_ai_server(now=1020.0)      # next window: real SSH
+            self.assertEqual(len(calls), 3, "seed + refresh + next-window collect")
+            self.assertIsNone(later.get("stale"))
+            self.assertIsNone(later.get("error"))
+
+    def test_real_failure_still_marks_cached_sample_stale(self):
+        with mock.patch.object(app, "AI_SSH_HOST", "ai-server"), \
+             mock.patch.object(
+                 app.subprocess, "run",
+                 return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout=self._payload(), stderr=""),
+             ):
+            app.collect_ai_server(now=1000.0)
+        with mock.patch.object(app, "AI_SSH_HOST", "ai-server"), \
+             mock.patch.object(
+                 app.subprocess, "run",
+                 return_value=subprocess.CompletedProcess(args=[], returncode=255, stdout="", stderr="ssh: connect refused"),
+             ):
+            stale = app.collect_ai_server(now=1011.0)
+        self.assertTrue(stale["stale"], "a genuine SSH failure must mark stale=True")
+        self.assertEqual(stale["error"], "ssh_exit_255")
+        self.assertEqual(len(stale["gpus"]), 1)
+
+    def test_cached_sample_past_stale_boundary_reports_stale(self):
+        with mock.patch.object(app, "AI_SSH_HOST", "ai-server"), \
+             mock.patch.object(
+                 app.subprocess, "run",
+                 return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout=self._payload(), stderr=""),
+             ):
+            app.collect_ai_server(now=1000.0)
+        # Another refresh is in flight while the cache is already past 60s.
+        with app._ai_server_lock:
+            app._ai_server_updating = True
+        try:
+            payload = app.collect_ai_server(now=1000.0 + app.GPU_STALE_AFTER_SECONDS + 5)
+        finally:
+            with app._ai_server_lock:
+                app._ai_server_updating = False
+        self.assertTrue(payload["stale"], "age past 60s must stay stale")
+
+    def test_plan_keeps_slots_fresh_while_refresh_in_flight(self):
+        with mock.patch.object(app, "AI_SSH_HOST", "ai-server"), \
+             mock.patch.object(
+                 app.subprocess, "run",
+                 return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout=self._payload(), stderr=""),
+             ):
+            seed = app.collect_ai_server(now=1000.0)
+        plan = app.build_dashboard_servers(
+            [{"status": "ok", "name": "CMP-A"}, {"status": "ok", "name": "CMP-B"}],
+            now=1011.3,
+            ai_gpus=seed["gpus"],
+            ai_system=dict(seed["system"]),
+            ai_error=None,
+            ai_collected_ts=seed["collected_ts"],
+        )
+        servers = {item["id"]: item for item in plan["servers"]}
+        self.assertEqual(plan["severity"], "ok")
+        self.assertEqual([s.get("stale") for s in servers["ai"]["slots"][:1]], [False])
 
 
 INDEX_HTML = Path(__file__).resolve().parent.parent / "static" / "index.html"
