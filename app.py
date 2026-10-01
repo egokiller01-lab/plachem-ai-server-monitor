@@ -1174,6 +1174,166 @@ def get_gpu() -> dict[str, Any]:
     }
 
 
+# --- Multi-server GPU dashboard plan (Main 2x CMP170HX + AI 4x RTX 3090) ---
+# Detected GPUs fill planned slots in order; missing slots stay offline with
+# install_pending and null telemetry.  Virtual telemetry is forbidden.
+GPU_SERVER_PLAN: list[dict[str, Any]] = [
+    {
+        "id": "main",
+        "label": "Main Server",
+        "model": "CMP170HX",
+        "planned_slots": 2,
+        "power_target_slot_w": None,
+    },
+    {
+        "id": "ai",
+        "label": "AI Server",
+        "model": "RTX 3090",
+        "planned_slots": 4,
+        "power_target_slot_w": 320,
+    },
+]
+GPU_STALE_AFTER_SECONDS = 60
+GPU_PLACEHOLDER_TELEMETRY_KEYS = (
+    "usage_percent",
+    "vram_used_gb",
+    "vram_total_gb",
+    "vram_usage_percent",
+    "temperature_c",
+    "power_draw_w",
+    "power_limit_w",
+    "fan_speed_percent",
+    "pci_bus_id",
+    "pcie_gen_current",
+    "pcie_gen_max",
+    "pcie_width_current",
+    "pcie_width_max",
+)
+
+
+def _gpu_placeholder_slot(server: dict[str, Any], slot: int, collected_ts: int) -> dict[str, Any]:
+    """Planned-but-undetected slot: offline/install_pending with null telemetry."""
+    return {
+        "server_id": server["id"],
+        "server_label": server["label"],
+        "slot": slot,
+        "planned_model": server["model"],
+        "state": "offline",
+        "install_reason": "install_pending",
+        "detected": False,
+        "status": "offline",
+        "source": "plan",
+        "power_target_w": server.get("power_target_slot_w"),
+        "collected_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(collected_ts)),
+        "collected_ts": collected_ts,
+        "age_seconds": 0,
+        "stale_after_seconds": GPU_STALE_AFTER_SECONDS,
+        "stale": False,
+        **{key: None for key in GPU_PLACEHOLDER_TELEMETRY_KEYS},
+    }
+
+
+def _gpu_slot_is_fresh(gpu: dict[str, Any], collected_ts: int, now_ts: float) -> bool:
+    if collected_ts <= 0:
+        return True
+    return (now_ts - collected_ts) <= GPU_STALE_AFTER_SECONDS
+
+
+def _gpu_slot_severity(slot: dict[str, Any]) -> str:
+    """Worst-severity feed for the overall banner.
+
+    An undetected planned slot (offline + install_pending) is an expected
+    install state, so it never escalates.  Detected slots escalate on
+    error/unknown collection failures and on stale telemetry.
+    """
+    if slot.get("install_reason") == "install_pending":
+        return "ok"
+    if slot.get("status") in {"error", "unknown"}:
+        return "warning"
+    if slot.get("stale"):
+        return "warning"
+    return "ok"
+
+
+def build_dashboard_servers(gpus: list[dict[str, Any]] | None, now: float | None = None) -> dict[str, Any]:
+    """Planned 2+4 slot dashboard across Main and AI servers.
+
+    Only GPUs actually detected by the collector carry telemetry; every other
+    planned slot is an offline/install_pending placeholder with null values.
+    """
+    now_ts = time.time() if now is None else float(now)
+    collected_ts = int(now_ts)
+    pool = [dict(item) for item in (gpus or []) if isinstance(item, dict)]
+    servers: list[dict[str, Any]] = []
+    cursor = 0
+    for plan in GPU_SERVER_PLAN:
+        planned = int(plan["planned_slots"])
+        slots: list[dict[str, Any]] = []
+        for slot_no in range(1, planned + 1):
+            if cursor < len(pool):
+                gpu = pool[cursor]
+                cursor += 1
+                slot = dict(gpu)
+                slot["server_id"] = plan["id"]
+                slot["server_label"] = plan["label"]
+                slot["slot"] = slot_no
+                slot["planned_model"] = plan["model"]
+                slot["detected"] = True
+                slot["install_reason"] = None
+                if slot.get("status") in {None, "offline"}:
+                    slot["status"] = "ok"
+                power_target = plan.get("power_target_slot_w")
+                if power_target is None:
+                    power_target = gpu.get("power_limit_w") or gpu.get("power_target_w")
+                slot["power_target_w"] = power_target
+                gpu_collected_ts = gpu.get("collected_ts") or gpu.get("timestamp") or collected_ts
+                try:
+                    gpu_collected_ts = int(gpu_collected_ts)
+                except (TypeError, ValueError):
+                    gpu_collected_ts = collected_ts
+                slot["collected_ts"] = gpu_collected_ts
+                slot["age_seconds"] = max(0, int(now_ts - gpu_collected_ts))
+                slot["stale_after_seconds"] = GPU_STALE_AFTER_SECONDS
+                slot["stale"] = gpu.get("status") == "ok" and not _gpu_slot_is_fresh(gpu, gpu_collected_ts, now_ts)
+                slots.append(slot)
+            else:
+                slots.append(_gpu_placeholder_slot(plan, slot_no, collected_ts))
+        detected_slots = [item for item in slots if item.get("detected")]
+        power_total_target = None
+        if plan.get("power_target_slot_w") is not None:
+            power_total_target = int(plan["power_target_slot_w"]) * planned
+        servers.append({
+            "id": plan["id"],
+            "label": plan["label"],
+            "model": plan["model"],
+            "planned_slots": planned,
+            "detected_slots": len(detected_slots),
+            "missing_slots": planned - len(detected_slots),
+            "power_target_slot_w": plan.get("power_target_slot_w"),
+            "power_target_total_w": power_total_target,
+            "slots": slots,
+        })
+    severity_priority = {"ok": 0, "warning": 1, "error": 2}
+    all_slots = [slot for server in servers for slot in server["slots"]]
+    worst = "ok"
+    worst_slot: dict[str, Any] | None = None
+    for slot in all_slots:
+        severity = _gpu_slot_severity(slot)
+        if severity_priority[severity] > severity_priority[worst]:
+            worst = severity
+            worst_slot = slot
+    return {
+        "collected_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(collected_ts)),
+        "collected_ts": collected_ts,
+        "age_seconds": 0,
+        "stale_after_seconds": GPU_STALE_AFTER_SECONDS,
+        "stale": False,
+        "servers": servers,
+        "severity": worst,
+        "worst_slot": worst_slot,
+    }
+
+
 def systemctl_status(service: str) -> str | None:
     if not shutil.which("systemctl"):
         return None
@@ -2544,12 +2704,27 @@ def api_status() -> dict[str, Any]:
     gpu_headroom_gb = gpu_summary["headroom_gb"]
     gpu_temp_c = gpu_summary["temperature_c"]
 
+    try:
+        dashboard_servers = build_dashboard_servers(gpus)
+    except Exception as exc:
+        dashboard_servers = {
+            "collected_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "collected_ts": int(time.time()),
+            "age_seconds": 0,
+            "stale_after_seconds": GPU_STALE_AFTER_SECONDS,
+            "stale": True,
+            "servers": [],
+            "severity": "warning",
+            "worst_slot": None,
+            "error": _sanitize_error(exc),
+        }
+
     has_error = any(
         item.get("status") == "error" for item in [cpu, memory, disk, network]
     ) or "error" in service_states or gateway_state in {"down", "probe_failed"} or gpu_risk == "error"
     has_warning = any(item.get("status") in {"unknown", "warming"} for item in [network]) or any(
         state in {"stopped", "unknown"} for state in service_states
-    ) or gateway_state == "degraded" or gpu_risk == "warning" or openconnector_error is not None or (
+    ) or gateway_state == "degraded" or gpu_risk == "warning" or dashboard_servers.get("severity") in {"warning", "error"} or openconnector_error is not None or (
         oc_total > 0 and (oc_attention > 0 or oc_errors > 0)
     )
 
@@ -2585,6 +2760,7 @@ def api_status() -> dict[str, Any]:
         "gpu_risk": gpu_risk,
         "gpu_headroom_gb": gpu_headroom_gb,
         "gpu_temperature_c": gpu_temp_c,
+        "dashboard_servers": dashboard_servers,
         "services": services,
         "gateway": openclaw.get("gateway"),
         "openconnector_summary": oc_summary,

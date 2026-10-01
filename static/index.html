@@ -649,6 +649,20 @@
     .gpu-unit-metric.temp strong { color: var(--amber); }
     .gpu-unit-metric.fan strong { color: #a78bfa; }
     .gpu-unit-pcie { grid-column: 1 / -1; padding-top: 9px; border-top: 1px solid rgba(148,163,184,.14); color: var(--muted); font-size: 10px; }
+    .gpu-server-section { margin-bottom: 14px; }
+    .gpu-server-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px; margin: 0 2px 9px; }
+    .gpu-server-title { color: var(--text); font-size: 12px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
+    .gpu-server-model { color: #22d3ee; font-size: 10px; font-weight: 700; letter-spacing: .08em; }
+    .gpu-server-meta { color: var(--muted); font-size: 10px; }
+    .ai-gpu-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .gpu-badge-row { display: flex; flex-wrap: wrap; gap: 5px; margin: -4px 0 10px 22px; }
+    .gpu-badge { padding: 2px 7px; border-radius: 999px; font-size: 8px; font-weight: 800; letter-spacing: .12em; }
+    .gpu-badge-offline { color: #fff; background: rgba(255,92,113,.5); border: 1px solid rgba(255,92,113,.75); }
+    .gpu-badge-install { color: var(--amber); background: rgba(255,178,28,.14); border: 1px solid rgba(255,178,28,.42); }
+    .gpu-badge-stale { color: #a78bfa; background: rgba(167,139,250,.14); border: 1px solid rgba(167,139,250,.45); }
+    .gpu-unit-card.gpu-slot-offline { opacity: .72; border-style: dashed; }
+    @media (max-width: 620px) { .ai-gpu-grid { grid-template-columns: 1fr; } }
+
     .agent-grid .erpmanager-card { margin-top: 0; }
     .secretary-card { padding: 14px 16px; border-color: rgba(167,139,250,.42); box-shadow: 0 0 0 1px rgba(167,139,250,.20), 0 0 28px rgba(167,139,250,.10), var(--shadow); }
     @media (max-width: 620px) { .gpu-grid, .agent-grid { grid-template-columns: 1fr; } .gpu-dashboard { grid-template-columns: 120px minmax(0, 1fr); } .gpu-gauge { width: 112px; } }
@@ -1339,7 +1353,23 @@
       <div class="kpi amber"><span class="icon">🌡</span><span class="label">CPU TEMP</span><span id="kpi-cpu-temp" class="value">--</span></div>
     </section>
 
-    <section class="gpu-grid" id="gpu-grid"></section>
+    <section class="gpu-server-section" id="gpu-server-main">
+      <div class="gpu-server-head">
+        <span class="gpu-server-title">Main Server</span>
+        <span class="gpu-server-model" id="gpu-server-main-model">--</span>
+        <span class="gpu-server-meta" id="gpu-server-main-meta">--</span>
+      </div>
+      <div class="gpu-grid gpu-server-grid" id="gpu-grid"></div>
+    </section>
+
+    <section class="gpu-server-section" id="gpu-server-ai">
+      <div class="gpu-server-head">
+        <span class="gpu-server-title">AI Server</span>
+        <span class="gpu-server-model" id="gpu-server-ai-model">--</span>
+        <span class="gpu-server-meta" id="gpu-server-ai-meta">--</span>
+      </div>
+      <div class="gpu-grid ai-gpu-grid gpu-server-grid" id="ai-gpu-grid"></div>
+    </section>
 
     <section class="codex-grid">
       <article class="card codex-card" id="codex-weekly-card">
@@ -1500,40 +1530,106 @@
       return Number.isFinite(value) ? `${value}${suffix}` : "--";
     }
 
-    function renderGpuCard(index, gpu) {
-      const grid = document.getElementById("gpu-grid");
-      if (!grid) return;
-      let card = document.getElementById(`gpu-card-${index}`);
+    function gpuSlotBadges(slot) {
+      const badges = [];
+      if (slot.detected === false || slot.state === "offline") {
+        badges.push('<span class="gpu-badge gpu-badge-offline">OFFLINE</span>');
+      }
+      if (slot.install_reason === "install_pending") {
+        badges.push('<span class="gpu-badge gpu-badge-install">INSTALL PENDING</span>');
+      }
+      if (slot.stale) {
+        badges.push('<span class="gpu-badge gpu-badge-stale">STALE</span>');
+      }
+      return badges.length ? `<div class="gpu-badge-row">${badges.join("")}</div>` : "";
+    }
+
+    function renderGpuSlotCard(grid, slot, key, heading) {
+      if (!grid) return null;
+      let card = document.getElementById(`gpu-card-${key}`);
       if (!card) {
         card = document.createElement("article");
-        card.className = "card gpu-unit-card clickable";
-        card.dataset.detail = "gpu";
-        card.id = `gpu-card-${index}`;
+        card.className = "card gpu-unit-card";
+        card.id = `gpu-card-${key}`;
         grid.appendChild(card);
       }
-      if (!gpu) {
-        card.innerHTML = `<div class="card-title"><span class="icon">▧</span><span>GPU ${index}</span></div><div class="gpu-unit-name">Unavailable</div>`;
-        return;
+      if (!slot) {
+        card.className = "card gpu-unit-card";
+        card.innerHTML = `<div class="card-title"><span class="icon">▧</span><span>${escapeHtml(heading)}</span></div><div class="gpu-unit-name">Unavailable</div>`;
+        return card;
       }
-      const gen = Number.isFinite(gpu.pcie_gen_max) ? `PCIe ${gpu.pcie_gen_max}.0` : "PCIe --";
-      const width = Number.isFinite(gpu.pcie_width_current) ? `x${gpu.pcie_width_current}` : "x--";
-      const maxWidth = Number.isFinite(gpu.pcie_width_max) ? `x${gpu.pcie_width_max}` : "x--";
-      const load = recentGpuPeak(index, gpu.usage_percent);
-      const powerPercent = Number.isFinite(gpu.power_draw_w) && Number.isFinite(gpu.power_limit_w) && gpu.power_limit_w > 0
-        ? Math.round(gpu.power_draw_w / gpu.power_limit_w * 100) : null;
+      const offline = slot.detected === false || slot.state === "offline";
+      card.className = `card gpu-unit-card${offline ? " gpu-slot-offline" : " clickable"}`;
+      if (offline) {
+        delete card.dataset.detail;
+      } else {
+        card.dataset.detail = "gpu";
+      }
+      const gen = Number.isFinite(slot.pcie_gen_max) ? `PCIe ${slot.pcie_gen_max}.0` : "PCIe --";
+      const width = Number.isFinite(slot.pcie_width_current) ? `x${slot.pcie_width_current}` : "x--";
+      const maxWidth = Number.isFinite(slot.pcie_width_max) ? `x${slot.pcie_width_max}` : "x--";
+      const load = offline ? 0 : recentGpuPeak(key, slot.usage_percent);
+      const powerPercent = Number.isFinite(slot.power_draw_w) && Number.isFinite(slot.power_limit_w) && slot.power_limit_w > 0
+        ? Math.round(slot.power_draw_w / slot.power_limit_w * 100) : null;
+      const targetPart = Number.isFinite(slot.power_target_w) ? ` / ${slot.power_target_w}W target` : "";
+      const name = offline
+        ? `${slot.planned_model || "Unknown"} · not installed`
+        : (slot.name || slot.planned_model || "Unknown");
       card.innerHTML = `
-        <div class="card-title"><span class="icon">▧</span><span>GPU ${index}</span></div>
-        <div class="gpu-unit-name">${escapeHtml(gpu.name || "Unknown")}</div>
+        <div class="card-title"><span class="icon">▧</span><span>${escapeHtml(heading)}</span></div>
+        <div class="gpu-unit-name">${escapeHtml(name)}</div>
+        ${gpuSlotBadges(slot)}
         <div class="gpu-dashboard">
-          <div class="gpu-gauge" style="--p:${load}"><div class="gpu-gauge-center"><div class="gpu-gauge-value">${percent(load)}</div><div class="gpu-gauge-label">GPU LOAD · 10s PEAK</div></div></div>
+          <div class="gpu-gauge" style="--p:${load}"><div class="gpu-gauge-center"><div class="gpu-gauge-value">${offline ? "--" : percent(load)}</div><div class="gpu-gauge-label">GPU LOAD · 10s PEAK</div></div></div>
           <div class="gpu-unit-metrics">
-            <div class="gpu-unit-metric vram"><span>VRAM / headroom</span><strong>${formatGpuValue(gpu.vram_used_gb)} / ${formatGpuValue(gpu.vram_total_gb)} GB · ${percent(gpu.vram_usage_percent)} · ${formatGpuValue(gpu.vram_headroom_gb, " GB")}</strong></div>
-            <div class="gpu-unit-metric temp"><span>Temperature</span><strong>${formatGpuValue(gpu.temperature_c, "°C")}</strong></div>
-            <div class="gpu-unit-metric power"><span>Power</span><strong>${formatGpuValue(gpu.power_draw_w)} / ${formatGpuValue(gpu.power_limit_w)} W · ${powerPercent === null ? "--" : powerPercent + "%"}</strong></div>
-            <div class="gpu-unit-metric fan"><span>Fan</span><strong>${percent(gpu.fan_speed_percent)}</strong></div>
-            <div class="gpu-unit-pcie">${gen} ${width} · Max ${maxWidth} · ${escapeHtml(gpu.vram_headroom_state || "unknown")}</div>
+            <div class="gpu-unit-metric vram"><span>VRAM / headroom</span><strong>${formatGpuValue(slot.vram_used_gb)} / ${formatGpuValue(slot.vram_total_gb)} GB · ${percent(slot.vram_usage_percent)} · ${formatGpuValue(slot.vram_headroom_gb, " GB")}</strong></div>
+            <div class="gpu-unit-metric temp"><span>Temperature</span><strong>${formatGpuValue(slot.temperature_c, "°C")}</strong></div>
+            <div class="gpu-unit-metric power"><span>Power draw / limit${targetPart ? " / target" : ""}</span><strong>${formatGpuValue(slot.power_draw_w)} / ${formatGpuValue(slot.power_limit_w)} W · ${powerPercent === null ? "--" : powerPercent + "%"}${targetPart}</strong></div>
+            <div class="gpu-unit-metric fan"><span>Fan</span><strong>${percent(slot.fan_speed_percent)}</strong></div>
+            <div class="gpu-unit-pcie">${gen} ${width} · Max ${maxWidth} · ${escapeHtml(slot.vram_headroom_state || (offline ? "install_pending" : "unknown"))}</div>
           </div>
         </div>`;
+      return card;
+    }
+
+    function renderGpuCard(index, gpu) {
+      return renderGpuSlotCard(
+        document.getElementById("gpu-grid"),
+        gpu ? { ...gpu, detected: gpu.status !== "offline" } : null,
+        index,
+        `GPU ${index}`
+      );
+    }
+
+    function renderGpuServerSection(server, gridId) {
+      const grid = document.getElementById(gridId);
+      if (!grid) return;
+      const meta = document.getElementById(`${gridId === "ai-gpu-grid" ? "gpu-server-ai" : "gpu-server-main"}-meta`);
+      const model = document.getElementById(`${gridId === "ai-gpu-grid" ? "gpu-server-ai" : "gpu-server-main"}-model`);
+      if (!server) {
+        grid.querySelectorAll(".gpu-unit-card").forEach((node) => node.remove());
+        if (meta) meta.textContent = "plan unavailable";
+        if (model) model.textContent = "--";
+        return;
+      }
+      if (model) {
+        model.textContent = server.power_target_total_w
+          ? `${server.model} · ${server.power_target_slot_w}W x ${server.planned_slots} · ${server.power_target_total_w}W total`
+          : `${server.model}`;
+      }
+      if (meta) {
+        const parts = [`${server.detected_slots}/${server.planned_slots} detected`];
+        if (server.stale) parts.push(`stale ${server.age_seconds ?? "--"}s`);
+        meta.textContent = parts.join(" · ");
+      }
+      const slots = Array.isArray(server.slots) ? server.slots : [];
+      const wanted = new Set(slots.map((slot) => `${server.id}-${slot.slot}`));
+      grid.querySelectorAll(".gpu-unit-card").forEach((node) => {
+        if (!wanted.has(node.id.replace("gpu-card-", ""))) node.remove();
+      });
+      slots.forEach((slot) => {
+        renderGpuSlotCard(grid, slot, `${server.id}-${slot.slot}`, `Slot ${slot.slot}`);
+      });
     }
 
     function drawSparkline(id, values, color) {
@@ -1579,6 +1675,26 @@
       const state = service?.state || "unknown";
       node.className = `service ${state}`;
       node.querySelector(".service-state").textContent = service?.label || "Unknown";
+    }
+
+    function gpuOverallState(overallState, serverPlan) {
+      const base = overallState === "error" ? 2 : overallState === "warning" ? 1 : 0;
+      let gpuLevel = 0;
+      if (serverPlan && Array.isArray(serverPlan.servers)) {
+        const priority = { ok: 0, warning: 1, error: 2 };
+        for (const server of serverPlan.servers) {
+          for (const slot of server.slots || []) {
+            if (slot.install_reason === "install_pending" && !slot.detected) continue;
+            let level = 0;
+            if (slot.status === "error" || slot.status === "unknown") level = 1;
+            if (slot.stale) level = 1;
+            if (level > gpuLevel) gpuLevel = level;
+          }
+        }
+        if (priority[serverPlan.severity] > gpuLevel) gpuLevel = priority[serverPlan.severity];
+      }
+      const worst = Math.max(base, gpuLevel);
+      return worst === 2 ? "error" : worst === 1 ? "warning" : "normal";
     }
 
     function setOverall(state) {
@@ -1865,10 +1981,19 @@
         document.getElementById("kpi-disk").textContent = percent(disk.usage_percent);
         document.getElementById("kpi-cpu-temp").textContent = valueOrUnknown(cpu.temperature_c, "°C");
 
-        const gpuGrid = document.getElementById("gpu-grid");
-        if (gpuGrid) {
-          gpuGrid.querySelectorAll(".gpu-unit-card").forEach(node => { if (!gpus[Number(node.id.replace("gpu-card-", ""))]) node.remove(); });
-          gpus.forEach((item, index) => renderGpuCard(index, item));
+        const serverPlan = data.dashboard_servers || null;
+        if (serverPlan && Array.isArray(serverPlan.servers)) {
+          const mainServer = serverPlan.servers.find((item) => item.id === "main") || null;
+          const aiServer = serverPlan.servers.find((item) => item.id === "ai") || null;
+          renderGpuServerSection(mainServer, "gpu-grid");
+          renderGpuServerSection(aiServer, "ai-gpu-grid");
+          setOverall(gpuOverallState(data.overall, serverPlan));
+        } else {
+          const gpuGrid = document.getElementById("gpu-grid");
+          if (gpuGrid) {
+            gpuGrid.querySelectorAll(".gpu-unit-card").forEach(node => { if (!gpus[Number(node.id.replace("gpu-card-", ""))]) node.remove(); });
+            gpus.forEach((item, index) => renderGpuCard(index, item));
+          }
         }
         pushKpi("cpu", cpu.usage_percent);
         pushKpi("ram", mem.usage_percent);
