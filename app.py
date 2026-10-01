@@ -12,6 +12,7 @@ import subprocess
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -1470,14 +1471,68 @@ def get_openconnector_lease_review(now: float | None = None) -> dict[str, Any]:
     return {"items": items, "error": None}
 
 
+def _collect_managed_service_runs(
+    source_services: list[str], *, limit_per_service: int = 100
+) -> tuple[list[dict[str, Any]], dict[str, str], dict[str, Any]]:
+    """Fetch run evidence per managed service instead of one global page.
+
+    A single global ``/api/runs`` page is saturated by high-volume services such
+    as vercel_ai_gateway, which hid every managed connection and forced 13x
+    false "attention".  The management API honours ``?service=<name>``, so each
+    managed service gets its own budget.  Individual service failures degrade
+    that service only (fail-closed) and never the whole dashboard.
+    """
+    runs: list[dict[str, Any]] = []
+    errors: dict[str, str] = {}
+    seen_ids: set[str] = set()
+    duplicate_count = 0
+    counts: dict[str, int] = {}
+    for source_service in source_services:
+        query = urllib.parse.urlencode({"limit": limit_per_service, "service": source_service})
+        try:
+            page = _openconnector_admin_get(f"/api/runs?{query}", timeout=6.0)
+        except Exception as exc:
+            errors[source_service] = _sanitize_error(exc)
+            continue
+        items = page.get("items", []) if isinstance(page, dict) else []
+        accepted = 0
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("service") or "") != source_service:
+                # A filtered page must not smuggle in another service's evidence.
+                continue
+            run_id = str(item.get("id") or "")
+            if run_id:
+                if run_id in seen_ids:
+                    duplicate_count += 1
+                    continue
+                seen_ids.add(run_id)
+            runs.append(item)
+            accepted += 1
+        counts[source_service] = accepted
+    runs.sort(key=lambda run: _parse_iso_timestamp(run.get("completedAt")) or 0, reverse=True)
+    scope = {
+        "mode": "per_managed_service",
+        "limit_per_service": limit_per_service,
+        "services_requested": len(source_services),
+        "services_ok": len(counts),
+        "services_failed": len(errors),
+        "runs_collected": len(runs),
+        "duplicates_dropped": duplicate_count,
+        "runs_by_service": counts,
+    }
+    return runs, errors, scope
+
+
 def get_openconnector_dashboard() -> dict[str, Any]:
     """Return a secret-free, live authentication control view."""
     now = time.time()
     collected_at = datetime.fromtimestamp(now, tz=timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
     raw_connections = _openconnector_admin_get("/api/connections")
     runtime_tokens = _openconnector_admin_get("/api/runtime-tokens")
-    run_page = _openconnector_admin_get("/api/runs?limit=100")
-    runs = [item for item in (run_page.get("items", []) if isinstance(run_page, dict) else []) if isinstance(item, dict)]
+    managed_sources = sorted(set(OPENCONNECTOR_MANAGED_CONNECTION_SERVICES.values()))
+    runs, run_collection_errors, run_scope = _collect_managed_service_runs(managed_sources)
 
     # The control screen follows the same canonical 13-item inventory as the
     # fixed verification job.  Legacy/extra OpenConnector connections remain
@@ -1501,7 +1556,6 @@ def get_openconnector_dashboard() -> dict[str, Any]:
     except Exception:
         updates = {}
 
-    managed_sources = set(canonical_by_source)
     day_runs = [
         run for run in runs
         if str(run.get("service") or "") in managed_sources
@@ -1525,6 +1579,8 @@ def get_openconnector_dashboard() -> dict[str, Any]:
         configured = bool(connection.get("configured"))
         if not configured:
             state, reason = "error", "not_configured"
+        elif source_service in run_collection_errors:
+            state, reason = "attention", "run_evidence_unavailable"
         elif latest_auth_failure and (not latest_success or (_parse_iso_timestamp(latest_auth_failure.get("completedAt")) or 0) > (success_epoch or 0)):
             state, reason = "error", "authentication_failed"
         elif success_epoch is not None and now - success_epoch <= 86400:
@@ -1539,6 +1595,11 @@ def get_openconnector_dashboard() -> dict[str, Any]:
             actions.append({"severity": "error", "service": service, "title": "연결 복구", "detail": "OpenConnector 연결 설정이 완료되지 않았습니다."})
         elif reason == "authentication_failed":
             actions.append({"severity": "error", "service": service, "title": "재인증 확인", "detail": str(latest_auth_failure.get("errorCode") or "인증 실패")[:120]})
+        elif reason == "run_evidence_unavailable":
+            actions.append({
+                "severity": "warning", "service": service, "title": "Run 증거 수집 실패",
+                "detail": f"OpenConnector run 조회 실패: {run_collection_errors[source_service]}"[:140],
+            })
         elif reason == "first_verification_required":
             actions.append({"severity": "warning", "service": service, "title": "첫 실사용 검증", "detail": f"{OPENCONNECTOR_MANAGED_ACTIONS.get(service, '안전한 READ 작업')}을 실행해 연결을 확인하세요."})
         if lifecycle["action_required"]:
@@ -1636,6 +1697,7 @@ def get_openconnector_dashboard() -> dict[str, Any]:
             "caller": run.get("caller"), "ok": run.get("ok"), "error_code": run.get("errorCode"),
             "completed_at": run.get("completedAt"), "duration_ms": run.get("durationMs")}
             for run in runs[:20]],
+        "run_collection": {**run_scope, "errors": run_collection_errors},
         "checked_at": int(now), "metadata_collected_at": collected_at,
         "console_url": OPENCONNECTOR_CONSOLE_URL,
     }
@@ -2076,6 +2138,108 @@ def _sanitize_error(exc: Exception) -> str:
     return msg or "unknown error"
 
 
+# ---------------------------------------------------------------------------
+# Local inference model probe (Qwen :18002 / Strata :18086)
+#
+# Standalone helper/collector only.  Sends one short chat-completion request
+# per endpoint and treats success as a real non-empty choices[0] text payload,
+# never HTTP 200 alone.  Not wired into /api/status in this step.
+# ---------------------------------------------------------------------------
+MODEL_PROBE_TARGETS = (
+    {"name": "qwen", "base_url": "http://127.0.0.1:18002", "timeout_seconds": 20.0},
+    {"name": "strata", "base_url": "http://127.0.0.1:18086", "timeout_seconds": 20.0},
+)
+# Both servers are reasoning models: they spend tokens on reasoning_content
+# before emitting message.content, so a tiny token budget truncates the answer
+# and yields HTTP 200 with empty content.  Keep a budget that fits reasoning.
+MODEL_PROBE_MAX_TOKENS = 128
+MODEL_PROBE_CACHE_TTL_SECONDS = 60.0
+# Loopback inference endpoints must never be reached through an inherited
+# egress proxy; use a proxy-free opener so the probe measures the model itself.
+_MODEL_PROBE_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+_model_probe_cache: dict[str, Any] = {}
+_model_probe_cache_at = 0.0
+_model_probe_cache_lock = threading.Lock()
+
+
+def probe_model_inference(*, name: str, base_url: str, timeout_seconds: float = 8.0) -> dict[str, Any]:
+    """One short completion request; ok=True only when choices[0] carries real text."""
+    started = time.time()
+    result: dict[str, Any] = {
+        "name": name,
+        "endpoint": f"{base_url}/v1/chat/completions",
+        "ok": False,
+        "http_status": None,
+        "response_ms": None,
+        "has_text": False,
+        "reasoning_only": False,
+        "finish_reason": None,
+        "error": None,
+    }
+    body = json.dumps({
+        "messages": [{"role": "user", "content": "Reply with exactly: OK"}],
+        "max_tokens": MODEL_PROBE_MAX_TOKENS,
+        "temperature": 0,
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        f"{base_url}/v1/chat/completions",
+        data=body,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with _MODEL_PROBE_OPENER.open(request, timeout=timeout_seconds) as response:
+            status = getattr(response, "status", None) or 200
+            raw = response.read().decode("utf-8", errors="replace")
+        result["http_status"] = status
+        text = None
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError):
+            payload = None
+        if isinstance(payload, dict):
+            choices = payload.get("choices")
+            if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+                choice = choices[0]
+                result["finish_reason"] = choice.get("finish_reason")
+                message = choice.get("message")
+                candidate = message.get("content") if isinstance(message, dict) else choice.get("text")
+                if isinstance(candidate, str) and candidate.strip():
+                    text = candidate.strip()
+                elif isinstance(message, dict):
+                    reasoning = message.get("reasoning_content")
+                    if isinstance(reasoning, str) and reasoning.strip():
+                        result["reasoning_only"] = True
+        result["has_text"] = text is not None
+        result["ok"] = status == 200 and text is not None
+        if not result["ok"] and result["error"] is None:
+            result["error"] = "reasoning_only_no_content" if result["reasoning_only"] else "no_completion_text"
+    except Exception as exc:
+        result["error"] = _sanitize_error(exc)
+    finally:
+        result["response_ms"] = int((time.time() - started) * 1000)
+    return result
+
+
+def collect_model_probes(*, force: bool = False) -> dict[str, Any]:
+    """Probe every configured model endpoint with a short process-local cache."""
+    global _model_probe_cache, _model_probe_cache_at
+    now = time.time()
+    with _model_probe_cache_lock:
+        if not force and _model_probe_cache and (now - _model_probe_cache_at) < MODEL_PROBE_CACHE_TTL_SECONDS:
+            return _model_probe_cache
+        results = [probe_model_inference(**target) for target in MODEL_PROBE_TARGETS]
+        payload = {
+            "models": results,
+            "all_ok": bool(results) and all(item["ok"] for item in results),
+            "checked_at": int(now),
+            "last_updated": time.strftime("%H:%M:%S", time.localtime(now)),
+        }
+        _model_probe_cache = payload
+        _model_probe_cache_at = now
+        return payload
+
+
 def _whitelist_bucket(bucket: Any) -> dict[str, Any] | None:
     if not isinstance(bucket, dict):
         return None
@@ -2342,6 +2506,30 @@ def api_status() -> dict[str, Any]:
     except Exception as exc:
         openconnector_error = _sanitize_error(exc)
         openconnector = {"summary": {"managed": 0, "healthy": 0, "warning": 0, "error": 0, "unverified": 0}}
+    try:
+        stall_detector = _collect_agent_watchdog()
+    except Exception as exc:
+        stall_detector = {
+            "available": False,
+            "unavailable_reason": _sanitize_error(exc),
+            "scan_ts": None,
+            "scan_ts_text": "UNAVAILABLE",
+            "stale": True,
+            "agent_count": 0,
+            "abnormal_count": 0,
+            "agents": {},
+        }
+
+    try:
+        model_probes = collect_model_probes()
+    except Exception as exc:
+        model_probes = {
+            "models": [],
+            "all_ok": False,
+            "checked_at": int(time.time()),
+            "last_updated": time.strftime("%H:%M:%S"),
+            "error": _sanitize_error(exc),
+        }
 
     service_states = [item["state"] for item in services.values()]
     gateway_state = openclaw.get("summary", {}).get("gateway", "unknown")
@@ -2385,6 +2573,8 @@ def api_status() -> dict[str, Any]:
             "services": {k: v.get("state") for k, v in services.items()},
             "gateway": gateway_state,
             "openconnector": {"healthy": oc_healthy, "total": oc_total, "attention": oc_attention, "error": oc_errors, "state": "unavailable" if openconnector_error else "available"},
+            "stall_detector": "unavailable" if not stall_detector.get("available") else ("stale" if stall_detector.get("stale") else "fresh"),
+            "model_probes": "healthy" if model_probes.get("all_ok") else "attention",
         },
         "cpu": cpu,
         "memory": memory,
@@ -2399,6 +2589,8 @@ def api_status() -> dict[str, Any]:
         "gateway": openclaw.get("gateway"),
         "openconnector_summary": oc_summary,
         "openconnector_error": openconnector_error,
+        "stall_detector": stall_detector,
+        "model_probes": model_probes,
         "gpu_risk_detail": gpu_summary,
     }
 

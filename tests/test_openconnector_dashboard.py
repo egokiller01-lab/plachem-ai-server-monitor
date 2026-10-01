@@ -1,5 +1,6 @@
 import time
 import unittest
+import urllib.parse
 from unittest.mock import patch
 
 import app
@@ -24,6 +25,28 @@ class OpenConnectorDashboardTests(unittest.TestCase):
             }
             for service, action in app.OPENCONNECTOR_MANAGED_ACTIONS.items()
         ]
+
+    @staticmethod
+    def fake_admin_get(connections, runtime_tokens, runs):
+        """Answer _openconnector_admin_get by request URL, not call order.
+
+        The dashboard now collects run evidence per managed service
+        (A-1 scoped collection), so a positional side_effect list can no
+        longer describe the call sequence.  Each runs request receives only
+        the runs matching its ``service`` query parameter.
+        """
+        def fake_get(path: str, timeout: float = 2.5):
+            if path.startswith("/api/connections"):
+                return connections
+            if path.startswith("/api/runtime-tokens"):
+                return runtime_tokens
+            if path.startswith("/api/runs"):
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
+                service = query.get("service", [None])[0]
+                items = [run for run in runs if run.get("service") == service] if service else list(runs)
+                return {"items": items}
+            raise AssertionError(f"unexpected admin path: {path}")
+        return fake_get
 
     def test_dashboard_reports_real_run_health_without_secrets(self) -> None:
         now_iso = "2026-08-27T05:00:00.000Z"
@@ -65,7 +88,7 @@ class OpenConnectorDashboardTests(unittest.TestCase):
             {"service": "generic_imap", "actionId": "generic_imap.list_folders", "completedAt": "2026-08-27T05:00:00.000Z", "ok": False, "errorCode": "authentication_failed"},
             {"service": "generic_imap", "actionId": "generic_imap.list_folders", "completedAt": "2026-08-27T04:00:00.000Z", "ok": True},
         ]
-        with patch.object(app, "_openconnector_admin_get", side_effect=[connections, [], {"items": runs}]), patch.object(time, "time", return_value=app._parse_iso_timestamp("2026-08-27T05:01:00.000Z")), patch.object(app, "get_openconnector_connection_updates", side_effect=RuntimeError("docker unavailable")), patch.object(app, "get_openconnector_lease_review", return_value={"items": [], "error": None}):
+        with patch.object(app, "_openconnector_admin_get", side_effect=self.fake_admin_get(connections, [], runs)), patch.object(time, "time", return_value=app._parse_iso_timestamp("2026-08-27T05:01:00.000Z")), patch.object(app, "get_openconnector_connection_updates", side_effect=RuntimeError("docker unavailable")), patch.object(app, "get_openconnector_lease_review", return_value={"items": [], "error": None}):
             dashboard = app.get_openconnector_dashboard()
         gmail = next(item for item in dashboard["services"] if item["service"] == "gmail")
         self.assertEqual(gmail["state"], "error")
@@ -82,7 +105,7 @@ class OpenConnectorDashboardTests(unittest.TestCase):
         runs = self.managed_runs("2026-08-27T05:00:00.000Z", ok=True) + [
             {"service": "gmail", "actionId": "gmail.get_profile", "completedAt": "2026-08-27T05:00:01.000Z", "ok": False, "errorCode": "oauth_token_refresh_failed"},
         ]
-        with patch.object(app, "_openconnector_admin_get", side_effect=[connections, [], {"items": runs}]), patch.object(time, "time", return_value=app._parse_iso_timestamp("2026-08-27T05:01:00.000Z")), patch.object(app, "get_openconnector_connection_updates", return_value={}), patch.object(app, "get_openconnector_lease_review", return_value={"items": [], "error": None}):
+        with patch.object(app, "_openconnector_admin_get", side_effect=self.fake_admin_get(connections, [], runs)), patch.object(time, "time", return_value=app._parse_iso_timestamp("2026-08-27T05:01:00.000Z")), patch.object(app, "get_openconnector_connection_updates", return_value={}), patch.object(app, "get_openconnector_lease_review", return_value={"items": [], "error": None}):
             dashboard = app.get_openconnector_dashboard()
         gmail = next(item for item in dashboard["services"] if item["service"] == "gmail")
         self.assertEqual(dashboard["summary"]["managed"], 13)
@@ -97,21 +120,21 @@ class OpenConnectorDashboardTests(unittest.TestCase):
             {"service": service, "actionId": action, "caller": "http", "completedAt": "2026-08-20T05:00:00.000Z", "ok": True, "durationMs": 80}
             for service, action in app.OPENCONNECTOR_MANAGED_ACTIONS.items()
         ]
-        with patch.object(app, "_openconnector_admin_get", side_effect=[connections, [], {"items": runs}]), patch.object(time, "time", return_value=app._parse_iso_timestamp("2026-08-27T05:00:00.000Z")), patch.object(app, "get_openconnector_connection_updates", return_value={}), patch.object(app, "get_openconnector_lease_review", return_value={"items": [], "error": None}):
+        with patch.object(app, "_openconnector_admin_get", side_effect=self.fake_admin_get(connections, [], runs)), patch.object(time, "time", return_value=app._parse_iso_timestamp("2026-08-27T05:00:00.000Z")), patch.object(app, "get_openconnector_connection_updates", return_value={}), patch.object(app, "get_openconnector_lease_review", return_value={"items": [], "error": None}):
             dashboard = app.get_openconnector_dashboard()
         self.assertTrue(all(s["state_reason"] == "authenticated_use_stale" for s in dashboard["services"]))
         self.assertTrue(all(s["credential_expires_at"] is None for s in dashboard["services"]))
 
     def test_dashboard_state_reason_no_run_record(self) -> None:
         connections = [{"service": service, "configured": True, "authType": "oauth"} for service in app.OPENCONNECTOR_MANAGED_ACTIONS]
-        with patch.object(app, "_openconnector_admin_get", side_effect=[connections, [], {"items": []}]), patch.object(time, "time", return_value=app._parse_iso_timestamp("2026-08-27T05:00:00.000Z")), patch.object(app, "get_openconnector_connection_updates", return_value={}), patch.object(app, "get_openconnector_lease_review", return_value={"items": [], "error": None}):
+        with patch.object(app, "_openconnector_admin_get", side_effect=self.fake_admin_get(connections, [], [])), patch.object(time, "time", return_value=app._parse_iso_timestamp("2026-08-27T05:00:00.000Z")), patch.object(app, "get_openconnector_connection_updates", return_value={}), patch.object(app, "get_openconnector_lease_review", return_value={"items": [], "error": None}):
             dashboard = app.get_openconnector_dashboard()
         self.assertTrue(all(s["state_reason"] == "first_verification_required" for s in dashboard["services"]))
         self.assertTrue(all(s["state"] == "attention" for s in dashboard["services"]))
 
     def test_dashboard_state_reason_not_configured(self) -> None:
         connections = [{"service": service, "configured": False} for service in app.OPENCONNECTOR_MANAGED_ACTIONS]
-        with patch.object(app, "_openconnector_admin_get", side_effect=[connections, [], {"items": []}]), patch.object(time, "time", return_value=app._parse_iso_timestamp("2026-08-27T05:00:00.000Z")), patch.object(app, "get_openconnector_connection_updates", return_value={}), patch.object(app, "get_openconnector_lease_review", return_value={"items": [], "error": None}):
+        with patch.object(app, "_openconnector_admin_get", side_effect=self.fake_admin_get(connections, [], [])), patch.object(time, "time", return_value=app._parse_iso_timestamp("2026-08-27T05:00:00.000Z")), patch.object(app, "get_openconnector_connection_updates", return_value={}), patch.object(app, "get_openconnector_lease_review", return_value={"items": [], "error": None}):
             dashboard = app.get_openconnector_dashboard()
         self.assertTrue(all(s["state_reason"] == "not_configured" for s in dashboard["services"]))
         self.assertTrue(all(s["auth_type"] is None for s in dashboard["services"]))
@@ -124,7 +147,7 @@ class OpenConnectorDashboardTests(unittest.TestCase):
             refreshable=True, authHealth="refreshable",
             profile={"accessToken": "must-not-leak"},
         )
-        with patch.object(app, "_openconnector_admin_get", side_effect=[connections, [], {"items": []}]), patch.object(time, "time", return_value=app._parse_iso_timestamp("2026-08-27T05:00:00.000Z")), patch.object(app, "get_openconnector_connection_updates", return_value={}), patch.object(app, "get_openconnector_lease_review", return_value={"items": [], "error": None}):
+        with patch.object(app, "_openconnector_admin_get", side_effect=self.fake_admin_get(connections, [], [])), patch.object(time, "time", return_value=app._parse_iso_timestamp("2026-08-27T05:00:00.000Z")), patch.object(app, "get_openconnector_connection_updates", return_value={}), patch.object(app, "get_openconnector_lease_review", return_value={"items": [], "error": None}):
             dashboard = app.get_openconnector_dashboard()
         self.assertEqual(dashboard["summary"]["oauth_auto_refresh"], 13)
         self.assertTrue(all(item["expiration_status"] == "due_2h" for item in dashboard["services"]))
@@ -133,7 +156,7 @@ class OpenConnectorDashboardTests(unittest.TestCase):
     def test_any_successful_service_action_is_real_verification(self) -> None:
         connections = [{"service": "googledrive", "configured": True, "authType": "oauth2", "refreshable": True}]
         runs = [{"service": "googledrive", "actionId": "googledrive.files.get", "completedAt": "2026-08-27T05:00:00.000Z", "ok": True}]
-        with patch.object(app, "_openconnector_admin_get", side_effect=[connections, [], {"items": runs}]), patch.object(time, "time", return_value=app._parse_iso_timestamp("2026-08-27T05:01:00.000Z")), patch.object(app, "get_openconnector_connection_updates", return_value={}), patch.object(app, "get_openconnector_lease_review", return_value={"items": [], "error": None}):
+        with patch.object(app, "_openconnector_admin_get", side_effect=self.fake_admin_get(connections, [], runs)), patch.object(time, "time", return_value=app._parse_iso_timestamp("2026-08-27T05:01:00.000Z")), patch.object(app, "get_openconnector_connection_updates", return_value={}), patch.object(app, "get_openconnector_lease_review", return_value={"items": [], "error": None}):
             dashboard = app.get_openconnector_dashboard()
         item = dashboard["services"][0]
         self.assertEqual(item["state"], "healthy")
@@ -145,7 +168,7 @@ class OpenConnectorDashboardTests(unittest.TestCase):
             {"service": "supabase", "actionId": "supabase.run_read_only_query", "completedAt": "2026-08-27T05:00:00.000Z", "ok": False, "errorCode": "invalid_input"},
             {"service": "supabase", "actionId": "supabase.get_project", "completedAt": "2026-08-27T04:00:00.000Z", "ok": True},
         ]
-        with patch.object(app, "_openconnector_admin_get", side_effect=[connections, [], {"items": runs}]), patch.object(time, "time", return_value=app._parse_iso_timestamp("2026-08-27T05:01:00.000Z")), patch.object(app, "get_openconnector_connection_updates", return_value={}), patch.object(app, "get_openconnector_lease_review", return_value={"items": [], "error": None}):
+        with patch.object(app, "_openconnector_admin_get", side_effect=self.fake_admin_get(connections, [], runs)), patch.object(time, "time", return_value=app._parse_iso_timestamp("2026-08-27T05:01:00.000Z")), patch.object(app, "get_openconnector_connection_updates", return_value={}), patch.object(app, "get_openconnector_lease_review", return_value={"items": [], "error": None}):
             item = app.get_openconnector_dashboard()["services"][0]
         self.assertEqual(item["state"], "healthy")
         self.assertEqual(item["auth_failures_24h"], 0)

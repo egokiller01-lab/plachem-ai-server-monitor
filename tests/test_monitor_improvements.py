@@ -76,6 +76,35 @@ class MonitorImprovementTests(unittest.TestCase):
         self.assertEqual("unavailable", result["overall_breakdown"]["openconnector"]["state"])
         self.assertIn("admin API unavailable", result["openconnector_error"])
 
+    def test_api_status_includes_agent_watchdog_payload(self):
+        healthy = {"status": "ok", "state": "ok"}
+        watchdog = {
+            "available": True,
+            "unavailable_reason": None,
+            "scan_ts": int(app.time.time() * 1000),
+            "scan_ts_text": "2026-09-30 21:00:00",
+            "stale": False,
+            "agent_count": 2,
+            "abnormal_count": 0,
+            "agents": {"main": {"status": "IDLE", "display_state": "IDLE", "buckets": {}, "warnings": []}},
+        }
+        with patch.multiple(app, get_cpu=lambda: healthy, get_memory=lambda: healthy, get_disk=lambda: healthy, get_network=lambda: healthy, get_gpus=lambda: [{"status": "ok", "vram_headroom_state": "ok", "vram_headroom_gb": 10.0, "temperature_c": 60}], get_services=lambda: {}, collect_openclaw_status=lambda: {"summary": {"gateway": "healthy"}, "gateway": {"ok": True}}, get_openconnector_dashboard=lambda: {"summary": {"managed": 2, "healthy": 2, "unverified": 0}}, _collect_agent_watchdog=lambda: watchdog):
+            result = app.api_status()
+        self.assertTrue(result["stall_detector"]["available"])
+        self.assertFalse(result["stall_detector"]["stale"])
+        self.assertEqual(2, result["stall_detector"]["agent_count"])
+        self.assertEqual("fresh", result["overall_breakdown"]["stall_detector"])
+
+    def test_api_status_isolates_agent_watchdog_failure(self):
+        healthy = {"status": "ok", "state": "ok"}
+        with patch.multiple(app, get_cpu=lambda: healthy, get_memory=lambda: healthy, get_disk=lambda: healthy, get_network=lambda: healthy, get_gpus=lambda: [{"status": "ok", "vram_headroom_state": "ok", "vram_headroom_gb": 10.0, "temperature_c": 60}], get_services=lambda: {}, collect_openclaw_status=lambda: {"summary": {"gateway": "healthy"}, "gateway": {"ok": True}}, get_openconnector_dashboard=lambda: {"summary": {"managed": 2, "healthy": 2, "unverified": 0}}, _collect_agent_watchdog=lambda: (_ for _ in ()).throw(RuntimeError("watchdog db unreadable"))):
+            result = app.api_status()
+        self.assertFalse(result["stall_detector"]["available"])
+        self.assertTrue(result["stall_detector"]["stale"])
+        self.assertIn("watchdog db unreadable", result["stall_detector"]["unavailable_reason"])
+        self.assertEqual("unavailable", result["overall_breakdown"]["stall_detector"])
+        self.assertEqual("normal", result["overall"])
+
     def test_ui_exposes_all_gpu_rows_and_independent_connector_columns(self):
         html = (app.STATIC_DIR / "index.html").read_text(encoding="utf-8")
         self.assertIn("gpus.forEach", html)
@@ -185,6 +214,162 @@ class MonitorImprovementTests(unittest.TestCase):
         self.assertIn('"Token State"', html)
         self.assertIn(".token-state.token-abnormal", html)
         self.assertIn('ABNORMAL:"token-abnormal"', html)
+
+
+class _ProbeResponse:
+    """Stand-in for the proxy-free urllib opener response."""
+
+    def __init__(self, payload, status=200):
+        self._payload = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+        self.status = status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def read(self):
+        return self._payload
+
+
+class _FakeProbeOpener:
+    def __init__(self, response=None, error=None):
+        self.response = response
+        self.error = error
+        self.calls = 0
+
+    def open(self, request, timeout=None):
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        return self.response
+
+
+def _completion_payload(content, reasoning=None, finish="stop"):
+    message = {"role": "assistant", "content": content}
+    if reasoning is not None:
+        message["reasoning_content"] = reasoning
+    return {"choices": [{"index": 0, "message": message, "finish_reason": finish}]}
+
+
+class ModelProbeTests(unittest.TestCase):
+    def setUp(self):
+        app._model_probe_cache = {}
+        app._model_probe_cache_at = 0.0
+
+    def test_probe_accepts_only_non_empty_completion_text(self):
+        opener = _FakeProbeOpener(_ProbeResponse(_completion_payload("OK", reasoning="thinking")))
+        with patch.object(app, "_MODEL_PROBE_OPENER", opener):
+            result = app.probe_model_inference(name="qwen", base_url="http://127.0.0.1:18002")
+        self.assertTrue(result["ok"])
+        self.assertEqual(200, result["http_status"])
+        self.assertTrue(result["has_text"])
+        self.assertFalse(result["reasoning_only"])
+        self.assertIsNone(result["error"])
+        self.assertEqual("stop", result["finish_reason"])
+        self.assertEqual("http://127.0.0.1:18002/v1/chat/completions", result["endpoint"])
+
+    def test_probe_rejects_empty_content_with_reasoning_only(self):
+        for empty in ("", None):
+            with self.subTest(content=empty):
+                opener = _FakeProbeOpener(_ProbeResponse(_completion_payload(empty, reasoning="still thinking", finish="length")))
+                with patch.object(app, "_MODEL_PROBE_OPENER", opener):
+                    result = app.probe_model_inference(name="strata", base_url="http://127.0.0.1:18086")
+                self.assertFalse(result["ok"])
+                self.assertEqual(200, result["http_status"])
+                self.assertFalse(result["has_text"])
+                self.assertTrue(result["reasoning_only"])
+                self.assertEqual("reasoning_only_no_content", result["error"])
+
+    def test_probe_rejects_malformed_or_missing_choices(self):
+        cases = {
+            "not_json": _ProbeResponse(b"<html>bad gateway</html>"),
+            "no_choices": _ProbeResponse({"object": "chat.completion"}),
+            "empty_choices": _ProbeResponse({"choices": []}),
+            "choice_not_object": _ProbeResponse({"choices": ["oops"]}),
+            "whitespace_content": _ProbeResponse(_completion_payload("   ")),
+        }
+        for label, response in cases.items():
+            with self.subTest(case=label):
+                opener = _FakeProbeOpener(response)
+                with patch.object(app, "_MODEL_PROBE_OPENER", opener):
+                    result = app.probe_model_inference(name="qwen", base_url="http://127.0.0.1:18002")
+                self.assertFalse(result["ok"], label)
+                self.assertFalse(result["has_text"], label)
+                self.assertEqual("no_completion_text", result["error"], label)
+
+    def test_probe_sanitizes_opener_error_without_propagating(self):
+        opener = _FakeProbeOpener(error=RuntimeError(
+            "401 client error for http://openclaw:SUPERVALUETOKEN@127.0.0.1:43483/v1/chat/completions"
+        ))
+        with patch.object(app, "_MODEL_PROBE_OPENER", opener):
+            result = app.probe_model_inference(name="qwen", base_url="http://127.0.0.1:18002")
+        self.assertFalse(result["ok"])
+        self.assertIsNone(result["http_status"])
+        self.assertFalse(result["has_text"])
+        self.assertIsNotNone(result["error"])
+        self.assertNotIn("SUPERVALUETOKEN", result["error"])
+        self.assertIn("[REDACTED]", result["error"])
+        self.assertIsInstance(result["response_ms"], int)
+
+    def test_collect_model_probes_uses_cache_within_ttl(self):
+        calls = []
+
+        def fake_probe(*, name, base_url, timeout_seconds=8.0):
+            calls.append(name)
+            return {"name": name, "ok": True}
+
+        with patch.object(app, "probe_model_inference", side_effect=fake_probe):
+            first = app.collect_model_probes()
+            second = app.collect_model_probes()
+        expected_names = sorted(target["name"] for target in app.MODEL_PROBE_TARGETS)
+        self.assertEqual(expected_names, sorted(calls[: len(expected_names)]))
+        self.assertEqual(len(expected_names), len(calls))
+        self.assertTrue(first["all_ok"])
+        self.assertIs(first, second)
+        self.assertIsInstance(first["checked_at"], int)
+        self.assertRegex(first["last_updated"], r"^\d{2}:\d{2}:\d{2}$")
+
+        with patch.object(app, "probe_model_inference", side_effect=fake_probe):
+            app._model_probe_cache_at = 0.0
+            third = app.collect_model_probes()
+        self.assertEqual(2 * len(expected_names), len(calls))
+        self.assertIsNot(first, third)
+
+    def test_api_status_reports_healthy_model_probes(self):
+        healthy = {"status": "ok", "state": "ok"}
+        payload = {
+            "models": [{"name": "qwen", "ok": True, "http_status": 200, "has_text": True},
+                       {"name": "strata", "ok": True, "http_status": 200, "has_text": True}],
+            "all_ok": True,
+            "checked_at": 1790782018,
+            "last_updated": "22:26:58",
+        }
+        with patch.multiple(app, get_cpu=lambda: healthy, get_memory=lambda: healthy, get_disk=lambda: healthy, get_network=lambda: healthy, get_gpus=lambda: [{"status": "ok", "vram_headroom_state": "ok", "vram_headroom_gb": 10.0, "temperature_c": 60}], get_services=lambda: {}, collect_openclaw_status=lambda: {"summary": {"gateway": "healthy"}, "gateway": {"ok": True}}, get_openconnector_dashboard=lambda: {"summary": {"managed": 2, "healthy": 2, "unverified": 0}}, _collect_agent_watchdog=lambda: {"available": True, "stale": False, "agent_count": 0, "abnormal_count": 0, "agents": {}}, collect_model_probes=lambda: payload):
+            result = app.api_status()
+        self.assertEqual(payload, result["model_probes"])
+        self.assertEqual(2, len(result["model_probes"]["models"]))
+        self.assertTrue(result["model_probes"]["all_ok"])
+        self.assertEqual("healthy", result["overall_breakdown"]["model_probes"])
+
+    def test_api_status_isolates_model_probe_failure(self):
+        healthy = {"status": "ok", "state": "ok"}
+
+        def boom():
+            raise RuntimeError("probe endpoint refused with credential=TOPSECRET")
+
+        with patch.multiple(app, get_cpu=lambda: healthy, get_memory=lambda: healthy, get_disk=lambda: healthy, get_network=lambda: healthy, get_gpus=lambda: [{"status": "ok", "vram_headroom_state": "ok", "vram_headroom_gb": 10.0, "temperature_c": 60}], get_services=lambda: {}, collect_openclaw_status=lambda: {"summary": {"gateway": "healthy"}, "gateway": {"ok": True}}, get_openconnector_dashboard=lambda: {"summary": {"managed": 2, "healthy": 2, "unverified": 0}}, _collect_agent_watchdog=lambda: {"available": True, "stale": False, "agent_count": 0, "abnormal_count": 0, "agents": {}}, collect_model_probes=boom):
+            result = app.api_status()
+        probes = result["model_probes"]
+        self.assertEqual([], probes["models"])
+        self.assertFalse(probes["all_ok"])
+        self.assertIsInstance(probes["checked_at"], int)
+        self.assertRegex(probes["last_updated"], r"^\d{2}:\d{2}:\d{2}$")
+        self.assertIn("[REDACTED]", probes["error"])
+        self.assertNotIn("TOPSECRET", probes["error"])
+        self.assertEqual("attention", result["overall_breakdown"]["model_probes"])
+        self.assertEqual("normal", result["overall"])
 
 
 if __name__ == "__main__":
