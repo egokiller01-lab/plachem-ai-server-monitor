@@ -1334,6 +1334,110 @@
     @media (max-width: 720px) {
       body.auth-control-open .shell { width: calc(100vw - 20px); }
     }
+
+    /* Final main-monitor layout aligned to the supplied 1122px reference. */
+    body:not(.auth-control-open) .shell { width: min(1080px, calc(100vw - 32px)); max-width: none; padding: 18px 0 24px; }
+    body:not(.auth-control-open) header { min-height: 44px; margin-bottom: 14px; gap: 18px; }
+    body:not(.auth-control-open) .brand { gap: 10px; }
+    body:not(.auth-control-open) .logo { width: 34px; height: 34px; border-radius: 10px; font-size: 16px; }
+    body:not(.auth-control-open) h1 { font-size: 24px; }
+    body:not(.auth-control-open) h1 span { font-size: 20px; }
+    body:not(.auth-control-open) .top-actions { gap: 8px; }
+    body:not(.auth-control-open) .back-button,
+    body:not(.auth-control-open) .live { min-height: 34px; padding: 0 12px; font-size: 11px; border-radius: 9px; }
+
+    body:not(.auth-control-open) .kpis { grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; margin-bottom: 16px; }
+    body:not(.auth-control-open) .kpi { min-height: 82px; padding: 11px 12px; grid-template-columns: 32px 1fr; grid-template-rows: auto auto 20px; gap: 1px 9px; border-radius: 10px; }
+    body:not(.auth-control-open) .kpi .icon { width: 32px; height: 32px; font-size: 14px; border-radius: 8px; }
+    body:not(.auth-control-open) .kpi .label { font-size: 10px; }
+    body:not(.auth-control-open) .kpi .value { font-size: 22px; }
+    body:not(.auth-control-open) .kpi-spark { height: 20px; }
+
+    body:not(.auth-control-open) .gpu-server-section { margin-bottom: 22px; }
+    body:not(.auth-control-open) .gpu-server-head { gap: 12px; margin: 0 3px 11px; }
+    body:not(.auth-control-open) .gpu-server-title { font-size: 14px; }
+    body:not(.auth-control-open) .gpu-server-model,
+    body:not(.auth-control-open) .gpu-server-meta { font-size: 11px; }
+    body:not(.auth-control-open) .gpu-grid,
+    body:not(.auth-control-open) .ai-gpu-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+    body:not(.auth-control-open) .gpu-unit-card { min-height: 278px; padding: 18px 20px; border-radius: 11px; }
+    body:not(.auth-control-open) .gpu-unit-card .card-title { font-size: 15px; margin-bottom: 5px; }
+    body:not(.auth-control-open) .gpu-unit-name { margin: 0 0 15px 26px; font-size: 11px; }
+    body:not(.auth-control-open) .gpu-badge-row { margin: -7px 0 12px 26px; }
+    body:not(.auth-control-open) .gpu-dashboard { grid-template-columns: 154px minmax(0, 1fr); gap: 22px; }
+    body:not(.auth-control-open) .gpu-gauge { width: 150px; }
+    body:not(.auth-control-open) .gpu-gauge::before { inset: 12px; }
+    body:not(.auth-control-open) .gpu-gauge-center { inset: 26px; }
+    body:not(.auth-control-open) .gpu-gauge-value { font-size: 34px; }
+    body:not(.auth-control-open) .gpu-gauge-label { font-size: 9px; }
+    body:not(.auth-control-open) .gpu-unit-metrics { gap: 13px 18px; }
+    body:not(.auth-control-open) .gpu-unit-metric span { font-size: 9px; }
+    body:not(.auth-control-open) .gpu-unit-metric strong { font-size: 15px; }
+    body:not(.auth-control-open) .gpu-unit-pcie { font-size: 10px; }
+
+    body:not(.auth-control-open) .ai-system-panel { grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 14px; margin-top: 14px; padding: 14px 18px 16px; border-radius: 11px; }
+    body:not(.auth-control-open) .ai-system-head { font-size: 10px; }
+    body:not(.auth-control-open) .ai-system-gauge span { font-size: 9px; }
+    body:not(.auth-control-open) .ai-system-gauge strong { font-size: 15px; }
+    body:not(.auth-control-open) .ai-system-bar { height: 5px; }
+
+    body:not(.auth-control-open) .codex-grid,
+    body:not(.auth-control-open) .agent-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-bottom: 12px; }
+    body:not(.auth-control-open) .codex-card,
+    body:not(.auth-control-open) .erpmanager-card,
+    body:not(.auth-control-open) .secretary-card { min-height: 142px; margin-top: 0; padding: 16px 18px; border-radius: 11px; }
+    body:not(.auth-control-open) .codex-card .card-title,
+    body:not(.auth-control-open) .agent-grid .card-title { font-size: 15px; }
+    body:not(.auth-control-open) .codex-percent,
+    body:not(.auth-control-open) .erpmanager-percent { font-size: 34px; }
+    body:not(.auth-control-open) .reading-label,
+    body:not(.auth-control-open) .codex-meta,
+    body:not(.auth-control-open) .codex-sub,
+    body:not(.auth-control-open) .erpmanager-meta { font-size: 11px; }
+    body:not(.auth-control-open) .watchdog-card { margin-top: 0; padding: 16px 18px; border-radius: 11px; }
+    body:not(.auth-control-open) .watchdog-card .card-title { font-size: 15px; }
+    body:not(.auth-control-open) .watchdog-scan-meta,
+    body:not(.auth-control-open) .wd-summary-line { font-size: 11px; }
+    body:not(.auth-control-open) .openclaw-main-summary { min-height: 82px; grid-template-columns: 170px 1fr 164px; gap: 12px; padding: 14px 18px; margin: 12px 0; border-radius: 11px; }
+    body:not(.auth-control-open) .openclaw-summary-head { font-size: 14px; }
+    body:not(.auth-control-open) .openclaw-summary-head .icon { width: 32px; height: 32px; font-size: 15px; }
+    body:not(.auth-control-open) .oc-segment { padding: 0 13px; }
+    body:not(.auth-control-open) .oc-segment span { font-size: 9px; }
+    body:not(.auth-control-open) .oc-segment strong { font-size: 12px; }
+    body:not(.auth-control-open) .openclaw-control-button { min-height: 38px; padding: 0 13px; font-size: 11px; border-radius: 9px; }
+    body:not(.auth-control-open) .services { grid-template-columns: 145px repeat(4, 1fr); min-height: 54px; padding: 10px 16px; margin-bottom: 12px; border-radius: 11px; }
+    body:not(.auth-control-open) .service-title { font-size: 14px; }
+    body:not(.auth-control-open) .service { font-size: 11px; }
+    body:not(.auth-control-open) footer { min-height: 38px; font-size: 10px; }
+
+    @media (max-width: 900px) {
+      body:not(.auth-control-open) .shell { width: min(720px, calc(100vw - 20px)); }
+      body:not(.auth-control-open) header { align-items: flex-start; flex-direction: column; }
+      body:not(.auth-control-open) .top-actions { width: 100%; flex-wrap: wrap; }
+      body:not(.auth-control-open) .kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      body:not(.auth-control-open) .gpu-grid,
+      body:not(.auth-control-open) .ai-gpu-grid { grid-template-columns: 1fr; }
+      body:not(.auth-control-open) .ai-system-panel { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      body:not(.auth-control-open) .openclaw-main-summary,
+      body:not(.auth-control-open) .services { grid-template-columns: 1fr; }
+      body:not(.auth-control-open) .openclaw-main-metrics { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+      body:not(.auth-control-open) .openclaw-control-button { justify-self: stretch; }
+    }
+    @media (max-width: 560px) {
+      body:not(.auth-control-open) .shell { width: calc(100vw - 14px); padding-top: 10px; }
+      body:not(.auth-control-open) h1 { font-size: 19px; }
+      body:not(.auth-control-open) h1 span { font-size: 15px; }
+      body:not(.auth-control-open) .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      body:not(.auth-control-open) .gpu-unit-card { min-height: 250px; padding: 15px; }
+      body:not(.auth-control-open) .gpu-dashboard { grid-template-columns: 132px minmax(0, 1fr); gap: 14px; }
+      body:not(.auth-control-open) .gpu-gauge { width: 128px; }
+      body:not(.auth-control-open) .gpu-unit-metric strong { font-size: 13px; }
+      body:not(.auth-control-open) .ai-system-panel { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      body:not(.auth-control-open) .codex-grid,
+      body:not(.auth-control-open) .agent-grid { grid-template-columns: 1fr; }
+      body:not(.auth-control-open) .openclaw-main-metrics { grid-template-columns: 1fr 1fr; }
+      body:not(.auth-control-open) .oc-segment { border-left: 0; border-top: 1px solid rgba(148,163,184,.16); padding: 9px 0; }
+    }
   </style>
 </head>
 <body>
