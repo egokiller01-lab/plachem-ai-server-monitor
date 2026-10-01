@@ -434,8 +434,8 @@ def _render_ai_panel_gauges(system_payload, collect_error):
               return {
                 className: panel.className,
                 head: panel.querySelector('.ai-system-head').textContent.replace(/\s+/g, ' ').trim(),
-                gauges: Array.from(panel.querySelectorAll('.ai-system-gauge strong')).map(e => e.textContent.trim()),
-                labels: Array.from(panel.querySelectorAll('.ai-system-gauge > span')).map(e => e.textContent.trim()),
+                gauges: Array.from(panel.querySelectorAll('.ai-system-gauge .value')).map(e => e.textContent.trim()),
+                labels: Array.from(panel.querySelectorAll('.ai-system-gauge .label')).map(e => e.textContent.trim()),
               };
             }""",
             [system_payload, collect_error],
@@ -462,8 +462,8 @@ class AiPanelDashContractTests(unittest.TestCase):
         ]
         self.assertEqual(direct_calls, [], "AI panel must not call formatBps directly")
         self.assertIn("bpsVal", body)
-        self.assertIn('gauge("Network \\u2193"', body)
-        self.assertIn('gauge("Network \\u2191"', body)
+        self.assertIn('document.getElementById("ai-kpi-download")', body)
+        self.assertIn('document.getElementById("ai-kpi-upload")', body)
 
     @unittest.skipIf(
         __import__("importlib").util.find_spec("playwright") is None, "playwright unavailable"
@@ -521,8 +521,8 @@ class AiPanelDashContractTests(unittest.TestCase):
         # formatBps() rounds to whole KB/s: 1818 -> "2 KB/s", 1036 -> "1 KB/s".
         self.assertEqual(gauges[labels.index("Network ↓")], "2 KB/s")
         self.assertEqual(gauges[labels.index("Network ↑")], "1 KB/s")
-        self.assertIn("43°C", gauges[labels.index("CPU Temp")])
-        self.assertIn("9.2 / 62.6 GB", gauges[labels.index("RAM")])
+        self.assertIn("43°C", gauges[labels.index("CPU TEMP")])
+        self.assertEqual(gauges[labels.index("RAM")], "15%")
         self.assertNotIn("--", " ".join(gauges))
 
 

@@ -278,11 +278,9 @@ class UiAnchorTests(unittest.TestCase):
             r"body:not\(\.auth-control-open\) \.server-columns\s*\{[^}]*"
             r"grid-template-columns:\s*minmax\(0,\s*44fr\)\s*minmax\(0,\s*56fr\)",
         )
-        self.assertRegex(
-            self.html,
-            r"body:not\(\.auth-control-open\) \.ai-system-panel\s*\{[^}]*"
-            r"grid-template-columns:\s*132px\s*repeat\(6,\s*minmax\(0,\s*1fr\)\)",
-        )
+        self.assertIn('class="system-strip ai-system-strip" id="ai-system-panel"', self.html)
+        self.assertIn("AI Server uses the exact same strip and six KPI-card design as Main", self.html)
+        self.assertEqual(self.html.count('id="ai-kpi-'), 6)
         self.assertIn('class="system-strip main-system-strip"', self.html)
         self.assertIn('class="server-columns"', self.html)
 

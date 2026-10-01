@@ -1388,13 +1388,14 @@
     body:not(.auth-control-open) .gpu-unit-metric.fan,
     body:not(.auth-control-open) .gpu-unit-pcie { display: none; }
 
-    body:not(.auth-control-open) .ai-system-panel { grid-template-columns: 132px repeat(6, minmax(0, 1fr)); gap: 5px; margin: 0 0 6px; padding: 5px; border-radius: 8px; }
-    body:not(.auth-control-open) .ai-system-head { grid-column: auto; align-content: center; padding: 0 8px; font-size: 8px; }
-    body:not(.auth-control-open) .ai-system-head span { display: block; width: 100%; }
-    body:not(.auth-control-open) .ai-system-gauge { min-height: 48px; padding: 7px 8px; border: 1px solid rgba(34,211,238,.24); border-radius: 7px; background: rgba(7,26,45,.72); }
-    body:not(.auth-control-open) .ai-system-gauge span { font-size: 7px; }
-    body:not(.auth-control-open) .ai-system-gauge strong { font-size: 10px; }
-    body:not(.auth-control-open) .ai-system-bar { height: 3px; }
+    /* AI Server uses the exact same strip and six KPI-card design as Main. */
+    body:not(.auth-control-open) .ai-system-strip { margin-bottom: 6px; }
+    body:not(.auth-control-open) .ai-system-strip.ai-system-stale { border-color: rgba(167,139,250,.58); }
+    body:not(.auth-control-open) .ai-system-strip.ai-system-error { border-color: rgba(255,92,113,.68); }
+    body:not(.auth-control-open) .ai-system-strip .ai-system-head { grid-column: auto; height: 48px; min-height: 0; flex-wrap: nowrap; align-items: center; overflow: hidden; }
+    body:not(.auth-control-open) .ai-system-strip .kpis { height: 48px; min-height: 0; grid-template-rows: minmax(0, 48px); overflow: hidden; }
+    body:not(.auth-control-open) .ai-system-strip .kpi { height: 48px; min-height: 48px; }
+    body:not(.auth-control-open) .ai-system-strip .ai-system-state { color: var(--muted); }
 
     body:not(.auth-control-open) .codex-grid,
     body:not(.auth-control-open) .agent-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-bottom: 12px; }
@@ -1433,8 +1434,7 @@
       body:not(.auth-control-open) .system-strip { grid-template-columns: 1fr; }
       body:not(.auth-control-open) .server-columns { grid-template-columns: 1fr; }
       body:not(.auth-control-open) #gpu-server-ai .ai-gpu-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      body:not(.auth-control-open) .ai-system-panel { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-      body:not(.auth-control-open) .ai-system-head { grid-column: 1 / -1; }
+      body:not(.auth-control-open) .ai-system-strip { grid-template-columns: 1fr; }
       body:not(.auth-control-open) .openclaw-main-summary,
       body:not(.auth-control-open) .services { grid-template-columns: 1fr; }
       body:not(.auth-control-open) .openclaw-main-metrics { grid-template-columns: repeat(5, minmax(0, 1fr)); }
@@ -1449,7 +1449,7 @@
       body:not(.auth-control-open) .gpu-dashboard { grid-template-columns: 132px minmax(0, 1fr); gap: 14px; }
       body:not(.auth-control-open) .gpu-gauge { width: 128px; }
       body:not(.auth-control-open) .gpu-unit-metric strong { font-size: 13px; }
-      body:not(.auth-control-open) .ai-system-panel { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      body:not(.auth-control-open) .ai-system-strip .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       body:not(.auth-control-open) .codex-grid,
       body:not(.auth-control-open) .agent-grid { grid-template-columns: 1fr; }
       body:not(.auth-control-open) .openclaw-main-metrics { grid-template-columns: 1fr 1fr; }
@@ -1509,7 +1509,17 @@
       <div class="gpu-grid ai-gpu-grid gpu-server-grid" id="ai-gpu-grid"></div>
     </section>
     </div>
-    <div class="ai-system-panel" id="ai-system-panel" hidden></div>
+    <section class="system-strip ai-system-strip" id="ai-system-panel" hidden>
+      <div class="system-strip-label ai-system-head"><span>AI Server<small id="ai-system-state" class="ai-system-state">AI-SERVER · --</small></span></div>
+      <section class="kpis">
+        <div class="kpi ai-system-gauge"><span class="icon">▣</span><span class="label">CPU</span><span id="ai-kpi-cpu" class="value">--</span></div>
+        <div class="kpi green ai-system-gauge"><span class="icon">▤</span><span class="label">RAM</span><span id="ai-kpi-ram" class="value">--</span></div>
+        <div class="kpi cyan ai-system-gauge"><span class="icon">↓</span><span class="label">Network ↓</span><span id="ai-kpi-download" class="value">--</span></div>
+        <div class="kpi green ai-system-gauge"><span class="icon">↑</span><span class="label">Network ↑</span><span id="ai-kpi-upload" class="value">--</span></div>
+        <div class="kpi cyan ai-system-gauge"><span class="icon">▭</span><span class="label">DISK</span><span id="ai-kpi-disk" class="value">--</span></div>
+        <div class="kpi amber ai-system-gauge temp"><span class="icon">🌡</span><span class="label">CPU TEMP</span><span id="ai-kpi-cpu-temp" class="value">--</span></div>
+      </section>
+    </section>
 
     <section class="codex-grid">
       <article class="card codex-card" id="codex-weekly-card">
@@ -1615,20 +1625,27 @@
   <script>
     const maxPoints = 42;
     const kpiHistory = { cpu: [], ram: [], download: [], upload: [], disk: [], temperature: [] };
+    const aiKpiHistory = { cpu: [], ram: [], download: [], upload: [], disk: [], temperature: [] };
     const gpuLoadHistory = new Map();
     const gpuPeakWindowMs = 10000;
 
-    function ensureKpiSparks() {
-      document.querySelectorAll(".kpi").forEach((node, index) => {
+    function ensureStripSparks(selector, prefix) {
+      const keys = ["cpu", "ram", "download", "upload", "disk", "temperature"];
+      document.querySelectorAll(selector).forEach((node, index) => {
         if (!node.querySelector("canvas")) {
           const canvas = document.createElement("canvas");
           canvas.className = "kpi-spark";
           canvas.width = 260;
           canvas.height = 54;
-          canvas.id = ["kpi-spark-cpu", "kpi-spark-ram", "kpi-spark-download", "kpi-spark-upload", "kpi-spark-disk", "kpi-spark-temperature"][index];
+          canvas.id = `${prefix}${keys[index]}`;
           node.appendChild(canvas);
         }
       });
+    }
+
+    function ensureKpiSparks() {
+      ensureStripSparks(".main-system-strip .kpi", "kpi-spark-");
+      ensureStripSparks(".ai-system-strip .kpi", "ai-kpi-spark-");
     }
 
     function pushKpi(key, value) {
@@ -1748,12 +1765,8 @@
       const errored = !system || system.status === "error";
       const stale = Boolean((system && system.stale) || (server && server.collect_error));
       panel.hidden = false;
-      panel.className = `ai-system-panel${errored ? " ai-system-error" : stale ? " ai-system-stale" : ""}`;
+      panel.className = `system-strip ai-system-strip${errored ? " ai-system-error" : stale ? " ai-system-stale" : ""}`;
       const stateLabel = errored ? "COLLECT ERROR" : stale ? "STALE" : "LIVE · ssh ai-server";
-      const gauge = (label, value, barPercent, cls) => `
-        <div class="ai-system-gauge ${cls || ""}"><span>${label}</span><strong>${value}</strong>${
-          barPercent === null ? "" : `<div class="ai-system-bar"><i style="width:${Math.max(0, Math.min(100, barPercent))}%"></i></div>`
-        }</div>`;
       const pctVal = (v) => (Number.isFinite(v) ? `${Math.round(v)}%` : "--");
       const tempVal = (v) => (Number.isFinite(v) ? `${v}\u00b0C` : "--");
       // Contract: missing AI telemetry renders as "--", never a substitute
@@ -1763,14 +1776,31 @@
       const cpuP = system ? system.cpu_usage_percent : null;
       const memP = system ? system.memory_usage_percent : null;
       const diskP = system ? system.disk_usage_percent : null;
-      panel.innerHTML = `
-        <div class="ai-system-head"><span>AI Server System</span><span class="ai-system-state">${escapeHtml(stateLabel)}</span></div>
-        ${gauge("CPU", `${pctVal(cpuP)}${system && Number.isFinite(system.cpu_load1) ? ` \u00b7 load ${system.cpu_load1}` : ""}`, cpuP)}
-        ${gauge("RAM", system && (Number.isFinite(system.memory_used_gb) || Number.isFinite(system.memory_total_gb)) ? `${formatGpuValue(system.memory_used_gb)} / ${formatGpuValue(system.memory_total_gb)} GB \u00b7 ${pctVal(memP)}` : "--", memP)}
-        ${gauge("Network \u2193", system ? bpsVal(system.download_bps) : "--", null, "net")}
-        ${gauge("Network \u2191", system ? bpsVal(system.upload_bps) : "--", null, "net")}
-        ${gauge("Disk", system && (Number.isFinite(system.disk_used_gb) || Number.isFinite(system.disk_total_gb)) ? `${formatGpuValue(system.disk_used_gb)} / ${formatGpuValue(system.disk_total_gb)} GB \u00b7 ${pctVal(diskP)}` : "--", diskP)}
-        ${gauge("CPU Temp", tempVal(system ? system.cpu_temp_c : null), null, "temp")}`;
+      document.getElementById("ai-system-state").textContent = `AI-SERVER · ${stateLabel}`;
+      document.getElementById("ai-kpi-cpu").textContent = pctVal(cpuP);
+      document.getElementById("ai-kpi-ram").textContent = pctVal(memP);
+      document.getElementById("ai-kpi-download").textContent = system ? bpsVal(system.download_bps) : "--";
+      document.getElementById("ai-kpi-upload").textContent = system ? bpsVal(system.upload_bps) : "--";
+      document.getElementById("ai-kpi-disk").textContent = pctVal(diskP);
+      document.getElementById("ai-kpi-cpu-temp").textContent = tempVal(system ? system.cpu_temp_c : null);
+      const values = {
+        cpu: cpuP, ram: memP,
+        download: system ? system.download_bps : null,
+        upload: system ? system.upload_bps : null,
+        disk: diskP,
+        temperature: system ? system.cpu_temp_c : null,
+      };
+      Object.entries(values).forEach(([key, value]) => {
+        const next = Number.isFinite(value) ? value : 0;
+        aiKpiHistory[key].push(next);
+        if (aiKpiHistory[key].length > maxPoints) aiKpiHistory[key].shift();
+      });
+      drawSparkline("ai-kpi-spark-cpu", aiKpiHistory.cpu, "rgba(59, 130, 246, 1)");
+      drawSparkline("ai-kpi-spark-ram", aiKpiHistory.ram, "rgba(34, 197, 94, 1)");
+      drawSparkline("ai-kpi-spark-download", aiKpiHistory.download, "rgba(34, 211, 238, 1)");
+      drawSparkline("ai-kpi-spark-upload", aiKpiHistory.upload, "rgba(34, 197, 94, 1)");
+      drawSparkline("ai-kpi-spark-disk", aiKpiHistory.disk, "rgba(34, 211, 238, 1)");
+      drawSparkline("ai-kpi-spark-temperature", aiKpiHistory.temperature, "rgba(245, 158, 11, 1)");
     }
 
     function renderGpuServerSection(server, gridId) {
