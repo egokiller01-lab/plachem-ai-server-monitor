@@ -268,21 +268,23 @@ class UiAnchorTests(unittest.TestCase):
         self.assertIn("pcie_width_max", self.html)
 
     def test_reference_layout_wins_over_legacy_compact_theme(self):
-        self.assertIn("Final main-monitor layout aligned to the supplied 1122px reference", self.html)
+        self.assertIn("Final main-monitor layout aligned to the supplied split-server reference", self.html)
         self.assertRegex(
             self.html,
-            r"body:not\(\.auth-control-open\) \.shell\s*\{[^}]*width:\s*min\(1080px,",
+            r"body:not\(\.auth-control-open\) \.shell\s*\{[^}]*width:\s*min\(1000px,",
         )
         self.assertRegex(
             self.html,
-            r"body:not\(\.auth-control-open\) \.gpu-grid,[\s\S]*?"
-            r"grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)",
+            r"body:not\(\.auth-control-open\) \.server-columns\s*\{[^}]*"
+            r"grid-template-columns:\s*minmax\(0,\s*44fr\)\s*minmax\(0,\s*56fr\)",
         )
         self.assertRegex(
             self.html,
             r"body:not\(\.auth-control-open\) \.ai-system-panel\s*\{[^}]*"
-            r"grid-template-columns:\s*repeat\(5,\s*minmax\(0,\s*1fr\)\)",
+            r"grid-template-columns:\s*132px\s*repeat\(6,\s*minmax\(0,\s*1fr\)\)",
         )
+        self.assertIn('class="system-strip main-system-strip"', self.html)
+        self.assertIn('class="server-columns"', self.html)
 
     def test_ai_system_panel_id_is_unique(self):
         self.assertEqual(self.html.count('id="ai-system-panel"'), 1)

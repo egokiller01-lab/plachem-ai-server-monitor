@@ -1335,51 +1335,62 @@
       body.auth-control-open .shell { width: calc(100vw - 20px); }
     }
 
-    /* Final main-monitor layout aligned to the supplied 1122px reference. */
-    body:not(.auth-control-open) .shell { width: min(1080px, calc(100vw - 32px)); max-width: none; padding: 18px 0 24px; }
-    body:not(.auth-control-open) header { min-height: 44px; margin-bottom: 14px; gap: 18px; }
-    body:not(.auth-control-open) .brand { gap: 10px; }
-    body:not(.auth-control-open) .logo { width: 34px; height: 34px; border-radius: 10px; font-size: 16px; }
-    body:not(.auth-control-open) h1 { font-size: 24px; }
-    body:not(.auth-control-open) h1 span { font-size: 20px; }
-    body:not(.auth-control-open) .top-actions { gap: 8px; }
+    /* Final main-monitor layout aligned to the supplied split-server reference. */
+    body:not(.auth-control-open) .shell { width: min(1000px, calc(100vw - 12px)); max-width: none; padding: 8px 0 14px; }
+    body:not(.auth-control-open) header { min-height: 34px; margin-bottom: 6px; gap: 12px; }
+    body:not(.auth-control-open) .brand { gap: 8px; }
+    body:not(.auth-control-open) .logo { width: 27px; height: 27px; border-radius: 7px; font-size: 13px; }
+    body:not(.auth-control-open) h1 { font-size: 20px; }
+    body:not(.auth-control-open) h1 span { font-size: 15px; }
+    body:not(.auth-control-open) .top-actions { gap: 6px; }
     body:not(.auth-control-open) .back-button,
-    body:not(.auth-control-open) .live { min-height: 34px; padding: 0 12px; font-size: 11px; border-radius: 9px; }
+    body:not(.auth-control-open) .live { min-height: 28px; padding: 0 9px; font-size: 9px; border-radius: 7px; }
 
-    body:not(.auth-control-open) .kpis { grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; margin-bottom: 16px; }
-    body:not(.auth-control-open) .kpi { min-height: 82px; padding: 11px 12px; grid-template-columns: 32px 1fr; grid-template-rows: auto auto 20px; gap: 1px 9px; border-radius: 10px; }
-    body:not(.auth-control-open) .kpi .icon { width: 32px; height: 32px; font-size: 14px; border-radius: 8px; }
-    body:not(.auth-control-open) .kpi .label { font-size: 10px; }
-    body:not(.auth-control-open) .kpi .value { font-size: 22px; }
-    body:not(.auth-control-open) .kpi-spark { height: 20px; }
+    body:not(.auth-control-open) .system-strip { display: grid; grid-template-columns: 132px minmax(0, 1fr); gap: 5px; padding: 5px; margin-bottom: 6px; border: 1px solid rgba(34,211,238,.34); border-radius: 8px; background: rgba(4,17,31,.82); }
+    body:not(.auth-control-open) .system-strip-label { display: flex; align-items: center; gap: 8px; padding: 0 8px; color: var(--text); font-size: 11px; font-weight: 800; }
+    body:not(.auth-control-open) .system-strip-label::before { content: "▣"; display: grid; place-items: center; width: 28px; height: 36px; border: 1px solid rgba(34,211,238,.42); border-radius: 6px; color: var(--cyan); background: rgba(10,46,72,.55); }
+    body:not(.auth-control-open) .system-strip-label small { display: block; margin-top: 2px; color: var(--muted); font-size: 7px; font-weight: 600; }
+    body:not(.auth-control-open) .kpis { grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 5px; padding: 0; margin: 0; border: 0; background: transparent; box-shadow: none; }
+    body:not(.auth-control-open) .kpi { min-height: 48px; padding: 5px 7px; grid-template-columns: 22px 1fr; grid-template-rows: auto auto 12px; gap: 0 6px; border-radius: 7px; }
+    body:not(.auth-control-open) .kpi .icon { width: 22px; height: 22px; font-size: 11px; border-radius: 5px; }
+    body:not(.auth-control-open) .kpi .label { font-size: 7px; }
+    body:not(.auth-control-open) .kpi .value { font-size: 15px; }
+    body:not(.auth-control-open) .kpi-spark { height: 12px; }
 
-    body:not(.auth-control-open) .gpu-server-section { margin-bottom: 22px; }
-    body:not(.auth-control-open) .gpu-server-head { gap: 12px; margin: 0 3px 11px; }
-    body:not(.auth-control-open) .gpu-server-title { font-size: 14px; }
+    body:not(.auth-control-open) .server-columns { display: grid; grid-template-columns: minmax(0, 44fr) minmax(0, 56fr); gap: 6px; align-items: stretch; margin-bottom: 6px; }
+    body:not(.auth-control-open) .gpu-server-section { min-width: 0; margin: 0; padding: 5px; border: 1px solid rgba(34,211,238,.32); border-radius: 8px; background: rgba(4,17,31,.72); }
+    body:not(.auth-control-open) .gpu-server-head { min-height: 25px; gap: 8px; margin: 0 2px 5px; }
+    body:not(.auth-control-open) .gpu-server-title { font-size: 11px; }
     body:not(.auth-control-open) .gpu-server-model,
-    body:not(.auth-control-open) .gpu-server-meta { font-size: 11px; }
-    body:not(.auth-control-open) .gpu-grid,
-    body:not(.auth-control-open) .ai-gpu-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-    body:not(.auth-control-open) .gpu-unit-card { min-height: 278px; padding: 18px 20px; border-radius: 11px; }
-    body:not(.auth-control-open) .gpu-unit-card .card-title { font-size: 15px; margin-bottom: 5px; }
-    body:not(.auth-control-open) .gpu-unit-name { margin: 0 0 15px 26px; font-size: 11px; }
-    body:not(.auth-control-open) .gpu-badge-row { margin: -7px 0 12px 26px; }
-    body:not(.auth-control-open) .gpu-dashboard { grid-template-columns: 154px minmax(0, 1fr); gap: 22px; }
-    body:not(.auth-control-open) .gpu-gauge { width: 150px; }
-    body:not(.auth-control-open) .gpu-gauge::before { inset: 12px; }
-    body:not(.auth-control-open) .gpu-gauge-center { inset: 26px; }
-    body:not(.auth-control-open) .gpu-gauge-value { font-size: 34px; }
-    body:not(.auth-control-open) .gpu-gauge-label { font-size: 9px; }
-    body:not(.auth-control-open) .gpu-unit-metrics { gap: 13px 18px; }
-    body:not(.auth-control-open) .gpu-unit-metric span { font-size: 9px; }
-    body:not(.auth-control-open) .gpu-unit-metric strong { font-size: 15px; }
-    body:not(.auth-control-open) .gpu-unit-pcie { font-size: 10px; }
+    body:not(.auth-control-open) .gpu-server-meta { font-size: 8px; }
+    body:not(.auth-control-open) #gpu-server-main .gpu-grid { grid-template-columns: 1fr; gap: 5px; }
+    body:not(.auth-control-open) #gpu-server-ai .ai-gpu-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; }
+    body:not(.auth-control-open) .gpu-unit-card { min-height: 214px; padding: 10px 11px; border-radius: 7px; }
+    body:not(.auth-control-open) .gpu-unit-card .card-title { font-size: 11px; margin-bottom: 3px; }
+    body:not(.auth-control-open) .gpu-unit-name { margin: 0 0 8px 20px; font-size: 8px; }
+    body:not(.auth-control-open) .gpu-badge-row { margin: -5px 0 7px 20px; }
+    body:not(.auth-control-open) .gpu-dashboard { grid-template-columns: 126px minmax(0, 1fr); gap: 12px; }
+    body:not(.auth-control-open) #gpu-server-ai .gpu-dashboard { grid-template-columns: 92px minmax(0, 1fr); gap: 8px; }
+    body:not(.auth-control-open) .gpu-gauge { width: 122px; }
+    body:not(.auth-control-open) #gpu-server-ai .gpu-gauge { width: 88px; }
+    body:not(.auth-control-open) .gpu-gauge::before { inset: 9px; }
+    body:not(.auth-control-open) .gpu-gauge-center { inset: 20px; }
+    body:not(.auth-control-open) #gpu-server-ai .gpu-gauge-center { inset: 15px; }
+    body:not(.auth-control-open) .gpu-gauge-value { font-size: 28px; }
+    body:not(.auth-control-open) #gpu-server-ai .gpu-gauge-value { font-size: 21px; }
+    body:not(.auth-control-open) .gpu-gauge-label { font-size: 7px; }
+    body:not(.auth-control-open) .gpu-unit-metrics { gap: 7px 8px; }
+    body:not(.auth-control-open) .gpu-unit-metric span { font-size: 6px; }
+    body:not(.auth-control-open) .gpu-unit-metric strong { font-size: 10px; }
+    body:not(.auth-control-open) .gpu-unit-pcie { padding-top: 6px; font-size: 7px; }
 
-    body:not(.auth-control-open) .ai-system-panel { grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 14px; margin-top: 14px; padding: 14px 18px 16px; border-radius: 11px; }
-    body:not(.auth-control-open) .ai-system-head { font-size: 10px; }
-    body:not(.auth-control-open) .ai-system-gauge span { font-size: 9px; }
-    body:not(.auth-control-open) .ai-system-gauge strong { font-size: 15px; }
-    body:not(.auth-control-open) .ai-system-bar { height: 5px; }
+    body:not(.auth-control-open) .ai-system-panel { grid-template-columns: 132px repeat(6, minmax(0, 1fr)); gap: 5px; margin: 0 0 6px; padding: 5px; border-radius: 8px; }
+    body:not(.auth-control-open) .ai-system-head { grid-column: auto; align-content: center; padding: 0 8px; font-size: 8px; }
+    body:not(.auth-control-open) .ai-system-head span { display: block; width: 100%; }
+    body:not(.auth-control-open) .ai-system-gauge { min-height: 48px; padding: 7px 8px; border: 1px solid rgba(34,211,238,.24); border-radius: 7px; background: rgba(7,26,45,.72); }
+    body:not(.auth-control-open) .ai-system-gauge span { font-size: 7px; }
+    body:not(.auth-control-open) .ai-system-gauge strong { font-size: 10px; }
+    body:not(.auth-control-open) .ai-system-bar { height: 3px; }
 
     body:not(.auth-control-open) .codex-grid,
     body:not(.auth-control-open) .agent-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-bottom: 12px; }
@@ -1410,14 +1421,16 @@
     body:not(.auth-control-open) .service { font-size: 11px; }
     body:not(.auth-control-open) footer { min-height: 38px; font-size: 10px; }
 
-    @media (max-width: 900px) {
+    @media (max-width: 760px) {
       body:not(.auth-control-open) .shell { width: min(720px, calc(100vw - 20px)); }
       body:not(.auth-control-open) header { align-items: flex-start; flex-direction: column; }
       body:not(.auth-control-open) .top-actions { width: 100%; flex-wrap: wrap; }
       body:not(.auth-control-open) .kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-      body:not(.auth-control-open) .gpu-grid,
-      body:not(.auth-control-open) .ai-gpu-grid { grid-template-columns: 1fr; }
+      body:not(.auth-control-open) .system-strip { grid-template-columns: 1fr; }
+      body:not(.auth-control-open) .server-columns { grid-template-columns: 1fr; }
+      body:not(.auth-control-open) #gpu-server-ai .ai-gpu-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       body:not(.auth-control-open) .ai-system-panel { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      body:not(.auth-control-open) .ai-system-head { grid-column: 1 / -1; }
       body:not(.auth-control-open) .openclaw-main-summary,
       body:not(.auth-control-open) .services { grid-template-columns: 1fr; }
       body:not(.auth-control-open) .openclaw-main-metrics { grid-template-columns: repeat(5, minmax(0, 1fr)); }
@@ -1461,18 +1474,22 @@
     </header>
 
     <section id="main-view">
-    <section class="kpis">
-      <div class="kpi clickable" data-detail="cpu"><span class="icon">▣</span><span class="label">CPU</span><span id="kpi-cpu" class="value">--</span></div>
-      <div class="kpi green clickable" data-detail="memory"><span class="icon">▤</span><span class="label">RAM</span><span id="kpi-ram" class="value">--</span></div>
-      <div class="kpi cyan clickable" data-detail="network"><span class="icon">↓</span><span class="label">Network ↓</span><span id="kpi-download" class="value">--</span></div>
-      <div class="kpi green clickable" data-detail="network"><span class="icon">↑</span><span class="label">Network ↑</span><span id="kpi-upload" class="value">--</span></div>
-      <div class="kpi cyan clickable" data-detail="disk"><span class="icon">▭</span><span class="label">DISK</span><span id="kpi-disk" class="value">--</span></div>
-      <div class="kpi amber"><span class="icon">🌡</span><span class="label">CPU TEMP</span><span id="kpi-cpu-temp" class="value">--</span></div>
+    <section class="system-strip main-system-strip">
+      <div class="system-strip-label"><span>Main Server<small>PLACHEM-MAIN</small></span></div>
+      <section class="kpis">
+        <div class="kpi clickable" data-detail="cpu"><span class="icon">▣</span><span class="label">CPU</span><span id="kpi-cpu" class="value">--</span></div>
+        <div class="kpi green clickable" data-detail="memory"><span class="icon">▤</span><span class="label">RAM</span><span id="kpi-ram" class="value">--</span></div>
+        <div class="kpi cyan clickable" data-detail="network"><span class="icon">↓</span><span class="label">Network ↓</span><span id="kpi-download" class="value">--</span></div>
+        <div class="kpi green clickable" data-detail="network"><span class="icon">↑</span><span class="label">Network ↑</span><span id="kpi-upload" class="value">--</span></div>
+        <div class="kpi cyan clickable" data-detail="disk"><span class="icon">▭</span><span class="label">DISK</span><span id="kpi-disk" class="value">--</span></div>
+        <div class="kpi amber"><span class="icon">🌡</span><span class="label">CPU TEMP</span><span id="kpi-cpu-temp" class="value">--</span></div>
+      </section>
     </section>
 
+    <div class="server-columns">
     <section class="gpu-server-section" id="gpu-server-main">
       <div class="gpu-server-head">
-        <span class="gpu-server-title">Main Server</span>
+        <span class="gpu-server-title">Main Server GPUs</span>
         <span class="gpu-server-model" id="gpu-server-main-model">--</span>
         <span class="gpu-server-meta" id="gpu-server-main-meta">--</span>
       </div>
@@ -1481,13 +1498,14 @@
 
     <section class="gpu-server-section" id="gpu-server-ai">
       <div class="gpu-server-head">
-        <span class="gpu-server-title">AI Server</span>
+        <span class="gpu-server-title">AI Server GPUs</span>
         <span class="gpu-server-model" id="gpu-server-ai-model">--</span>
         <span class="gpu-server-meta" id="gpu-server-ai-meta">--</span>
       </div>
       <div class="gpu-grid ai-gpu-grid gpu-server-grid" id="ai-gpu-grid"></div>
-      <div class="ai-system-panel" id="ai-system-panel" hidden></div>
     </section>
+    </div>
+    <div class="ai-system-panel" id="ai-system-panel" hidden></div>
 
     <section class="codex-grid">
       <article class="card codex-card" id="codex-weekly-card">
@@ -1738,11 +1756,6 @@
       // string.  formatBps() yields "Unknown" for null (used by the Main KPI
       // tiles), so the AI panel keeps its own dash formatter.
       const bpsVal = (v) => (Number.isFinite(v) ? formatBps(v) : "--");
-      const netVal = (down, up) => (
-        Number.isFinite(down) || Number.isFinite(up)
-          ? `${bpsVal(down)} / ${bpsVal(up)}`
-          : "--"
-      );
       const cpuP = system ? system.cpu_usage_percent : null;
       const memP = system ? system.memory_usage_percent : null;
       const diskP = system ? system.disk_usage_percent : null;
@@ -1750,7 +1763,8 @@
         <div class="ai-system-head"><span>AI Server System</span><span class="ai-system-state">${escapeHtml(stateLabel)}</span></div>
         ${gauge("CPU", `${pctVal(cpuP)}${system && Number.isFinite(system.cpu_load1) ? ` \u00b7 load ${system.cpu_load1}` : ""}`, cpuP)}
         ${gauge("RAM", system && (Number.isFinite(system.memory_used_gb) || Number.isFinite(system.memory_total_gb)) ? `${formatGpuValue(system.memory_used_gb)} / ${formatGpuValue(system.memory_total_gb)} GB \u00b7 ${pctVal(memP)}` : "--", memP)}
-        ${gauge("Network \u2193 / \u2191", system ? netVal(system.download_bps, system.upload_bps) : "--", null, "net")}
+        ${gauge("Network \u2193", system ? bpsVal(system.download_bps) : "--", null, "net")}
+        ${gauge("Network \u2191", system ? bpsVal(system.upload_bps) : "--", null, "net")}
         ${gauge("Disk", system && (Number.isFinite(system.disk_used_gb) || Number.isFinite(system.disk_total_gb)) ? `${formatGpuValue(system.disk_used_gb)} / ${formatGpuValue(system.disk_total_gb)} GB \u00b7 ${pctVal(diskP)}` : "--", diskP)}
         ${gauge("CPU Temp", tempVal(system ? system.cpu_temp_c : null), null, "temp")}`;
     }

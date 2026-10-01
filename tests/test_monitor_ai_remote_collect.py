@@ -462,16 +462,17 @@ class AiPanelDashContractTests(unittest.TestCase):
         ]
         self.assertEqual(direct_calls, [], "AI panel must not call formatBps directly")
         self.assertIn("bpsVal", body)
-        self.assertIn("netVal", body)
+        self.assertIn('gauge("Network \\u2193"', body)
+        self.assertIn('gauge("Network \\u2191"', body)
 
     @unittest.skipIf(
         __import__("importlib").util.find_spec("playwright") is None, "playwright unavailable"
     )
-    def test_first_ssh_failure_all_five_gauges_are_dash(self):
+    def test_first_ssh_failure_all_six_gauges_are_dash(self):
         payload = app._ai_server_error_payload("ai-server", "ssh_timeout", 1700000000)
         rendered = _render_ai_panel_gauges(payload["system"], payload["error"])
-        self.assertEqual(len(rendered["gauges"]), 5, rendered["labels"])
-        self.assertEqual(rendered["gauges"], ["--"] * 5, rendered)
+        self.assertEqual(len(rendered["gauges"]), 6, rendered["labels"])
+        self.assertEqual(rendered["gauges"], ["--"] * 6, rendered)
         self.assertNotIn("Unknown", " ".join(rendered["gauges"]))
         self.assertIn("ai-system-error", rendered["className"])
         self.assertIn("COLLECT ERROR", rendered["head"])
@@ -479,9 +480,9 @@ class AiPanelDashContractTests(unittest.TestCase):
     @unittest.skipIf(
         __import__("importlib").util.find_spec("playwright") is None, "playwright unavailable"
     )
-    def test_system_null_all_five_gauges_are_dash(self):
+    def test_system_null_all_six_gauges_are_dash(self):
         rendered = _render_ai_panel_gauges(None, None)
-        self.assertEqual(rendered["gauges"], ["--"] * 5, rendered)
+        self.assertEqual(rendered["gauges"], ["--"] * 6, rendered)
 
     @unittest.skipIf(
         __import__("importlib").util.find_spec("playwright") is None, "playwright unavailable"
@@ -494,13 +495,15 @@ class AiPanelDashContractTests(unittest.TestCase):
             "cpu_temp_c": 44.0, "download_bps": None, "upload_bps": None,
         }
         rendered = _render_ai_panel_gauges(base, None)
-        net = rendered["gauges"][rendered["labels"].index("Network ↓ / ↑")]
-        self.assertEqual(net, "--")
-        self.assertNotIn("Unknown", " ".join(rendered["gauges"]))
+        labels, gauges = rendered["labels"], rendered["gauges"]
+        self.assertEqual(gauges[labels.index("Network ↓")], "--")
+        self.assertEqual(gauges[labels.index("Network ↑")], "--")
+        self.assertNotIn("Unknown", " ".join(gauges))
         one_sided = dict(base, download_bps=1024.0, upload_bps=None)
         rendered2 = _render_ai_panel_gauges(one_sided, None)
-        net2 = rendered2["gauges"][rendered2["labels"].index("Network ↓ / ↑")]
-        self.assertEqual(net2, "1 KB/s / --")
+        labels2, gauges2 = rendered2["labels"], rendered2["gauges"]
+        self.assertEqual(gauges2[labels2.index("Network ↓")], "1 KB/s")
+        self.assertEqual(gauges2[labels2.index("Network ↑")], "--")
 
     @unittest.skipIf(
         __import__("importlib").util.find_spec("playwright") is None, "playwright unavailable"
@@ -516,7 +519,8 @@ class AiPanelDashContractTests(unittest.TestCase):
         labels, gauges = rendered["labels"], rendered["gauges"]
         self.assertIn("LIVE", rendered["head"])
         # formatBps() rounds to whole KB/s: 1818 -> "2 KB/s", 1036 -> "1 KB/s".
-        self.assertEqual(gauges[labels.index("Network ↓ / ↑")], "2 KB/s / 1 KB/s")
+        self.assertEqual(gauges[labels.index("Network ↓")], "2 KB/s")
+        self.assertEqual(gauges[labels.index("Network ↑")], "1 KB/s")
         self.assertIn("43°C", gauges[labels.index("CPU Temp")])
         self.assertIn("9.2 / 62.6 GB", gauges[labels.index("RAM")])
         self.assertNotIn("--", " ".join(gauges))
