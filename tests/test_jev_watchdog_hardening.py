@@ -135,6 +135,7 @@ def _install_salvage_fakes(monkeypatch, *, ctx=None, stable_digest="stable"):
 def _clear_live_state():
     with live._LOCK:
         live._INFLIGHT.clear()
+        live._NUDGE_INFLIGHT.clear()
         live._SALVAGE_CONFIRMATIONS.clear()
 
 
@@ -551,3 +552,263 @@ def test_single_recovery_turn_prompt_is_bounded_to_handoff_and_task_workspace(mo
     assert result["recovery_status"] == "RECOVERY_BLOCKED"
     assert result["handoff_ack"] is True
     assert any(p.get("phase") == "D_ACK" and p.get("status") == "IMPLICIT_BY_RECOVERY_TURN" for p in phases)
+
+
+def _nudge_snapshot(*, age=300.0, inflight=0, assistant_turns=2,
+                    tool_calls=1, tool_results=1, meaningful_results=1,
+                    total_tokens=100):
+    return type(
+        "NudgeSnapshot",
+        (),
+        {
+            "progress": live.Availability(
+                True,
+                {
+                    "assistant_turns": assistant_turns,
+                    "tool_call_count": tool_calls,
+                    "tool_result_count": tool_results,
+                    "meaningful_result_count": meaningful_results,
+                    "latest_total_tokens": total_tokens,
+                    "meaningful_progress_age_sec": age,
+                    "inflight_tool_calls": inflight,
+                },
+            )
+        },
+    )()
+
+
+class _NudgeDecision:
+    choice = "NUDGE"
+    confidence = 0.9
+    probabilities = {
+        "NUDGE": 0.9,
+        "WATCH": 0.05,
+        "CONTINUE": 0.03,
+        "SALVAGE": 0.02,
+        "DEAD": 0.0,
+    }
+
+
+class _NudgeJudge:
+    def decide(self, **kwargs):
+        return _NudgeDecision()
+
+
+def _install_nudge_fakes(monkeypatch, tmp_path, *, snapshot=None):
+    if snapshot is None:
+        snapshot = _nudge_snapshot()
+    ctx = _active_ctx()
+    activity = _FakeActivity()
+    monkeypatch.setattr(live, "LIVE_HISTORY", tmp_path / "nudge-history.jsonl")
+    monkeypatch.setattr(live, "_make_snapshot", lambda **kwargs: (ctx, activity, snapshot))
+    monkeypatch.setattr(
+        live,
+        "FeatureBuilder",
+        lambda: type("FB", (), {"build": lambda self, snap: _FakeFeatures()})(),
+    )
+    monkeypatch.setattr(live, "ExistingOpenConnectorHealthJudge", lambda: _NudgeJudge())
+    monkeypatch.setattr(live, "snapshot_state_digest", lambda snap: "stable-nudge")
+    monkeypatch.setattr(live, "_recovery_attempt_exists", lambda session_id: False)
+    return snapshot
+
+
+def test_nudge_dispatch_is_background_and_same_session(monkeypatch, tmp_path):
+    _clear_live_state()
+    _install_nudge_fakes(monkeypatch, tmp_path)
+    started = []
+
+    class FakeThread:
+        def __init__(self, *, target, kwargs, daemon, name):
+            self.target = target
+            self.kwargs = kwargs
+            self.daemon = daemon
+            self.name = name
+
+        def start(self):
+            started.append(self)
+
+    monkeypatch.setattr(live.threading, "Thread", FakeThread)
+    payload = {
+        "agent_id": "erpmanager",
+        "session_id": "source-nudge",
+        "session_key": "agent:erpmanager:task",
+        "kind": "PERIODIC_HEALTH",
+        "evidence": {"source": "periodic_supervisor"},
+    }
+    result = live.evaluate_live_candidate(payload)
+
+    assert result["choice"] == "NUDGE"
+    assert result["action"] == "NUDGE_DISPATCHED"
+    assert len(started) == 1
+    assert started[0].target is live._run_same_session_nudge
+    assert started[0].kwargs["session_id"] == "source-nudge"
+    assert started[0].kwargs["session_key"] == "agent:erpmanager:task"
+    dispatch, resolution = live._latest_nudge_state("source-nudge")
+    assert dispatch["stable_state_digest"] == "stable-nudge"
+    assert resolution is None
+
+
+def test_nudge_is_blocked_while_tool_is_inflight(monkeypatch, tmp_path):
+    _clear_live_state()
+    _install_nudge_fakes(monkeypatch, tmp_path, snapshot=_nudge_snapshot(inflight=1))
+    monkeypatch.setattr(
+        live.threading,
+        "Thread",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("inflight tool must block NUDGE")),
+    )
+    result = live.evaluate_live_candidate({
+        "agent_id": "erpmanager",
+        "session_id": "source-inflight",
+        "session_key": "agent:erpmanager:task",
+        "kind": "PERIODIC_HEALTH",
+        "evidence": {"source": "periodic_supervisor"},
+    })
+    assert result["action"] == "NUDGE_BLOCKED_OBSERVE_ONLY"
+    assert result["nudge_guard_reason"] == "inflight_tool_active"
+
+
+def test_nudge_is_blocked_when_meaningful_progress_is_recent(monkeypatch, tmp_path):
+    _clear_live_state()
+    _install_nudge_fakes(monkeypatch, tmp_path, snapshot=_nudge_snapshot(age=10.0))
+    result = live.evaluate_live_candidate({
+        "agent_id": "erpmanager",
+        "session_id": "source-recent",
+        "session_key": "agent:erpmanager:task",
+        "kind": "PERIODIC_HEALTH",
+        "evidence": {"source": "periodic_supervisor"},
+    })
+    assert result["action"] == "NUDGE_BLOCKED_OBSERVE_ONLY"
+    assert result["nudge_guard_reason"] == "recent_or_unobservable_progress"
+
+
+def test_nudge_message_or_digest_change_alone_is_not_recovery():
+    baseline = {
+        "assistant_turns": 2,
+        "tool_call_count": 3,
+        "tool_result_count": 3,
+        "meaningful_result_count": 1,
+        "latest_total_tokens": 100,
+        "meaningful_progress_age_sec": 300.0,
+    }
+    current = dict(baseline)
+    recovered, reasons = live._nudge_worker_activity(baseline, current)
+    assert recovered is False
+    assert reasons == []
+
+
+def test_nudge_agent_reply_is_real_recovery_signal(monkeypatch, tmp_path):
+    _clear_live_state()
+    monkeypatch.setattr(live, "LIVE_HISTORY", tmp_path / "history.jsonl")
+    baseline = {
+        "assistant_turns": 2,
+        "tool_call_count": 3,
+        "tool_result_count": 3,
+        "meaningful_result_count": 1,
+        "latest_total_tokens": 100,
+        "meaningful_progress_age_sec": 300.0,
+        "inflight_tool_calls": 0,
+    }
+    monkeypatch.setattr(
+        live,
+        "_agent_turn",
+        lambda **kwargs: {
+            "status": "ok",
+            "text": "continuing the task",
+            "session_id": "same-session",
+        },
+    )
+    monkeypatch.setattr(
+        live,
+        "_read_session_trace",
+        lambda **kwargs: {
+            "available": True,
+            **baseline,
+        },
+    )
+    live._append({
+        "type": "live_nudge_dispatch",
+        "observed_at": live.time.time(),
+        "agent_id": "erpmanager",
+        "session_id": "same-session",
+        "session_key": "agent:erpmanager:task",
+        "stable_state_digest": "digest-a",
+        "dispatch_id": "dispatch-a",
+        "baseline": baseline,
+    })
+    with live._LOCK:
+        live._NUDGE_INFLIGHT.add("same-session")
+
+    live._run_same_session_nudge(
+        agent_id="erpmanager",
+        session_id="same-session",
+        session_key="agent:erpmanager:task",
+        stable_digest="digest-a",
+        dispatch_id="dispatch-a",
+        baseline=baseline,
+    )
+
+    _, outcome = live._latest_nudge_state("same-session")
+    assert outcome["status"] == "NUDGE_RECOVERED"
+    assert outcome["same_session"] is True
+    assert "assistant_reply" in outcome["activity_reasons"]
+    assert "same-session" not in live._NUDGE_INFLIGHT
+
+
+def test_nudge_dedupe_survives_restart_and_ignores_nudge_only_digest_change(monkeypatch, tmp_path):
+    _clear_live_state()
+    monkeypatch.setattr(live, "LIVE_HISTORY", tmp_path / "history.jsonl")
+    baseline = {
+        "assistant_turns": 2,
+        "tool_call_count": 3,
+        "tool_result_count": 3,
+        "meaningful_result_count": 1,
+        "latest_total_tokens": 100,
+        "meaningful_progress_age_sec": 300.0,
+        "inflight_tool_calls": 0,
+    }
+    live._append({
+        "type": "live_nudge_dispatch",
+        "observed_at": live.time.time() - 10,
+        "agent_id": "erpmanager",
+        "session_id": "restart-session",
+        "session_key": "agent:erpmanager:task",
+        "stable_state_digest": "before-nudge",
+        "dispatch_id": "dispatch-restart",
+        "baseline": baseline,
+    })
+
+    ctx = _active_ctx()
+    scope = {"auto_recovery_allowed": True}
+    detection = {"evidence": {"source": "periodic_supervisor"}}
+    monkeypatch.setattr(live, "_recovery_attempt_exists", lambda session_id: False)
+
+    allowed, reason, _ = live._nudge_guard(
+        ctx=ctx,
+        snapshot=_nudge_snapshot(),
+        scope=scope,
+        session_id="restart-session",
+        session_role="task",
+        stable_digest="after-nudge-digest-only",
+        kind="PERIODIC_HEALTH",
+        detection=detection,
+    )
+    assert allowed is False
+    assert reason == "prior_nudge_without_worker_activity"
+
+    allowed, reason, _ = live._nudge_guard(
+        ctx=ctx,
+        snapshot=_nudge_snapshot(tool_calls=4),
+        scope=scope,
+        session_id="restart-session",
+        session_role="task",
+        stable_digest="new-real-state",
+        kind="PERIODIC_HEALTH",
+        detection=detection,
+    )
+    assert allowed is True
+    assert reason == "nudge_guard_pass"
+
+
+def test_nudge_prefix_is_skipped_for_task_context_but_not_marked_control_run():
+    assert live._NUDGE_PREFIX in live._TASK_CONTEXT_SKIP_PREFIXES
+    assert live._NUDGE_PREFIX not in live._CONTROL_PROMPT_PREFIXES

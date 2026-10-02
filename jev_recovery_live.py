@@ -37,6 +37,7 @@ NODE24_BIN = Path.home() / ".local" / "node-v24.21.0" / "bin"
 _ALLOWED_KINDS = {"STALL", "LOOP", "COMPACTION_STREAK", "CONTEXT_EVIDENCE", "PERIODIC_HEALTH"}
 _TERMINAL = {"done", "failed", "killed", "timeout", "cancelled", "canceled"}
 _INFLIGHT: set[str] = set()
+_NUDGE_INFLIGHT: set[str] = set()
 _LOCK = threading.Lock()
 HANDOFF_PHASE_TIMEOUT_SECONDS = 240
 ACK_PHASE_TIMEOUT_SECONDS = 180
@@ -46,13 +47,24 @@ AUTO_RECOVERY_MIN_MARGIN = 0.20
 AUTO_RECOVERY_CONFIRMATIONS = 2
 AUTO_RECOVERY_CONFIRMATION_GAP_SECONDS = 45.0
 GENERAL_RECOVERY_GRACE_SECONDS = 300.0
+NUDGE_MIN_NO_PROGRESS_SECONDS = 60.0
+NUDGE_RESTART_HOLD_SECONDS = 240.0
 HANDOFF_SESSION_TAG = ":jev-handoff:"
 RECOVERY_SESSION_TAG = ":jev-recovery:"
 _SALVAGE_CONFIRMATIONS: dict[str, tuple[int, float, str]] = {}
+_NUDGE_PREFIX = "JEV SAME-SESSION NUDGE."
+_NUDGE_MESSAGE = (
+    _NUDGE_PREFIX
+    + "\nContinue the current task in this same session and same scope."
+    + "\nDo not repeat completed work or expand the scope."
+    + "\nIf progress is possible, continue now."
+    + "\nOtherwise report only the current blocker."
+)
 _CONTROL_PROMPT_PREFIXES = (
     "Agent-to-agent announce step.",
     "JEV RECOVERY MODE.",
 )
+_TASK_CONTEXT_SKIP_PREFIXES = _CONTROL_PROMPT_PREFIXES + (_NUDGE_PREFIX,)
 
 
 class WatchdogAbortBridge:
@@ -346,6 +358,218 @@ def _recovery_attempt_exists(session_id: str) -> bool:
     return False
 
 
+
+
+def _nudge_metrics(snapshot: ObserverSnapshot | None = None, trace: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    value = trace or (
+        snapshot.progress.value
+        if snapshot is not None and snapshot.progress.available and isinstance(snapshot.progress.value, Mapping)
+        else {}
+    )
+    return {
+        "assistant_turns": int(value.get("assistant_turns") or 0),
+        "tool_call_count": int(value.get("tool_call_count") or 0),
+        "tool_result_count": int(value.get("tool_result_count") or 0),
+        "meaningful_result_count": int(value.get("meaningful_result_count") or 0),
+        "latest_total_tokens": int(value.get("latest_total_tokens") or 0),
+        "meaningful_progress_age_sec": (
+            float(value["meaningful_progress_age_sec"])
+            if isinstance(value.get("meaningful_progress_age_sec"), (int, float))
+            else None
+        ),
+        "inflight_tool_calls": int(value.get("inflight_tool_calls") or 0),
+    }
+
+
+def _nudge_worker_activity(
+    baseline: Mapping[str, Any], current: Mapping[str, Any], *, assistant_reply: str = ""
+) -> tuple[bool, list[str]]:
+    reasons = [
+        key for key in (
+            "assistant_turns", "tool_call_count", "tool_result_count",
+            "meaningful_result_count", "latest_total_tokens",
+        )
+        if int(current.get(key) or 0) > int(baseline.get(key) or 0)
+    ]
+    before = baseline.get("meaningful_progress_age_sec")
+    after = current.get("meaningful_progress_age_sec")
+    if isinstance(before, (int, float)) and isinstance(after, (int, float)) and after + 5.0 < before:
+        reasons.append("meaningful_progress_age_sec")
+    if assistant_reply.strip():
+        reasons.append("assistant_reply")
+    return bool(reasons), reasons
+
+
+def _latest_nudge_state(session_id: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    if not LIVE_HISTORY.exists():
+        return None, None
+    try:
+        lines = LIVE_HISTORY.read_text(encoding="utf-8").splitlines()[-2000:]
+    except OSError:
+        return None, None
+    dispatch = resolution = None
+    for raw in lines:
+        try:
+            row = json.loads(raw)
+        except Exception:
+            continue
+        if row.get("session_id") != session_id:
+            continue
+        if row.get("type") == "live_nudge_dispatch":
+            dispatch, resolution = row, None
+        elif (
+            dispatch
+            and row.get("dispatch_id") == dispatch.get("dispatch_id")
+            and row.get("type") in {"live_nudge_outcome", "live_nudge_error"}
+        ):
+            resolution = row
+    return dispatch, resolution
+
+
+def _nudge_guard(
+    *, ctx: Mapping[str, Any], snapshot: ObserverSnapshot, scope: Mapping[str, Any],
+    session_id: str, session_role: str, stable_digest: str,
+    kind: str, detection: Mapping[str, Any],
+) -> tuple[bool, str, dict[str, Any]]:
+    metrics = _nudge_metrics(snapshot)
+    active, active_reason = _source_task_active(ctx)
+    checks = (
+        (session_role == "task", "not_task_session"),
+        (active, active_reason),
+        (_runtime_recovery_safe(ctx, snapshot), "runtime_evidence_not_safe"),
+        (metrics["inflight_tool_calls"] == 0, "inflight_tool_active"),
+        (
+            isinstance(metrics["meaningful_progress_age_sec"], (int, float))
+            and metrics["meaningful_progress_age_sec"] >= NUDGE_MIN_NO_PROGRESS_SECONDS,
+            "recent_or_unobservable_progress",
+        ),
+        (bool(scope.get("auto_recovery_allowed")), "scope_blocks_auto_action"),
+        (not _recovery_attempt_exists(session_id), "recovery_attempt_exists"),
+        (_is_periodic_supervisor_candidate(kind, detection), "periodic_supervisor_only"),
+    )
+    for ok, reason in checks:
+        if not ok:
+            return False, reason, metrics
+
+    prior, _ = _latest_nudge_state(session_id)
+    if prior:
+        baseline = prior.get("baseline") if isinstance(prior.get("baseline"), Mapping) else {}
+        progressed, _ = _nudge_worker_activity(baseline, metrics)
+        if str(prior.get("stable_state_digest") or "") == stable_digest:
+            return False, "same_stable_state_already_nudged", metrics
+        if not progressed:
+            return False, "prior_nudge_without_worker_activity", metrics
+    return True, "nudge_guard_pass", metrics
+
+
+def _run_same_session_nudge(
+    *, agent_id: str, session_id: str, session_key: str,
+    stable_digest: str, dispatch_id: str, baseline: Mapping[str, Any],
+) -> None:
+    try:
+        result = _agent_turn(
+            agent_id=agent_id, session_key=session_key, message=_NUDGE_MESSAGE, timeout=180
+        )
+        returned_session_id = str(result.get("session_id") or "")
+        same_session = returned_session_id == session_id
+        current = _nudge_metrics(trace=_read_session_trace(agent_id=agent_id, session_id=session_id))
+        recovered, reasons = _nudge_worker_activity(
+            baseline, current, assistant_reply=str(result.get("text") or "") if same_session else ""
+        )
+        _append({
+            "type": "live_nudge_outcome",
+            "observed_at": time.time(),
+            "agent_id": agent_id,
+            "session_id": session_id,
+            "session_key": session_key,
+            "stable_state_digest": stable_digest,
+            "dispatch_id": dispatch_id,
+            "status": (
+                "NUDGE_RECOVERED" if same_session and recovered
+                else "NUDGE_SESSION_MISMATCH" if not same_session
+                else "NUDGE_NO_ACTIVITY"
+            ),
+            "same_session": same_session,
+            "returned_session_id": returned_session_id or None,
+            "activity_reasons": reasons,
+            "baseline": dict(baseline),
+            "current": current,
+        })
+    except Exception as exc:
+        _append({
+            "type": "live_nudge_error",
+            "observed_at": time.time(),
+            "agent_id": agent_id,
+            "session_id": session_id,
+            "session_key": session_key,
+            "stable_state_digest": stable_digest,
+            "dispatch_id": dispatch_id,
+            "status": "NUDGE_ERROR",
+            "error": type(exc).__name__,
+            "error_detail": str(exc)[:240],
+        })
+    finally:
+        with _LOCK:
+            _NUDGE_INFLIGHT.discard(session_id)
+
+
+def _pending_nudge_observation(
+    *, agent_id: str, session_id: str, session_key: str, snapshot: ObserverSnapshot,
+) -> dict[str, Any] | None:
+    dispatch, resolution = _latest_nudge_state(session_id)
+    if not dispatch or resolution:
+        return None
+    baseline = dispatch.get("baseline") if isinstance(dispatch.get("baseline"), Mapping) else {}
+    current = _nudge_metrics(snapshot)
+    recovered, reasons = _nudge_worker_activity(baseline, current)
+    if recovered:
+        row = {
+            "type": "live_nudge_outcome",
+            "observed_at": time.time(),
+            "agent_id": agent_id,
+            "session_id": session_id,
+            "session_key": session_key,
+            "stable_state_digest": dispatch.get("stable_state_digest"),
+            "dispatch_id": dispatch.get("dispatch_id"),
+            "status": "NUDGE_RECOVERED",
+            "same_session": True,
+            "activity_reasons": reasons,
+            "baseline": dict(baseline),
+            "current": current,
+        }
+        _append(row)
+        return {**row, "choice": "CONTINUE", "action": "NUDGE_RECOVERED"}
+
+    with _LOCK:
+        in_memory = session_id in _NUDGE_INFLIGHT
+    age = max(0.0, time.time() - float(dispatch.get("observed_at") or 0))
+    if in_memory or age < NUDGE_RESTART_HOLD_SECONDS:
+        return {
+            "status": "NUDGE_PENDING",
+            "agent_id": agent_id,
+            "session_id": session_id,
+            "choice": "NUDGE",
+            "action": "NUDGE_INFLIGHT_OBSERVE",
+            "nudge_age_seconds": round(age, 1),
+        }
+
+    _append({
+        "type": "live_nudge_outcome",
+        "observed_at": time.time(),
+        "agent_id": agent_id,
+        "session_id": session_id,
+        "session_key": session_key,
+        "stable_state_digest": dispatch.get("stable_state_digest"),
+        "dispatch_id": dispatch.get("dispatch_id"),
+        "status": "NUDGE_NO_ACTIVITY",
+        "same_session": True,
+        "reason": "restart_hold_expired_without_worker_activity",
+        "baseline": dict(baseline),
+        "current": current,
+    })
+    return None
+
+
 def _salvage_is_confident(decision: Any) -> tuple[bool, str, float | None]:
     try:
         confidence = float(decision.confidence)
@@ -357,7 +581,7 @@ def _salvage_is_confident(decision: Any) -> tuple[bool, str, float | None]:
     except (TypeError, ValueError):
         salvage = None
     competitors = []
-    for key in ("WATCH", "CONTINUE", "DEAD"):
+    for key in ("WATCH", "CONTINUE", "NUDGE", "DEAD"):
         try:
             competitors.append(float(probs.get(key)))
         except (TypeError, ValueError):
@@ -413,7 +637,11 @@ def _session_context(agent_id: str, session_id: str) -> dict[str, Any]:
             if meta.get("runId"):
                 transcript_run_id = str(meta["runId"])
         if msg.get("role") == "user" and not latest_user:
-            latest_user = _message_text(msg)
+            candidate_user = _message_text(msg)
+            if candidate_user and not any(
+                candidate_user.startswith(prefix) for prefix in _TASK_CONTEXT_SKIP_PREFIXES
+            ):
+                latest_user = candidate_user
         if msg.get("role") == "assistant" and isinstance(msg.get("content"), list):
             text = _message_text(msg)
             if text:
@@ -494,6 +722,7 @@ def _make_snapshot(*, agent_id: str, session_id: str, detection: Mapping[str, An
         "session_status": ctx.get("status"),
         "latest_run": ctx.get("latest_run"),
         "last_activity_age_sec": age,
+        "assistant_turns": trace.get("assistant_turns"),
         "tool_call_count": trace.get("tool_call_count"),
         "tool_result_count": trace.get("tool_result_count"),
         "inflight_tool_calls": trace.get("inflight_tool_calls"),
@@ -1196,6 +1425,15 @@ def evaluate_live_candidate(payload: Mapping[str, Any]) -> dict[str, Any]:
         _append(record)
         return record
 
+    pending_nudge = _pending_nudge_observation(
+        agent_id=agent_id,
+        session_id=session_id,
+        session_key=session_key,
+        snapshot=snapshot,
+    )
+    if pending_nudge is not None:
+        return pending_nudge
+
     features = FeatureBuilder().build(snapshot)
     stable_digest = snapshot_state_digest(snapshot)
     decision = ExistingOpenConnectorHealthJudge().decide(
@@ -1232,6 +1470,56 @@ def evaluate_live_candidate(payload: Mapping[str, Any]) -> dict[str, Any]:
 
     if decision.choice == "DEAD":
         action = "ESCALATE_MAIN"
+    elif decision.choice == "NUDGE":
+        allowed, nudge_reason, baseline = _nudge_guard(
+            ctx=ctx,
+            snapshot=snapshot,
+            scope=scope,
+            session_id=session_id,
+            session_role=session_role,
+            stable_digest=stable_digest,
+            kind=kind,
+            detection=detection,
+        )
+        record["nudge_guard_reason"] = nudge_reason
+        if not allowed:
+            action = "NUDGE_BLOCKED_OBSERVE_ONLY"
+        else:
+            dispatch_id = f"nudge-{uuid.uuid4().hex}"
+            dispatch_record = {
+                "type": "live_nudge_dispatch",
+                "observed_at": time.time(),
+                "agent_id": agent_id,
+                "session_id": session_id,
+                "session_key": session_key,
+                "stable_state_digest": stable_digest,
+                "dispatch_id": dispatch_id,
+                "baseline": dict(baseline),
+                "message_prefix": _NUDGE_PREFIX,
+            }
+            with _LOCK:
+                if session_id in _NUDGE_INFLIGHT:
+                    action = "NUDGE_INFLIGHT_OBSERVE"
+                else:
+                    # Record before starting the thread so process restart still
+                    # preserves at-most-once behavior for this stalled state.
+                    _append(dispatch_record)
+                    _NUDGE_INFLIGHT.add(session_id)
+                    threading.Thread(
+                        target=_run_same_session_nudge,
+                        kwargs={
+                            "agent_id": agent_id,
+                            "session_id": session_id,
+                            "session_key": session_key,
+                            "stable_digest": stable_digest,
+                            "dispatch_id": dispatch_id,
+                            "baseline": dict(baseline),
+                        },
+                        daemon=True,
+                        name=f"jev-nudge-{agent_id}-{session_id[:8]}",
+                    ).start()
+                    action = "NUDGE_DISPATCHED"
+                    record["nudge_dispatch_id"] = dispatch_id
     elif decision.choice == "SALVAGE":
         confident, confidence_reason, salvage_margin = _salvage_is_confident(decision)
         record["salvage_margin"] = salvage_margin

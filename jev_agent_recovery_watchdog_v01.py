@@ -18,7 +18,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
-CHOICES = ("CONTINUE", "WATCH", "SALVAGE", "DEAD")
+CHOICES = ("CONTINUE", "WATCH", "NUDGE", "SALVAGE", "DEAD")
 TERMINAL = frozenset({"COMPLETED", "FAILED", "CANCELLED", "DEAD"})
 
 
@@ -228,6 +228,13 @@ class ExistingOpenConnectorHealthJudge:
             "Observe without mutation when evidence is incomplete or ambiguous, the idle/repetition "
             "signal is weak or isolated, or there is not enough evidence yet to justify handoff."
         ),
+        "NUDGE": (
+            "Send one bounded same-session wake signal when the task session is live/recoverable, "
+            "there is no legitimate in-flight tool work, meaningful forward progress has stalled, "
+            "and a same-session continuation attempt is preferable to SALVAGE. Do not choose NUDGE "
+            "when evidence shows current productive activity or when a prior NUDGE has not produced "
+            "real worker activity."
+        ),
         "SALVAGE": (
             "Prepare a validated handoff when the session is still responsive but evidence shows "
             "sustained repetition of the same output/tool/error/step with little or no meaningful "
@@ -251,7 +258,7 @@ class ExistingOpenConnectorHealthJudge:
 
     def decide(self, *, feature_state: Mapping[str, Any], idempotency_key: str) -> JEVDecision:
         result = self.client.choice(
-            question="Choose exactly one v0.1 recovery action from CONTINUE, WATCH, SALVAGE, DEAD.",
+            question="Choose exactly one v0.1 recovery action from CONTINUE, WATCH, NUDGE, SALVAGE, DEAD.",
             state=dict(feature_state), criteria=self.CRITERIA, idempotency_key=idempotency_key)
         raw_choice = str(result.get("choice", "DEAD")).upper()
         choice = self.NORMALIZE.get(raw_choice, raw_choice)
@@ -416,7 +423,7 @@ class RecoveryController:
             return self._record("MAIN_ESCALATION", "ESCALATE_MAIN", activity.session_id, None, None,
                                 "DEAD_MAIN_ONLY", digest)
         if decision.choice != "SALVAGE":
-            kind = "NO_ACTION" if decision.choice in {"CONTINUE", "WATCH"} else "BLOCKED"
+            kind = "NO_ACTION" if decision.choice in {"CONTINUE", "WATCH", "NUDGE"} else "BLOCKED"
             return self._record(kind, decision.choice, activity.session_id, None, None,
                                 "OBSERVE_ONLY", digest)
         if not deterministic_safe:
